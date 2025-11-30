@@ -195,7 +195,8 @@ func (d *Open123) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 	}
 
 	// 3. 上传完毕
-	for range 60 {
+	// 延时10分钟
+	for range 600 {
 		uploadCompleteResp, err := d.complete(createResp.Data.PreuploadID)
 		// 返回错误代码未知，如：20103，文档也没有具体说
 		if err == nil && uploadCompleteResp.Data.Completed && uploadCompleteResp.Data.FileID != 0 {
