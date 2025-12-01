@@ -195,7 +195,16 @@ func (d *Open123) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 	}
 
 	// 3. 上传完毕
-	for range 60 {
+	// 尝试轮询最多 600 次（约 10 分钟），并正确响应 ctx 取消
+	for range 600 {
+		// 完成态轮询的取消
+		select {
+		case <-ctx.Done():
+			up(0)
+			return nil, fmt.Errorf("upload canceled")
+		default:
+		}
+
 		uploadCompleteResp, err := d.complete(createResp.Data.PreuploadID)
 		// 返回错误代码未知，如：20103，文档也没有具体说
 		if err == nil && uploadCompleteResp.Data.Completed && uploadCompleteResp.Data.FileID != 0 {
