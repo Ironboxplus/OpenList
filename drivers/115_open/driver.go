@@ -228,7 +228,8 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 	}
 	sha1 := file.GetHash().GetHash(utils.SHA1)
 	if len(sha1) != utils.SHA1.Width {
-		_, sha1, err = stream.CacheFullAndHash(file, &up, utils.SHA1)
+		// 流式计算SHA1
+		sha1, err = stream.StreamHashFile(file, utils.SHA1, 100, &up)
 		if err != nil {
 			return err
 		}
