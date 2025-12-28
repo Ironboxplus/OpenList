@@ -67,6 +67,82 @@ func fileToObj(f File) *model.ObjThumb {
 	if f.ServerMtime == 0 {
 		f.ServerMtime = f.Mtime
 	}
+
+	// ========== DEBUG: MD5处理流程 ==========
+	utils.Log.Debugf("╔══════════════════════════════════════════════════════════╗")
+	utils.Log.Debugf("║ [百度网盘] 文件对象转换开始")
+	utils.Log.Debugf("╠══════════════════════════════════════════════════════════╣")
+	utils.Log.Debugf("║ 文件名: %s", f.ServerFilename)
+	utils.Log.Debugf("║ 文件ID: %d", f.FsId)
+	utils.Log.Debugf("║ 文件大小: %d bytes", f.Size)
+	utils.Log.Debugf("║ 是否目录: %v", f.Isdir == 1)
+	utils.Log.Debugf("╠══════════════════════════════════════════════════════════╣")
+
+	// 记录百度API返回的原始MD5
+	originalMd5 := f.Md5
+	utils.Log.Debugf("║ [步骤1] 百度API返回的原始MD5")
+	utils.Log.Debugf("║   值: '%s'", originalMd5)
+	utils.Log.Debugf("║   长度: %d", len(originalMd5))
+	utils.Log.Debugf("║   是否为空: %v", originalMd5 == "")
+
+	// 打印MD5的字节表示
+	if originalMd5 != "" {
+		utils.Log.Debugf("║   字节值: %v", []byte(originalMd5))
+		// 检查是否包含非十六进制字符
+		hasNonHex := false
+		for i, ch := range originalMd5 {
+			if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')) {
+				hasNonHex = true
+				utils.Log.Warnf("║   ⚠ 位置%d包含非十六进制字符: '%c' (ASCII:%d)", i, ch, ch)
+			}
+		}
+		if !hasNonHex {
+			utils.Log.Debugf("║   ✓ 所有字符都是有效的十六进制字符")
+		}
+	}
+
+	utils.Log.Debugf("╠══════════════════════════════════════════════════════════╣")
+	utils.Log.Debugf("║ [步骤2] 调用DecryptMd5进行处理")
+	utils.Log.Debugf("║   注释说明: '直接获取的MD5是错误的'")
+	utils.Log.Debugf("║   问题: 百度返回的MD5格式如 '1261d72d03471f7b7b805fd60e024b8d'")
+	utils.Log.Debugf("║   问题: 这已经是标准的32位十六进制，为何说是错误的？")
+
+	// 执行解密
+	decryptedMd5 := DecryptMd5(f.Md5)
+
+	utils.Log.Debugf("╠══════════════════════════════════════════════════════════╣")
+	utils.Log.Debugf("║ [步骤3] DecryptMd5处理结果")
+	utils.Log.Debugf("║   原始MD5: '%s'", originalMd5)
+	utils.Log.Debugf("║   处理后MD5: '%s'", decryptedMd5)
+	utils.Log.Debugf("║   是否相同: %v", originalMd5 == decryptedMd5)
+
+	if originalMd5 != decryptedMd5 {
+		utils.Log.Warnf("║   ⚠ MD5被修改了！")
+		utils.Log.Warnf("║   这意味着执行了解密/转换操作")
+	} else {
+		utils.Log.Debugf("║   ✓ MD5未被修改（直接返回原值）")
+		utils.Log.Debugf("║   这意味着百度返回的就是标准格式")
+	}
+
+	utils.Log.Debugf("╠══════════════════════════════════════════════════════════╣")
+	utils.Log.Debugf("║ [步骤4] 创建HashInfo对象")
+
+	// 创建HashInfo
+	hashInfo := utils.NewHashInfo(utils.MD5, decryptedMd5)
+
+	utils.Log.Debugf("║   已将MD5传入HashInfo")
+	utils.Log.Debugf("╠══════════════════════════════════════════════════════════╣")
+	utils.Log.Debugf("║ [关键问题分析]")
+	utils.Log.Debugf("║ 1. 百度API现在返回的MD5格式是什么？")
+	utils.Log.Debugf("║    - 如果是标准32位hex: DecryptMd5不应该做任何处理")
+	utils.Log.Debugf("║    - 如果是加密格式: DecryptMd5需要解密")
+	utils.Log.Debugf("║ 2. '直接获取的MD5是错误的'这个注释是否过时？")
+	utils.Log.Debugf("║    - 可能百度以前返回加密MD5，现在已经改为标准格式")
+	utils.Log.Debugf("║ 3. 如果Etag验证失败，可能的原因：")
+	utils.Log.Debugf("║    - MD5本身格式正确，但客户端对Etag格式有特殊要求")
+	utils.Log.Debugf("║    - Etag的引号、大小写等格式问题")
+	utils.Log.Debugf("╚══════════════════════════════════════════════════════════╝")
+
 	return &model.ObjThumb{
 		Object: model.Object{
 			ID:       strconv.FormatInt(f.FsId, 10),
@@ -78,7 +154,7 @@ func fileToObj(f File) *model.ObjThumb {
 			IsFolder: f.Isdir == 1,
 
 			// 直接获取的MD5是错误的
-			HashInfo: utils.NewHashInfo(utils.MD5, DecryptMd5(f.Md5)),
+			HashInfo: hashInfo,
 		},
 		Thumbnail: model.Thumbnail{Thumbnail: f.Thumbs.Url3},
 	}
