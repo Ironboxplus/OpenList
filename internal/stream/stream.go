@@ -211,7 +211,9 @@ func (f *FileStream) RangeRead(httpRange http_range.Range) (io.Reader, error) {
 		return io.NewSectionReader(f.GetFile(), httpRange.Start, httpRange.Length), nil
 	}
 
-	cache, err := f.cache(httpRange.Start + httpRange.Length)
+	// 限制缓存大小，避免累积缓存整个文件
+	maxCache := min(httpRange.Start+httpRange.Length, int64(conf.MaxBufferLimit))
+	cache, err := f.cache(maxCache)
 	if err != nil {
 		return nil, err
 	}
@@ -224,31 +226,13 @@ func (f *FileStream) RangeRead(httpRange http_range.Range) (io.Reader, error) {
 // 即使被写入的数据量与Buffer.Cap一致，Buffer也会扩大
 
 // 确保指定大小的数据被缓存
+// 注意：此方法只缓存到 maxCacheSize，不会缓存整个文件
 func (f *FileStream) cache(maxCacheSize int64) (model.File, error) {
+	// 限制缓存大小，避免超大文件占用过多资源
+	// 如果需要缓存整个文件，应该显式调用 CacheFullAndWriter
 	if maxCacheSize > int64(conf.MaxBufferLimit) {
-		size := f.GetSize()
-		reader := f.Reader
-		if f.peekBuff != nil {
-			size -= f.peekBuff.Size()
-			reader = f.oriReader
-		}
-		tmpF, err := utils.CreateTempFile(reader, size)
-		if err != nil {
-			return nil, err
-		}
-		f.Add(utils.CloseFunc(func() error {
-			return errors.Join(tmpF.Close(), os.RemoveAll(tmpF.Name()))
-		}))
-		if f.peekBuff != nil {
-			peekF, err := buffer.NewPeekFile(f.peekBuff, tmpF)
-			if err != nil {
-				return nil, err
-			}
-			f.Reader = peekF
-			return peekF, nil
-		}
-		f.Reader = tmpF
-		return tmpF, nil
+		// 不再创建整个文件的临时文件，只缓存到 MaxBufferLimit
+		maxCacheSize = int64(conf.MaxBufferLimit)
 	}
 
 	if f.peekBuff == nil {

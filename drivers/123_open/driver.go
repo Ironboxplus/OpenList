@@ -175,7 +175,7 @@ func (d *Open123) Remove(ctx context.Context, obj model.Obj) error {
 }
 
 func (d *Open123) Put(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
-	// 1. 创建文件
+	// 1. 准备参数
 	// parentFileID 父目录id，上传到根目录时填写 0
 	parentFileId, err := strconv.ParseInt(dstDir.GetID(), 10, 64)
 	if err != nil {
@@ -197,14 +197,38 @@ func (d *Open123) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		}
 	}
 
+
 	// etag 文件md5
 	etag := file.GetHash().GetHash(utils.MD5)
-	if len(etag) < utils.MD5.Width {
-		_, etag, err = stream.CacheFullAndHash(file, &up, utils.MD5)
+	if len(etag) >= utils.MD5.Width {
+		// 有etag时，先尝试秒传
+		createResp, err := d.create(parentFileId, file.GetName(), etag, file.GetSize(), 2, false)
 		if err != nil {
 			return nil, err
 		}
+		// 是否秒传
+		if createResp.Data.Reuse {
+			// 秒传成功才会返回正确的 FileID，否则为 0
+			if createResp.Data.FileID != 0 {
+				return File{
+					FileName: file.GetName(),
+					Size:     file.GetSize(),
+					FileId:   createResp.Data.FileID,
+					Type:     2,
+					Etag:     etag,
+				}, nil
+			}
+		}
+		// 秒传失败，etag可能不可靠，继续流式计算真实MD5
 	}
+
+	// 流式MD5计算
+	etag, err = stream.StreamHashFile(file, utils.MD5, 40, &up)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. 创建上传任务
 	createResp, err := d.create(parentFileId, file.GetName(), etag, file.GetSize(), 2, false)
 	if err != nil {
 		return nil, err
@@ -223,13 +247,16 @@ func (d *Open123) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		}
 	}
 
-	// 2. 上传分片
-	err = d.Upload(ctx, file, createResp, up)
+	// 3. 上传分片
+	uploadProgress := func(p float64) {
+		up(40 + p*0.6)
+	}
+	err = d.Upload(ctx, file, createResp, uploadProgress)
 	if err != nil {
 		return nil, err
 	}
 
-	// 3. 上传完毕
+	// 4. 合并分片/完成上传
 	for range 60 {
 		uploadCompleteResp, err := d.complete(createResp.Data.PreuploadID)
 		// 返回错误代码未知，如：20103，文档也没有具体说
