@@ -174,6 +174,40 @@ func CacheFullAndHash(stream model.FileStreamer, up *model.UpdateProgress, hashT
 	return tmpF, hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// StreamHashFile 流式计算文件哈希值，避免将整个文件加载到内存
+// file: 文件流
+// hashType: 哈希算法类型
+// progressWeight: 进度权重（0-100），用于计算整体进度
+// up: 进度回调函数
+func StreamHashFile(file model.FileStreamer, hashType *utils.HashType, progressWeight float64, up *model.UpdateProgress) (string, error) {
+	hashFunc := hashType.NewFunc()
+	size := file.GetSize()
+	chunkSize := int64(10 * 1024 * 1024) // 10MB per chunk
+	var offset int64 = 0
+
+	for offset < size {
+		readSize := chunkSize
+		if size-offset < chunkSize {
+			readSize = size - offset
+		}
+		reader, err := file.RangeRead(http_range.Range{Start: offset, Length: readSize})
+		if err != nil {
+			return "", fmt.Errorf("range read for hash calculation failed: %w", err)
+		}
+		if _, err := io.Copy(hashFunc, reader); err != nil {
+			return "", fmt.Errorf("calculate hash failed: %w", err)
+		}
+		offset += readSize
+
+		if up != nil && progressWeight > 0 {
+			progress := progressWeight * float64(offset) / float64(size)
+			(*up)(progress)
+		}
+	}
+
+	return hex.EncodeToString(hashFunc.Sum(nil)), nil
+}
+
 type StreamSectionReaderIF interface {
 	// 线程不安全
 	GetSectionReader(off, length int64) (io.ReadSeeker, error)

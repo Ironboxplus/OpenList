@@ -2,9 +2,7 @@ package _123_open
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"strconv"
 	"time"
 
@@ -12,7 +10,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
-	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
+	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
@@ -189,27 +187,11 @@ func (d *Open123) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		// 秒传失败，etag可能不可靠，继续流式计算真实MD5
 	}
 
-	// 流式计算MD5
-	md5Hash := utils.MD5.NewFunc()
-	size := file.GetSize()
-	chunkSize := int64(10 * 1024 * 1024) // 10MB per chunk for MD5 calculation
-	var offset int64 = 0
-	for offset < size {
-		readSize := min(chunkSize, size-offset)
-		reader, err := file.RangeRead(http_range.Range{Start: offset, Length: readSize})
-		if err != nil {
-			return nil, fmt.Errorf("range read for MD5 calculation failed: %w", err)
-		}
-		if _, err := io.Copy(md5Hash, reader); err != nil {
-			return nil, fmt.Errorf("calculate MD5 failed: %w", err)
-		}
-		offset += readSize
-
-		progress := 40 * float64(offset) / float64(size)
-		up(progress)
+	// 流式MD5计算
+	etag, err = stream.StreamHashFile(file, utils.MD5, 40, &up)
+	if err != nil {
+		return nil, err
 	}
-
-	etag = hex.EncodeToString(md5Hash.Sum(nil))
 
 	// 2. 创建上传任务
 	createResp, err := d.create(parentFileId, file.GetName(), etag, file.GetSize(), 2, false)

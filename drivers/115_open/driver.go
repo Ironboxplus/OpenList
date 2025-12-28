@@ -2,9 +2,7 @@ package _115_open
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -16,6 +14,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"golang.org/x/time/rate"
@@ -230,29 +229,10 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 	sha1 := file.GetHash().GetHash(utils.SHA1)
 	if len(sha1) != utils.SHA1.Width {
 		// 流式计算SHA1
-		sha1Hash := utils.SHA1.NewFunc()
-		size := file.GetSize()
-		chunkSize := int64(10 * 1024 * 1024) // 10MB per chunk for SHA1 calculation
-		var offset int64 = 0
-		for offset < size {
-			readSize := chunkSize
-			if size-offset < chunkSize {
-				readSize = size - offset
-			}
-			reader, err := file.RangeRead(http_range.Range{Start: offset, Length: readSize})
-			if err != nil {
-				return fmt.Errorf("range read for SHA1 calculation failed: %w", err)
-			}
-			if _, err := io.Copy(sha1Hash, reader); err != nil {
-				return fmt.Errorf("calculate SHA1 failed: %w", err)
-			}
-			offset += readSize
-
-			progress := 10 * float64(offset) / float64(size)
-			up(progress)
+		sha1, err = stream.StreamHashFile(file, utils.SHA1, 10, &up)
+		if err != nil {
+			return err
 		}
-
-		sha1 = hex.EncodeToString(sha1Hash.Sum(nil))
 	}
 	const PreHashSize int64 = 128 * utils.KB
 	hashSize := PreHashSize
