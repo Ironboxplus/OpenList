@@ -2,9 +2,7 @@ package _123_open
 
 import (
 	"context"
-	"encoding/hex"
 	"fmt"
-	"io"
 	"strconv"
 	"time"
 
@@ -12,7 +10,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
-	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
+	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
@@ -186,51 +184,46 @@ func (d *Open123) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 
 	// etag 文件md5
 	etag := file.GetHash().GetHash(utils.MD5)
+
+	// 检查是否是可重复读取的流
+	_, isSeekable := file.(*stream.SeekableStream)
+
+	// 如果有预计算的 hash，先尝试秒传
 	if len(etag) >= utils.MD5.Width {
-		// 有etag时，先尝试秒传
 		createResp, err := d.create(parentFileId, file.GetName(), etag, file.GetSize(), 2, false)
 		if err != nil {
 			return nil, err
 		}
-		// 是否秒传
-		if createResp.Data.Reuse {
-			// 秒传成功才会返回正确的 FileID，否则为 0
-			if createResp.Data.FileID != 0 {
-				return File{
-					FileName: file.GetName(),
-					Size:     file.GetSize(),
-					FileId:   createResp.Data.FileID,
-					Type:     2,
-					Etag:     etag,
-				}, nil
+		if createResp.Data.Reuse && createResp.Data.FileID != 0 {
+			return File{
+				FileName: file.GetName(),
+				Size:     file.GetSize(),
+				FileId:   createResp.Data.FileID,
+				Type:     2,
+				Etag:     etag,
+			}, nil
+		}
+		// 秒传失败，继续后续流程
+	}
+
+	if isSeekable {
+		// 可重复读取的流，使用 RangeRead 计算 hash，不缓存
+		if len(etag) < utils.MD5.Width {
+			etag, err = stream.StreamHashFile(file, utils.MD5, 40, &up)
+			if err != nil {
+				return nil, err
 			}
 		}
-		// 秒传失败，etag可能不可靠，继续流式计算真实MD5
-	}
-
-	// 流式计算MD5
-	md5Hash := utils.MD5.NewFunc()
-	size := file.GetSize()
-	chunkSize := int64(10 * 1024 * 1024) // 10MB per chunk for MD5 calculation
-	var offset int64 = 0
-	for offset < size {
-		readSize := min(chunkSize, size-offset)
-		reader, err := file.RangeRead(http_range.Range{Start: offset, Length: readSize})
+	} else {
+		// 不可重复读取的流（如 HTTP body）
+		// 秒传失败或没有 hash，缓存整个文件并计算 MD5
+		_, etag, err = stream.CacheFullAndHash(file, &up, utils.MD5)
 		if err != nil {
-			return nil, fmt.Errorf("range read for MD5 calculation failed: %w", err)
+			return nil, err
 		}
-		if _, err := io.Copy(md5Hash, reader); err != nil {
-			return nil, fmt.Errorf("calculate MD5 failed: %w", err)
-		}
-		offset += readSize
-
-		progress := 40 * float64(offset) / float64(size)
-		up(progress)
 	}
 
-	etag = hex.EncodeToString(md5Hash.Sum(nil))
-
-	// 2. 创建上传任务
+	// 2. 创建上传任务（或再次尝试秒传）
 	createResp, err := d.create(parentFileId, file.GetName(), etag, file.GetSize(), 2, false)
 	if err != nil {
 		return nil, err
