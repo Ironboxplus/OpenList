@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -42,14 +43,21 @@ func (d *Open123) create(parentFileID int64, filename string, etag string, size 
 }
 
 // 上传分片 V2
-func (d *Open123) Upload(ctx context.Context, file model.FileStreamer, createResp *UploadCreateResp, up driver.UpdateProgress) error {
+// 如果needHash为true，会在上传过程中计算文件的MD5哈希，并通过返回值返回
+func (d *Open123) Upload(ctx context.Context, file model.FileStreamer, createResp *UploadCreateResp, up driver.UpdateProgress, needHash bool) (string, error) {
 	uploadDomain := createResp.Data.Servers[0]
 	size := file.GetSize()
 	chunkSize := createResp.Data.SliceSize
 
 	ss, err := stream.NewStreamSectionReader(file, int(chunkSize), &up)
 	if err != nil {
-		return err
+		return "", err
+	}
+
+	// 如果需要计算哈希，创建哈希计算器
+	var md5Hash hash.Hash
+	if needHash {
+		md5Hash = utils.MD5.NewFunc()
 	}
 
 	uploadNums := (size + chunkSize - 1) / chunkSize
@@ -82,6 +90,15 @@ func (d *Open123) Upload(ctx context.Context, file model.FileStreamer, createRes
 				if sliceMD5 == "" {
 					// 把耗时的计算放在这里，避免阻塞其他协程
 					sliceMD5, err = utils.HashReader(utils.MD5, reader)
+					if err != nil {
+						return err
+					}
+					reader.Seek(0, io.SeekStart)
+				}
+
+				// 如果需要计算整体文件哈希，在这里将分片数据写入哈希计算器
+				if needHash {
+					_, err = io.Copy(md5Hash, reader)
 					if err != nil {
 						return err
 					}
@@ -160,10 +177,14 @@ func (d *Open123) Upload(ctx context.Context, file model.FileStreamer, createRes
 	}
 
 	if err := threadG.Wait(); err != nil {
-		return err
+		return "", err
 	}
 
-	return nil
+	// 如果需要计算哈希，返回计算结果
+	if needHash {
+		return fmt.Sprintf("%x", md5Hash.Sum(nil)), nil
+	}
+	return "", nil
 }
 
 // 上传完毕

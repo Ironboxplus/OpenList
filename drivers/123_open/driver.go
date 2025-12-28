@@ -165,7 +165,36 @@ func (d *Open123) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		return nil, fmt.Errorf("parse parentFileID error: %v", err)
 	}
 
-	// 1. 流式计算MD5
+	// 1. 检查是否有etag（注意：etag默认是不可靠的）
+	etag := file.GetHash().GetHash(utils.MD5)
+	hasEtag := len(etag) > 0
+
+	var createResp *UploadCreateResp // 用于最后的complete调用
+
+	if hasEtag {
+		// 有etag（但不可靠）：先尝试用它秒传，如果失败则流式计算真实MD5
+		createResp, err = d.create(parentFileId, file.GetName(), etag, file.GetSize(), 2, false)
+		if err != nil {
+			return nil, err
+		}
+		// 是否秒传
+		if createResp.Data.Reuse {
+			// 秒传成功才会返回正确的 FileID，否则为 0
+			if createResp.Data.FileID != 0 {
+				return File{
+					FileName: file.GetName(),
+					Size:     file.GetSize(),
+					FileId:   createResp.Data.FileID,
+					Type:     2,
+					Etag:     etag,
+				}, nil
+			}
+		}
+		// 秒传失败，说明etag不可靠，需要流式计算真实MD5
+		// 注意：此时不能上传，因为etag可能是错的
+	}
+
+	// 没有etag或秒传失败：流式计算MD5
 	md5Hash := utils.MD5.NewFunc()
 	size := file.GetSize()
 	chunkSize := int64(10 * 1024 * 1024) // 10MB per chunk for MD5 calculation
@@ -185,10 +214,10 @@ func (d *Open123) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		up(progress)
 	}
 
-	etag := hex.EncodeToString(md5Hash.Sum(nil))
+	etag = hex.EncodeToString(md5Hash.Sum(nil))
 
-	// 2. 创建上传任务
-	createResp, err := d.create(parentFileId, file.GetName(), etag, file.GetSize(), 2, false)
+	// 创建上传任务（使用真实计算的MD5）
+	createResp, err = d.create(parentFileId, file.GetName(), etag, file.GetSize(), 2, false)
 	if err != nil {
 		return nil, err
 	}
@@ -206,16 +235,16 @@ func (d *Open123) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		}
 	}
 
-	// 3. 上传分片
+	// 上传分片（不需要计算哈希了，已经计算过了）
 	uploadProgress := func(p float64) {
-		up(40 + p*0.6)
+		up(40 + p*0.5)
 	}
-	err = d.Upload(ctx, file, createResp, uploadProgress)
+	_, err = d.Upload(ctx, file, createResp, uploadProgress, false)
 	if err != nil {
 		return nil, err
 	}
 
-	// 4. 合并分片/完成上传
+	// 2. 合并分片/完成上传
 	for range 60 {
 		uploadCompleteResp, err := d.complete(createResp.Data.PreuploadID)
 		// 返回错误代码未知，如：20103，文档也没有具体说
