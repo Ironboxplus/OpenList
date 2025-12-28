@@ -165,7 +165,31 @@ func (d *Open123) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		return nil, fmt.Errorf("parse parentFileID error: %v", err)
 	}
 
-	// 1. 流式计算MD5
+	// etag 文件md5
+	etag := file.GetHash().GetHash(utils.MD5)
+	if len(etag) >= utils.MD5.Width {
+		// 有etag时，先尝试秒传
+		createResp, err := d.create(parentFileId, file.GetName(), etag, file.GetSize(), 2, false)
+		if err != nil {
+			return nil, err
+		}
+		// 是否秒传
+		if createResp.Data.Reuse {
+			// 秒传成功才会返回正确的 FileID，否则为 0
+			if createResp.Data.FileID != 0 {
+				return File{
+					FileName: file.GetName(),
+					Size:     file.GetSize(),
+					FileId:   createResp.Data.FileID,
+					Type:     2,
+					Etag:     etag,
+				}, nil
+			}
+		}
+		// 秒传失败，etag可能不可靠，继续流式计算真实MD5
+	}
+
+	// 流式计算MD5
 	md5Hash := utils.MD5.NewFunc()
 	size := file.GetSize()
 	chunkSize := int64(10 * 1024 * 1024) // 10MB per chunk for MD5 calculation
@@ -185,7 +209,7 @@ func (d *Open123) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		up(progress)
 	}
 
-	etag := hex.EncodeToString(md5Hash.Sum(nil))
+	etag = hex.EncodeToString(md5Hash.Sum(nil))
 
 	// 2. 创建上传任务
 	createResp, err := d.create(parentFileId, file.GetName(), etag, file.GetSize(), 2, false)
