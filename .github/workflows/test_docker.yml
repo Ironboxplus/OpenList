@@ -1,5 +1,4 @@
 name: Beta Release (Docker)
-
 on:
   workflow_dispatch:
   push:
@@ -7,51 +6,51 @@ on:
       - main
   pull_request:
     branches:
-      - main
+      - fix   # 👈 允许你的 fix 分支触发
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
-  DOCKERHUB_ORG_NAME: ${{ vars.DOCKERHUB_ORG_NAME || 'openlistteam' }}
-  GHCR_ORG_NAME: ${{ vars.GHCR_ORG_NAME || 'openlistteam' }}
-  IMAGE_NAME: openlist-git
-  IMAGE_NAME_DOCKERHUB: openlist
+  GHCR_ORG_NAME: ${{ vars.GHCR_ORG_NAME || 'ironboxplus' }} # 👈 最好改成你的用户名，防止推错地方
+  IMAGE_NAME: openlist
   REGISTRY: ghcr.io
   ARTIFACT_NAME: 'binaries_docker_release'
-  RELEASE_PLATFORMS: 'linux/amd64,linux/arm64,linux/arm/v7,linux/386,linux/arm/v6,linux/ppc64le,linux/riscv64,linux/loong64' ### Temporarily disable Docker builds for linux/s390x architectures for unknown reasons.
-  IMAGE_PUSH: ${{ github.event_name == 'push' }}
+  # 👇 关键修改：只保留 linux/amd64，删掉后面一长串
+  RELEASE_PLATFORMS: 'linux/amd64'
+  # 👇 关键修改：强制允许推送，不用管是不是 push 事件
+  IMAGE_PUSH: 'true'
   IMAGE_TAGS_BETA: |
     type=ref,event=pr
-    type=raw,value=beta,enable={{is_default_branch}}
+    type=raw,value=beta
 
 jobs:
   build_binary:
-    name: Build Binaries for Docker Release (Beta)
+    name: Build Binaries (x64 Only)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25.0'
 
+      # 即使只构建 x64，我们也需要 musl 工具链（因为 BuildDockerMultiplatform 默认会检查它）
       - name: Cache Musl
         id: cache-musl
         uses: actions/cache@v4
         with:
           path: build/musl-libs
           key: docker-musl-libs-v2
-
       - name: Download Musl Library
         if: steps.cache-musl.outputs.cache-hit != 'true'
         run: bash build.sh prepare docker-multiplatform
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build go binary (beta)
+      - name: Build go binary
+        # 这里还是跑 docker-multiplatform，虽然会多编译一些架构，但这是兼容 Dockerfile 路径最稳妥的方法
         run: bash build.sh beta docker-multiplatform
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -69,12 +68,13 @@ jobs:
 
   release_docker:
     needs: build_binary
-    name: Release Docker image (Beta)
+    name: Release Docker (x64)
     runs-on: ubuntu-latest
     permissions:
       packages: write
     strategy:
       matrix:
+        # 你可以选择只构建 latest，或者保留全部变体
         image: ["latest", "ffmpeg", "aria2", "aio"]
         include:
           - image: "latest"
@@ -102,27 +102,16 @@ jobs:
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: 'build/'
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # 👇 只保留 GitHub 登录，删除了 DockerHub 登录
       - name: Login to GitHub Container Registry
-        if: env.IMAGE_PUSH == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Login to DockerHub Container Registry
-        if: env.IMAGE_PUSH == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ vars.DOCKERHUB_ORG_NAME_BACKUP || env.DOCKERHUB_ORG_NAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Docker meta
         id: meta
@@ -130,18 +119,15 @@ jobs:
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.GHCR_ORG_NAME }}/${{ env.IMAGE_NAME }}
-            ${{ env.DOCKERHUB_ORG_NAME }}/${{ env.IMAGE_NAME_DOCKERHUB }}
           tags: ${{ env.IMAGE_TAGS_BETA }}
-          flavor: |
-            ${{ matrix.tag_favor }}
+          flavor: ${{ matrix.tag_favor }}
 
       - name: Build and push
-        id: docker_build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile.ci
-          push: ${{ env.IMAGE_PUSH == 'true' }}
+          push: true
           build-args: |
             BASE_IMAGE_TAG=${{ matrix.base_image_tag }}
             ${{ matrix.build_arg }}
