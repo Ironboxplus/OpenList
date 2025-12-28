@@ -119,6 +119,21 @@ func fileToObj(f File) *model.ObjThumb {
 	if originalMd5 != decryptedMd5 {
 		utils.Log.Warnf("║   ⚠ MD5被修改了！")
 		utils.Log.Warnf("║   这意味着执行了解密/转换操作")
+
+		// 测试备用加密方法：使用解密后的MD5加密，看是否能还原成百度的格式
+		utils.Log.Debugf("╠══════════════════════════════════════════════════════════╣")
+		utils.Log.Debugf("║ [验证] 使用encMd5测试逆向过程")
+		utils.Log.Debugf("║   假设: encMd5(解密后MD5) 应该 = 百度加密MD5")
+		reEncrypted := encMd5(decryptedMd5)
+		utils.Log.Debugf("║   encMd5('%s') = '%s'", decryptedMd5, reEncrypted)
+		utils.Log.Debugf("║   是否匹配百度原始: %v", reEncrypted == originalMd5)
+		if reEncrypted == originalMd5 {
+			utils.Log.Debugf("║   ✓ 完美匹配！解密算法正确")
+		} else {
+			utils.Log.Warnf("║   ✗ 不匹配！")
+			utils.Log.Warnf("║   百度原始: %s", originalMd5)
+			utils.Log.Warnf("║   重新加密: %s", reEncrypted)
+		}
 	} else {
 		utils.Log.Debugf("║   ✓ MD5未被修改（直接返回原值）")
 		utils.Log.Debugf("║   这意味着百度返回的就是标准格式")
@@ -138,9 +153,26 @@ func fileToObj(f File) *model.ObjThumb {
 	utils.Log.Debugf("║    - 如果是加密格式: DecryptMd5需要解密")
 	utils.Log.Debugf("║ 2. '直接获取的MD5是错误的'这个注释是否过时？")
 	utils.Log.Debugf("║    - 可能百度以前返回加密MD5，现在已经改为标准格式")
-	utils.Log.Debugf("║ 3. 如果Etag验证失败，可能的原因：")
-	utils.Log.Debugf("║    - MD5本身格式正确，但客户端对Etag格式有特殊要求")
+	utils.Log.Debugf("║ 3. 解密后的MD5是否是文件的真实MD5？")
+	utils.Log.Debugf("║    - 这是核心问题！")
+	utils.Log.Debugf("║    - 如果解密后MD5 ≠ 文件真实MD5：")
+	utils.Log.Debugf("║      → 上传到123网盘时MD5校验会失败")
+	utils.Log.Debugf("║      → 必须重新计算文件真实MD5")
+	utils.Log.Debugf("║    - 如果解密后MD5 = 文件真实MD5：")
+	utils.Log.Debugf("║      → 可以直接使用，秒传成功")
+	utils.Log.Debugf("║ 4. 百度的MD5加密/解密可能只是防爬虫手段")
+	utils.Log.Debugf("║    - 解密后的MD5可能仍然不是文件真实MD5")
+	utils.Log.Debugf("║    - 只是百度内部的文件标识符")
+	utils.Log.Debugf("║ 5. 如果Etag验证失败，可能的原因：")
+	utils.Log.Debugf("║    - MD5本身格式正确，但不是文件真实MD5")
+	utils.Log.Debugf("║    - 客户端对Etag格式有特殊要求")
 	utils.Log.Debugf("║    - Etag的引号、大小写等格式问题")
+	utils.Log.Debugf("║")
+	utils.Log.Debugf("║ [建议]")
+	utils.Log.Debugf("║ 从百度网盘复制到其他网盘时:")
+	utils.Log.Debugf("║ - 不要信任百度提供的MD5（无论是否解密）")
+	utils.Log.Debugf("║ - 强制重新计算文件的真实MD5")
+	utils.Log.Debugf("║ - 或者在目标网盘驱动中添加MD5验证逻辑")
 	utils.Log.Debugf("╚══════════════════════════════════════════════════════════╝")
 
 	return &model.ObjThumb{

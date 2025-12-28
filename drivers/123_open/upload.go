@@ -24,20 +24,50 @@ import (
 
 // 创建文件 V2
 func (d *Open123) create(parentFileID int64, filename string, etag string, size int64, duplicate int, containDir bool) (*UploadCreateResp, error) {
+	utils.Log.Debugf("    ┌─ [create API] 调用开始 ─────────────────────────┐")
+	utils.Log.Debugf("    │ URL: %s", UploadCreate)
+
+	lowerEtag := strings.ToLower(etag)
+	utils.Log.Debugf("    │ 请求参数:")
+	utils.Log.Debugf("    │   parentFileId: %d", parentFileID)
+	utils.Log.Debugf("    │   filename: %s", filename)
+	utils.Log.Debugf("    │   etag(原始): %s", etag)
+	utils.Log.Debugf("    │   etag(小写): %s", lowerEtag)
+	utils.Log.Debugf("    │   size: %d", size)
+	utils.Log.Debugf("    │   duplicate: %d", duplicate)
+	utils.Log.Debugf("    │   containDir: %v", containDir)
+
 	var resp UploadCreateResp
 	_, err := d.Request(UploadCreate, http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{
 			"parentFileId": parentFileID,
 			"filename":     filename,
-			"etag":         strings.ToLower(etag),
+			"etag":         lowerEtag,
 			"size":         size,
 			"duplicate":    duplicate,
 			"containDir":   containDir,
 		})
 	}, &resp)
+
 	if err != nil {
+		utils.Log.Errorf("    │ ✗ API调用失败: %v", err)
+		utils.Log.Debugf("    └───────────────────────────────────────────────┘")
 		return nil, err
 	}
+
+	utils.Log.Debugf("    │ ✓ API调用成功")
+	utils.Log.Debugf("    │ 响应:")
+	utils.Log.Debugf("    │   Code: %d", resp.Code)
+	utils.Log.Debugf("    │   Message: %s", resp.Message)
+	utils.Log.Debugf("    │   Data.Reuse: %v", resp.Data.Reuse)
+	utils.Log.Debugf("    │   Data.FileID: %d", resp.Data.FileID)
+	utils.Log.Debugf("    │   Data.PreuploadID: %s", resp.Data.PreuploadID)
+	utils.Log.Debugf("    │   Data.SliceSize: %d", resp.Data.SliceSize)
+	if len(resp.Data.Servers) > 0 {
+		utils.Log.Debugf("    │   Data.Servers[0]: %s", resp.Data.Servers[0])
+	}
+	utils.Log.Debugf("    └───────────────────────────────────────────────┘")
+
 	return &resp, nil
 }
 
@@ -168,14 +198,30 @@ func (d *Open123) Upload(ctx context.Context, file model.FileStreamer, createRes
 
 // 上传完毕
 func (d *Open123) complete(preuploadID string) (*UploadCompleteResp, error) {
+	utils.Log.Debugf("    ┌─ [complete API] 调用 ────────────────────────┐")
+	utils.Log.Debugf("    │ URL: %s", UploadComplete)
+	utils.Log.Debugf("    │ 请求参数:")
+	utils.Log.Debugf("    │   preuploadID: %s", preuploadID)
+
 	var resp UploadCompleteResp
 	_, err := d.Request(UploadComplete, http.MethodPost, func(req *resty.Request) {
 		req.SetBody(base.Json{
 			"preuploadID": preuploadID,
 		})
 	}, &resp)
+
 	if err != nil {
+		utils.Log.Debugf("    │ ✗ API调用失败: %v", err)
+		utils.Log.Debugf("    └──────────────────────────────────────────────┘")
 		return nil, err
 	}
+
+	utils.Log.Debugf("    │ ✓ API响应:")
+	utils.Log.Debugf("    │   Code: %d", resp.Code)
+	utils.Log.Debugf("    │   Message: %s", resp.Message)
+	utils.Log.Debugf("    │   Data.Completed: %v", resp.Data.Completed)
+	utils.Log.Debugf("    │   Data.FileID: %d", resp.Data.FileID)
+	utils.Log.Debugf("    └──────────────────────────────────────────────┘")
+
 	return &resp, nil
 }

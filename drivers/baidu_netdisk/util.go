@@ -446,23 +446,142 @@ func (d *BaiduNetdisk) requestForUploadUrl(path, uploadId string) (string, error
 // }
 
 func DecryptMd5(encryptMd5 string) string {
-	if _, err := hex.DecodeString(encryptMd5); err == nil {
+	utils.Log.Debugf("┌─────────────────────────────────────────────────────────┐")
+	utils.Log.Debugf("│ [DecryptMd5] 开始处理")
+	utils.Log.Debugf("│ 输入: '%s' (长度:%d)", encryptMd5, len(encryptMd5))
+
+	if encryptMd5 == "" {
+		utils.Log.Debugf("│ 输入为空，直接返回")
+		utils.Log.Debugf("└─────────────────────────────────────────────────────────┘")
 		return encryptMd5
 	}
+
+	// 检查是否已经是有效的十六进制
+	if _, err := hex.DecodeString(encryptMd5); err == nil {
+		utils.Log.Debugf("│ ✓ 已是有效的32位十六进制MD5，无需解密")
+		utils.Log.Debugf("│ 输出: '%s'", encryptMd5)
+		utils.Log.Debugf("└─────────────────────────────────────────────────────────┘")
+		return encryptMd5
+	} else {
+		utils.Log.Debugf("│ ✗ 不是有效十六进制: %v", err)
+		utils.Log.Debugf("│ 需要执行解密操作")
+	}
+
+	utils.Log.Debugf("│")
+	utils.Log.Debugf("│ [步骤1] XOR解密")
 
 	var out strings.Builder
 	out.Grow(len(encryptMd5))
 	for i, n := 0, int64(0); i < len(encryptMd5); i++ {
 		if i == 9 {
+			// 特殊处理：第9位字符减去'g'
 			n = int64(unicode.ToLower(rune(encryptMd5[i])) - 'g')
+			utils.Log.Debugf("│   位置%d: '%c' -> toLower('%c') - 'g' = %d",
+				i, encryptMd5[i], unicode.ToLower(rune(encryptMd5[i])), n)
 		} else {
 			n, _ = strconv.ParseInt(encryptMd5[i:i+1], 16, 64)
 		}
-		out.WriteString(strconv.FormatInt(n^int64(15&i), 16))
+		xorResult := n ^ int64(15&i)
+		out.WriteString(strconv.FormatInt(xorResult, 16))
 	}
 
-	encryptMd5 = out.String()
-	return encryptMd5[8:16] + encryptMd5[:8] + encryptMd5[24:32] + encryptMd5[16:24]
+	xorOutput := out.String()
+	utils.Log.Debugf("│ XOR结果: '%s'", xorOutput)
+
+	utils.Log.Debugf("│")
+	utils.Log.Debugf("│ [步骤2] 位置交换")
+	utils.Log.Debugf("│   [8:16]  (8个字符): '%s'", xorOutput[8:16])
+	utils.Log.Debugf("│   [0:8]   (8个字符): '%s'", xorOutput[:8])
+	utils.Log.Debugf("│   [24:32] (8个字符): '%s'", xorOutput[24:32])
+	utils.Log.Debugf("│   [16:24] (8个字符): '%s'", xorOutput[16:24])
+
+	finalMd5 := xorOutput[8:16] + xorOutput[:8] + xorOutput[24:32] + xorOutput[16:24]
+
+	utils.Log.Debugf("│")
+	utils.Log.Debugf("│ [最终结果]")
+	utils.Log.Debugf("│ 输出: '%s' (长度:%d)", finalMd5, len(finalMd5))
+
+	// 验证最终结果
+	if _, err := hex.DecodeString(finalMd5); err == nil {
+		utils.Log.Debugf("│ ✓ 解密成功！输出是有效的32位十六进制MD5")
+	} else {
+		utils.Log.Warnf("│ ✗ 解密结果不是有效的十六进制: %v", err)
+	}
+
+	utils.Log.Debugf("└─────────────────────────────────────────────────────────┘")
+
+	return finalMd5
+}
+
+// encMd5 备用加密方法（基于Java实现）
+// 用于验证加密逻辑的另一种实现方式
+func encMd5(md5 string) string {
+	utils.Log.Debugf("    ┌─ [encMd5备用方法] ──────────────────────────┐")
+	utils.Log.Debugf("    │ 输入MD5: %s", md5)
+
+	// 位置交换
+	temp := md5[8:16] + md5[0:8] + md5[24:32] + md5[16:24]
+	utils.Log.Debugf("    │ 位置交换后: %s", temp)
+
+	var res strings.Builder
+	res.Grow(32)
+
+	for i := 0; i < len(temp); i++ {
+		c := temp[i]
+		// Character.digit(c, 16) 等价于 strconv.ParseInt
+		digit, _ := strconv.ParseInt(string(c), 16, 64)
+		xorResult := digit ^ int64(15&i)
+		res.WriteString(strconv.FormatInt(xorResult, 16))
+	}
+
+	// 特殊处理第9位：将十六进制数字加上'g'
+	result := res.String()
+	utils.Log.Debugf("    │ XOR后: %s", result)
+
+	if len(result) > 9 {
+		digit9, _ := strconv.ParseInt(string(result[9]), 16, 64)
+		char9 := rune(digit9 + 'g')
+		result = result[:9] + string(char9) + result[10:]
+		utils.Log.Debugf("    │ 替换位置9: '%c' (digit:%d + 'g')", char9, digit9)
+	}
+
+	utils.Log.Debugf("    │ 最终输出: %s", result)
+	utils.Log.Debugf("    └────────────────────────────────────────────┘")
+
+	return result
+}
+
+// DecryptMd5Alternative 备用解密方法（使用encMd5逆向）
+// 如果标准解密失败，可以尝试这个方法
+func DecryptMd5Alternative(encryptMd5 string) string {
+	utils.Log.Debugf("┌─────────────────────────────────────────────────────────┐")
+	utils.Log.Debugf("│ [DecryptMd5Alternative] 备用解密方法")
+	utils.Log.Debugf("│ 输入: '%s'", encryptMd5)
+
+	if encryptMd5 == "" {
+		utils.Log.Debugf("│ 输入为空")
+		utils.Log.Debugf("└─────────────────────────────────────────────────────────┘")
+		return encryptMd5
+	}
+
+	// 检查是否已经是有效的十六进制
+	if _, err := hex.DecodeString(encryptMd5); err == nil {
+		utils.Log.Debugf("│ 已是有效hex，直接返回")
+		utils.Log.Debugf("└─────────────────────────────────────────────────────────┘")
+		return encryptMd5
+	}
+
+	// 使用encMd5方法验证：尝试加密标准MD5，看是否能得到百度的加密格式
+	// 这里我们假设输入是加密的，需要通过逆向得到原始MD5
+
+	utils.Log.Debugf("│ 尝试使用encMd5逆向解密...")
+	utils.Log.Debugf("│ 提示: encMd5(真实MD5) = 百度加密MD5")
+	utils.Log.Debugf("│ 当前我们有百度加密MD5，需要找到真实MD5")
+	utils.Log.Debugf("└─────────────────────────────────────────────────────────┘")
+
+	// 注意：这只是演示，实际解密需要逆向encMd5的每一步
+	// 当前仍使用标准解密方法
+	return DecryptMd5(encryptMd5)
 }
 
 func EncryptMd5(originalMd5 string) string {
