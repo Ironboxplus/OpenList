@@ -19,19 +19,21 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/net"
 	streamPkg "github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/errgroup"
+	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/avast/retry-go"
 	log "github.com/sirupsen/logrus"
 )
 
 // calculateHashesStream 流式计算文件的MD5哈希值
-// 返回：文件MD5、前256KB的MD5、每个分片的MD5列表、StreamSectionReader
+// 返回：文件MD5、前256KB的MD5、每个分片的MD5列表
+// 注意：此函数使用 RangeRead 读取数据，不会消耗流
 func (d *BaiduNetdisk) calculateHashesStream(
 	ctx context.Context,
 	stream model.FileStreamer,
 	sliceSize int64,
 	up *driver.UpdateProgress,
-) (contentMd5 string, sliceMd5 string, blockList []string, ss streamPkg.StreamSectionReaderIF, err error) {
+) (contentMd5 string, sliceMd5 string, blockList []string, err error) {
 	streamSize := stream.GetSize()
 	count := 1
 	if streamSize > sliceSize {
@@ -40,12 +42,6 @@ func (d *BaiduNetdisk) calculateHashesStream(
 	lastBlockSize := streamSize % sliceSize
 	if lastBlockSize == 0 {
 		lastBlockSize = sliceSize
-	}
-
-	// 创建 StreamSectionReader 用于流式读取
-	ss, err = streamPkg.NewStreamSectionReader(stream, int(sliceSize), nil)
-	if err != nil {
-		return "", "", nil, nil, err
 	}
 
 	// 前256KB的MD5
@@ -57,7 +53,7 @@ func (d *BaiduNetdisk) calculateHashesStream(
 
 	for i := 0; i < count; i++ {
 		if utils.IsCanceled(ctx) {
-			return "", "", nil, nil, ctx.Err()
+			return "", "", nil, ctx.Err()
 		}
 
 		offset := int64(i) * sliceSize
@@ -66,9 +62,10 @@ func (d *BaiduNetdisk) calculateHashesStream(
 			length = lastBlockSize
 		}
 
-		reader, err := ss.GetSectionReader(offset, length)
+		// 使用 RangeRead 读取数据，不会消耗流
+		reader, err := stream.RangeRead(http_range.Range{Start: offset, Length: length})
 		if err != nil {
-			return "", "", nil, nil, err
+			return "", "", nil, err
 		}
 
 		// 计算分片MD5
@@ -81,16 +78,17 @@ func (d *BaiduNetdisk) calculateHashesStream(
 			writers = append(writers, utils.LimitWriter(sliceMd5H2, remaining))
 		}
 
-		reader.Seek(0, io.SeekStart)
 		n, err := io.Copy(io.MultiWriter(writers...), reader)
+		// 关闭 reader（如果是 ReadCloser）
+		if rc, ok := reader.(io.Closer); ok {
+			rc.Close()
+		}
 		if err != nil {
-			ss.FreeSectionReader(reader)
-			return "", "", nil, nil, err
+			return "", "", nil, err
 		}
 		sliceWritten += n
 
 		blockList = append(blockList, hex.EncodeToString(sliceMd5Calc.Sum(nil)))
-		ss.FreeSectionReader(reader)
 
 		// 更新进度（哈希计算占总进度的一小部分）
 		if up != nil {
@@ -101,7 +99,7 @@ func (d *BaiduNetdisk) calculateHashesStream(
 
 	return hex.EncodeToString(fileMd5H.Sum(nil)),
 		hex.EncodeToString(sliceMd5H2.Sum(nil)),
-		blockList, ss, nil
+		blockList, nil
 }
 
 // uploadChunksStream 流式上传所有分片
