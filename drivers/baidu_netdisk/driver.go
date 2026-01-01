@@ -198,8 +198,8 @@ func (d *BaiduNetdisk) Put(ctx context.Context, dstDir model.Obj, stream model.F
 	mtime := stream.ModTime().Unix()
 	ctime := stream.CreateTime().Unix()
 
-	// step.1 流式计算MD5哈希值
-	contentMd5, sliceMd5, blockList, ss, err := d.calculateHashesStream(ctx, stream, sliceSize, &up)
+	// step.1 流式计算MD5哈希值（使用 RangeRead，不会消耗流）
+	contentMd5, sliceMd5, blockList, err := d.calculateHashesStream(ctx, stream, sliceSize, &up)
 	if err != nil {
 		return nil, err
 	}
@@ -231,14 +231,10 @@ func (d *BaiduNetdisk) Put(ctx context.Context, dstDir model.Obj, stream model.F
 	}
 
 	// step.3 流式上传分片
-	// 由于流式上传已经消耗了流，需要重新创建 StreamSectionReader
-	// 如果有缓存文件，可以直接使用；否则需要通过 RangeRead 重新获取
-	if ss == nil || stream.GetFile() == nil {
-		// 重新创建 StreamSectionReader
-		ss, err = streamPkg.NewStreamSectionReader(stream, int(sliceSize), &up)
-		if err != nil {
-			return nil, err
-		}
+	// 创建 StreamSectionReader 用于上传
+	ss, err := streamPkg.NewStreamSectionReader(stream, int(sliceSize), &up)
+	if err != nil {
+		return nil, err
 	}
 
 uploadLoop:
@@ -333,7 +329,6 @@ func (d *BaiduNetdisk) precreate(ctx context.Context, path string, streamSize in
 
 	return &precreateResp, nil
 }
-
 
 func (d *BaiduNetdisk) GetDetails(ctx context.Context) (*model.StorageDetails, error) {
 	du, err := d.quota(ctx)
