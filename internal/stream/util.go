@@ -198,18 +198,34 @@ func StreamHashFile(file model.FileStreamer, hashType *utils.HashType, progressW
 	size := file.GetSize()
 	chunkSize := int64(10 * 1024 * 1024) // 10MB per chunk
 	var offset int64 = 0
+	const maxRetries = 3
 	for offset < size {
 		readSize := chunkSize
 		if size-offset < chunkSize {
 			readSize = size - offset
 		}
-		reader, err := file.RangeRead(http_range.Range{Start: offset, Length: readSize})
-		if err != nil {
-			return "", fmt.Errorf("range read for hash calculation failed: %w", err)
+
+		var lastErr error
+		for retry := 0; retry < maxRetries; retry++ {
+			reader, err := file.RangeRead(http_range.Range{Start: offset, Length: readSize})
+			if err != nil {
+				lastErr = fmt.Errorf("range read for hash calculation failed: %w", err)
+				continue
+			}
+			_, err = io.Copy(hashFunc, reader)
+			if closer, ok := reader.(io.Closer); ok {
+				closer.Close()
+			}
+			if err == nil {
+				lastErr = nil
+				break
+			}
+			lastErr = fmt.Errorf("calculate hash failed at offset %d: %w", offset, err)
 		}
-		if _, err := io.Copy(hashFunc, reader); err != nil {
-			return "", fmt.Errorf("calculate hash failed: %w", err)
+		if lastErr != nil {
+			return "", lastErr
 		}
+
 		offset += readSize
 
 		if up != nil && progressWeight > 0 {
