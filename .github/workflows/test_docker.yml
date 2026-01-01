@@ -23,7 +23,7 @@ env:
   IMAGE_PUSH: 'true'
   IMAGE_TAGS_BETA: |
     type=ref,event=pr
-    type=raw,value=beta
+    type=raw,value=beta-baidu
 
 jobs:
   build_binary:
