@@ -50,6 +50,23 @@ func Proxy(w http.ResponseWriter, r *http.Request, link *model.Link, file model.
 		})
 	}
 
+	// If link has Refresher, use RangeReader to enable automatic link refresh on expiry
+	if link.Refresher != nil {
+		attachHeader(w, file, link)
+		size := link.ContentLength
+		if size <= 0 {
+			size = file.GetSize()
+		}
+		rrf, err := stream.GetRangeReaderFromLink(size, link)
+		if err != nil {
+			return err
+		}
+		r = r.WithContext(context.WithValue(r.Context(), conf.RequestHeaderKey, r.Header))
+		return net.ServeHTTP(w, r, file.GetName(), file.ModTime(), size, &model.RangeReadCloser{
+			RangeReader: rrf,
+		})
+	}
+
 	//transparent proxy
 	header := net.ProcessHeader(r.Header, link.Header)
 	res, err := net.RequestHttp(r.Context(), r.Method, header, link.URL)
