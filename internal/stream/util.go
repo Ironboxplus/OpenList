@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -28,7 +30,129 @@ func (f RangeReaderFunc) RangeRead(ctx context.Context, httpRange http_range.Ran
 	return f(ctx, httpRange)
 }
 
+// IsLinkExpiredError checks if the error indicates an expired download link
+func IsLinkExpiredError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+
+	// Common expired link error keywords
+	expiredKeywords := []string{
+		"expired", "invalid signature", "token expired",
+		"access denied", "forbidden", "unauthorized",
+		"link has expired", "url expired", "request has expired",
+		"signature expired", "accessdenied", "invalidtoken",
+	}
+	for _, keyword := range expiredKeywords {
+		if strings.Contains(errStr, keyword) {
+			return true
+		}
+	}
+
+	// Check for HTTP status codes that typically indicate expired links
+	if statusErr, ok := errs.UnwrapOrSelf(err).(net.HttpStatusCodeError); ok {
+		code := int(statusErr)
+		// 401 Unauthorized, 403 Forbidden, 410 Gone are common for expired links
+		// 500 Internal Server Error - some providers (e.g., Baidu) return 500 when link expires
+		if code == 401 || code == 403 || code == 410 || code == 500 {
+			return true
+		}
+	}
+
+	return false
+}
+
+// RefreshableRangeReader wraps a RangeReader with link refresh capability
+type RefreshableRangeReader struct {
+	link         *model.Link
+	size         int64
+	innerReader  model.RangeReaderIF
+	mu           sync.Mutex
+	refreshCount int // track refresh count to avoid infinite loops
+}
+
+// NewRefreshableRangeReader creates a new RefreshableRangeReader
+func NewRefreshableRangeReader(link *model.Link, size int64) *RefreshableRangeReader {
+	return &RefreshableRangeReader{
+		link: link,
+		size: size,
+	}
+}
+
+func (r *RefreshableRangeReader) getInnerReader() (model.RangeReaderIF, error) {
+	if r.innerReader != nil {
+		return r.innerReader, nil
+	}
+
+	// Create inner reader without Refresher to avoid recursion
+	linkCopy := *r.link
+	linkCopy.Refresher = nil
+
+	reader, err := GetRangeReaderFromLink(r.size, &linkCopy)
+	if err != nil {
+		return nil, err
+	}
+	r.innerReader = reader
+	return reader, nil
+}
+
+func (r *RefreshableRangeReader) RangeRead(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
+	r.mu.Lock()
+	reader, err := r.getInnerReader()
+	r.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	rc, err := reader.RangeRead(ctx, httpRange)
+	if err != nil {
+		// Check if we should try to refresh on initial connection error
+		if IsLinkExpiredError(err) && r.link.Refresher != nil {
+			rc, err = r.refreshAndRetry(ctx, httpRange)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return rc, nil
+}
+
+func (r *RefreshableRangeReader) refreshAndRetry(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.refreshCount >= 3 {
+		return nil, fmt.Errorf("max refresh attempts reached")
+	}
+
+	log.Infof("Link expired, attempting to refresh...")
+	newLink, _, refreshErr := r.link.Refresher(ctx)
+	if refreshErr != nil {
+		return nil, fmt.Errorf("failed to refresh link: %w", refreshErr)
+	}
+
+	newLink.Refresher = r.link.Refresher
+	r.link = newLink
+	r.innerReader = nil
+	r.refreshCount++
+
+	log.Infof("Link refreshed successfully, retrying request...")
+
+	reader, err := r.getInnerReader()
+	if err != nil {
+		return nil, err
+	}
+	return reader.RangeRead(ctx, httpRange)
+}
+
 func GetRangeReaderFromLink(size int64, link *model.Link) (model.RangeReaderIF, error) {
+	// If link has a Refresher, wrap with RefreshableRangeReader for automatic refresh on expiry
+	if link.Refresher != nil {
+		return NewRefreshableRangeReader(link, size), nil
+	}
+
 	if link.RangeReader != nil {
 		if link.Concurrency < 1 && link.PartSize < 1 {
 			return link.RangeReader, nil
