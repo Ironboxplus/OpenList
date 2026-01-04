@@ -19,7 +19,6 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/net"
 	streamPkg "github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/errgroup"
-	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/avast/retry-go"
 	log "github.com/sirupsen/logrus"
@@ -51,6 +50,11 @@ func (d *BaiduNetdisk) calculateHashesStream(
 	sliceMd5H2 := md5.New()
 	sliceWritten := int64(0)
 
+	// 使用固定大小的缓冲区进行流式哈希计算
+	// 这样可以利用 readFullWithRangeRead 的链接刷新逻辑
+	const chunkSize = 10 * 1024 * 1024 // 10MB per chunk
+	buf := make([]byte, chunkSize)
+
 	for i := 0; i < count; i++ {
 		if utils.IsCanceled(ctx) {
 			return "", "", nil, ctx.Err()
@@ -62,31 +66,39 @@ func (d *BaiduNetdisk) calculateHashesStream(
 			length = lastBlockSize
 		}
 
-		// 使用 RangeRead 读取数据，不会消耗流
-		reader, err := stream.RangeRead(http_range.Range{Start: offset, Length: length})
-		if err != nil {
-			return "", "", nil, err
-		}
-
 		// 计算分片MD5
 		sliceMd5Calc := md5.New()
 
-		// 同时写入多个哈希计算器
-		writers := []io.Writer{fileMd5H, sliceMd5Calc}
-		if sliceWritten < SliceSize {
-			remaining := SliceSize - sliceWritten
-			writers = append(writers, utils.LimitWriter(sliceMd5H2, remaining))
-		}
+		// 分块读取并计算哈希
+		var sliceOffset int64 = 0
+		for sliceOffset < length {
+			readSize := chunkSize
+			if length-sliceOffset < int64(chunkSize) {
+				readSize = int(length - sliceOffset)
+			}
 
-		n, err := io.Copy(io.MultiWriter(writers...), reader)
-		// 关闭 reader（如果是 ReadCloser）
-		if rc, ok := reader.(io.Closer); ok {
-			rc.Close()
+			// 使用 readFullWithRangeRead 读取数据，自动处理链接刷新
+			n, err := streamPkg.ReadFullWithRangeRead(stream, buf[:readSize], offset+sliceOffset)
+			if err != nil {
+				return "", "", nil, err
+			}
+
+			// 同时写入多个哈希计算器
+			fileMd5H.Write(buf[:n])
+			sliceMd5Calc.Write(buf[:n])
+			if sliceWritten < SliceSize {
+				remaining := SliceSize - sliceWritten
+				if int64(n) > remaining {
+					sliceMd5H2.Write(buf[:remaining])
+					sliceWritten += remaining
+				} else {
+					sliceMd5H2.Write(buf[:n])
+					sliceWritten += int64(n)
+				}
+			}
+
+			sliceOffset += int64(n)
 		}
-		if err != nil {
-			return "", "", nil, err
-		}
-		sliceWritten += n
 
 		blockList = append(blockList, hex.EncodeToString(sliceMd5Calc.Sum(nil)))
 
