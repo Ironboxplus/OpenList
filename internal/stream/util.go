@@ -174,6 +174,69 @@ func CacheFullAndHash(stream model.FileStreamer, up *model.UpdateProgress, hashT
 	return tmpF, hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// StreamHashFile 流式计算文件哈希值，避免将整个文件加载到内存
+// file: 文件流
+// hashType: 哈希算法类型
+// progressWeight: 进度权重（0-100），用于计算整体进度
+// up: 进度回调函数
+func StreamHashFile(file model.FileStreamer, hashType *utils.HashType, progressWeight float64, up *model.UpdateProgress) (string, error) {
+	// 如果已经有完整缓存文件，直接使用
+	if cache := file.GetFile(); cache != nil {
+		hashFunc := hashType.NewFunc()
+		cache.Seek(0, io.SeekStart)
+		_, err := io.Copy(hashFunc, cache)
+		if err != nil {
+			return "", err
+		}
+		if up != nil && progressWeight > 0 {
+			(*up)(progressWeight)
+		}
+		return hex.EncodeToString(hashFunc.Sum(nil)), nil
+	}
+
+	hashFunc := hashType.NewFunc()
+	size := file.GetSize()
+	chunkSize := int64(10 * 1024 * 1024) // 10MB per chunk
+	var offset int64 = 0
+	const maxRetries = 3
+	for offset < size {
+		readSize := chunkSize
+		if size-offset < chunkSize {
+			readSize = size - offset
+		}
+
+		var lastErr error
+		for retry := 0; retry < maxRetries; retry++ {
+			reader, err := file.RangeRead(http_range.Range{Start: offset, Length: readSize})
+			if err != nil {
+				lastErr = fmt.Errorf("range read for hash calculation failed: %w", err)
+				continue
+			}
+			_, err = io.Copy(hashFunc, reader)
+			if closer, ok := reader.(io.Closer); ok {
+				closer.Close()
+			}
+			if err == nil {
+				lastErr = nil
+				break
+			}
+			lastErr = fmt.Errorf("calculate hash failed at offset %d: %w", offset, err)
+		}
+		if lastErr != nil {
+			return "", lastErr
+		}
+
+		offset += readSize
+
+		if up != nil && progressWeight > 0 {
+			progress := progressWeight * float64(offset) / float64(size)
+			(*up)(progress)
+		}
+	}
+
+	return hex.EncodeToString(hashFunc.Sum(nil)), nil
+}
+
 type StreamSectionReaderIF interface {
 	// 线程不安全
 	GetSectionReader(off, length int64) (io.ReadSeeker, error)
@@ -188,37 +251,9 @@ func NewStreamSectionReader(file model.FileStreamer, maxBufferSize int, up *mode
 	}
 
 	maxBufferSize = min(maxBufferSize, int(file.GetSize()))
-	if maxBufferSize > conf.MaxBufferLimit {
-		f, err := os.CreateTemp(conf.Conf.TempDir, "file-*")
-		if err != nil {
-			return nil, err
-		}
 
-		if f.Truncate(file.GetSize()) != nil {
-			// fallback to full cache
-			_, _ = f.Close(), os.Remove(f.Name())
-			cache, err := file.CacheFullAndWriter(up, nil)
-			if err != nil {
-				return nil, err
-			}
-			return &cachedSectionReader{cache}, nil
-		}
-
-		ss := &fileSectionReader{file: file, temp: f}
-		ss.bufPool = &pool.Pool[*offsetWriterWithBase]{
-			New: func() *offsetWriterWithBase {
-				base := ss.tempOffset
-				ss.tempOffset += int64(maxBufferSize)
-				return &offsetWriterWithBase{io.NewOffsetWriter(ss.temp, base), base}
-			},
-		}
-		file.Add(utils.CloseFunc(func() error {
-			ss.bufPool.Reset()
-			return errors.Join(ss.temp.Close(), os.Remove(ss.temp.Name()))
-		}))
-		return ss, nil
-	}
-
+	// 始终使用 directSectionReader，只在内存中缓存当前分片
+	// 避免创建临时文件导致中间文件增长到整个文件大小
 	ss := &directSectionReader{file: file}
 	if conf.MmapThreshold > 0 && maxBufferSize >= conf.MmapThreshold {
 		ss.bufPool = &pool.Pool[[]byte]{
