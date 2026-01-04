@@ -269,6 +269,50 @@ func StreamHashFile(file model.FileStreamer, hashType *utils.HashType, progressW
 	return hex.EncodeToString(hashFunc.Sum(nil)), nil
 }
 
+// ComputePreHashAndFullHash 计算预哈希和完整哈希，针对需要秒传验证的云盘驱动（如115、阿里云盘等）
+// 通过先 RangeRead 预哈希部分并缓存，然后 StreamHashFile 计算完整哈希，避免流消耗顺序错误
+//
+// 参数:
+//   - file: 文件流
+//   - preHashSize: 预哈希的大小（如115的128KB）
+//   - hashType: 哈希算法类型
+//   - progressWeight: 完整哈希计算的进度权重（0-100）
+//   - up: 进度回调函数
+//
+// 返回:
+//   - preHash: 预哈希值（前 preHashSize 字节的哈希）
+//   - fullHash: 完整文件哈希值
+//   - err: 错误
+func ComputePreHashAndFullHash(file model.FileStreamer, preHashSize int64, hashType *utils.HashType, progressWeight float64, up *model.UpdateProgress) (preHash, fullHash string, err error) {
+	// 如果文件大小小于预哈希大小，使用实际大小
+	hashSize := preHashSize
+	if file.GetSize() < preHashSize {
+		hashSize = file.GetSize()
+	}
+
+	// 步骤1：先读取前 N 字节（会缓存到 FileStream.peekBuff）
+	reader, err := file.RangeRead(http_range.Range{Start: 0, Length: hashSize})
+	if err != nil {
+		return "", "", err
+	}
+	preHash, err = utils.HashReader(hashType, reader)
+	if err != nil {
+		return "", "", err
+	}
+
+	// 步骤2：检查是否已有完整哈希
+	fullHash = file.GetHash().GetHash(hashType)
+	if len(fullHash) != hashType.Width {
+		// 流式计算完整哈希 - 会从已缓存的 peekBuff 开始，不会重复读取
+		fullHash, err = StreamHashFile(file, hashType, progressWeight, up)
+		if err != nil {
+			return "", "", err
+		}
+	}
+
+	return preHash, fullHash, nil
+}
+
 type StreamSectionReaderIF interface {
 	// 线程不安全
 	GetSectionReader(off, length int64) (io.ReadSeeker, error)
