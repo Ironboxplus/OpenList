@@ -14,6 +14,8 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/go-resty/resty/v2"
@@ -195,6 +197,92 @@ func (d *OpenList) Remove(ctx context.Context, obj model.Obj) error {
 }
 
 func (d *OpenList) Put(ctx context.Context, dstDir model.Obj, s model.FileStreamer, up driver.UpdateProgress) error {
+	// 预计算 hash（如果不存在），使用 RangeRead 不消耗 Reader
+	// 这样远端驱动不需要再计算，避免 HTTP body 被重复读取
+	md5Hash := s.GetHash().GetHash(utils.MD5)
+	sha1Hash := s.GetHash().GetHash(utils.SHA1)
+	sha256Hash := s.GetHash().GetHash(utils.SHA256)
+	sha1_128kHash := s.GetHash().GetHash(utils.SHA1_128K)
+	preHash := s.GetHash().GetHash(utils.PRE_HASH)
+
+	// 计算所有缺失的 hash，确保最大兼容性
+	if len(md5Hash) != utils.MD5.Width {
+		var err error
+		md5Hash, err = stream.StreamHashFile(s, utils.MD5, 33, &up)
+		if err != nil {
+			log.Warnf("[openlist] failed to pre-calculate MD5: %v", err)
+			md5Hash = ""
+		}
+	}
+	if len(sha1Hash) != utils.SHA1.Width {
+		var err error
+		sha1Hash, err = stream.StreamHashFile(s, utils.SHA1, 33, &up)
+		if err != nil {
+			log.Warnf("[openlist] failed to pre-calculate SHA1: %v", err)
+			sha1Hash = ""
+		}
+	}
+	if len(sha256Hash) != utils.SHA256.Width {
+		var err error
+		sha256Hash, err = stream.StreamHashFile(s, utils.SHA256, 34, &up)
+		if err != nil {
+			log.Warnf("[openlist] failed to pre-calculate SHA256: %v", err)
+			sha256Hash = ""
+		}
+	}
+
+	// 计算特殊 hash（用于秒传验证）
+	// SHA1_128K: 前128KB的SHA1，115网盘使用
+	if len(sha1_128kHash) != utils.SHA1_128K.Width {
+		const PreHashSize int64 = 128 * 1024 // 128KB
+		hashSize := PreHashSize
+		if s.GetSize() < PreHashSize {
+			hashSize = s.GetSize()
+		}
+		reader, err := s.RangeRead(http_range.Range{Start: 0, Length: hashSize})
+		if err == nil {
+			sha1_128kHash, err = utils.HashReader(utils.SHA1, reader)
+			if closer, ok := reader.(io.Closer); ok {
+				_ = closer.Close()
+			}
+			if err != nil {
+				log.Warnf("[openlist] failed to pre-calculate SHA1_128K: %v", err)
+				sha1_128kHash = ""
+			}
+		} else {
+			log.Warnf("[openlist] failed to RangeRead for SHA1_128K: %v", err)
+		}
+	}
+
+	// PRE_HASH: 前1024字节的SHA1，阿里云盘使用
+	if len(preHash) != utils.PRE_HASH.Width {
+		const PreHashSize int64 = 1024 // 1KB
+		hashSize := PreHashSize
+		if s.GetSize() < PreHashSize {
+			hashSize = s.GetSize()
+		}
+		reader, err := s.RangeRead(http_range.Range{Start: 0, Length: hashSize})
+		if err == nil {
+			preHash, err = utils.HashReader(utils.SHA1, reader)
+			if closer, ok := reader.(io.Closer); ok {
+				_ = closer.Close()
+			}
+			if err != nil {
+				log.Warnf("[openlist] failed to pre-calculate PRE_HASH: %v", err)
+				preHash = ""
+			}
+		} else {
+			log.Warnf("[openlist] failed to RangeRead for PRE_HASH: %v", err)
+		}
+	}
+
+	// 诊断日志：检查流的状态
+	if ss, ok := s.(*stream.SeekableStream); ok {
+		if ss.Reader != nil {
+			log.Warnf("[openlist] WARNING: SeekableStream.Reader is not nil for file %s, stream may have been consumed!", s.GetName())
+		}
+	}
+
 	reader := driver.NewLimitedUploadStream(ctx, &driver.ReaderUpdatingProgress{
 		Reader:         s,
 		UpdateProgress: up,
@@ -206,14 +294,20 @@ func (d *OpenList) Put(ctx context.Context, dstDir model.Obj, s model.FileStream
 	req.Header.Set("Authorization", d.Token)
 	req.Header.Set("File-Path", path.Join(dstDir.GetPath(), s.GetName()))
 	req.Header.Set("Password", d.MetaPassword)
-	if md5 := s.GetHash().GetHash(utils.MD5); len(md5) > 0 {
-		req.Header.Set("X-File-Md5", md5)
+	if len(md5Hash) > 0 {
+		req.Header.Set("X-File-Md5", md5Hash)
 	}
-	if sha1 := s.GetHash().GetHash(utils.SHA1); len(sha1) > 0 {
-		req.Header.Set("X-File-Sha1", sha1)
+	if len(sha1Hash) > 0 {
+		req.Header.Set("X-File-Sha1", sha1Hash)
 	}
-	if sha256 := s.GetHash().GetHash(utils.SHA256); len(sha256) > 0 {
-		req.Header.Set("X-File-Sha256", sha256)
+	if len(sha256Hash) > 0 {
+		req.Header.Set("X-File-Sha256", sha256Hash)
+	}
+	if len(sha1_128kHash) > 0 {
+		req.Header.Set("X-File-Sha1-128k", sha1_128kHash)
+	}
+	if len(preHash) > 0 {
+		req.Header.Set("X-File-Pre-Hash", preHash)
 	}
 
 	req.ContentLength = s.GetSize()

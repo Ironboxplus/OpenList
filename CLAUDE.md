@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Core Development Principles
+
+1. **最小代码改动原则** (Minimum code changes): Make the smallest change necessary to achieve the goal
+2. **不缓存整个文件原则** (No full file caching for seekable streams): For SeekableStream, use RangeRead instead of caching entire file
+3. **必要情况下可以多遍上传原则** (Multi-pass upload when necessary): If rapid upload fails, fall back to normal upload
+
 ## Build and Development Commands
 
 ```bash
@@ -165,6 +171,49 @@ Response (JSON / Proxy / Redirect)
    - Splits file into parts based on `Concurrency` and `PartSize`
    - Downloads parts in parallel
    - Assembles final stream
+
+**Stream Types and Reader Management**:
+
+⚠️ **CRITICAL**: SeekableStream.Reader must NEVER be created early!
+
+- **FileStream**: One-time sequential stream (e.g., HTTP body)
+  - `Reader` is set at creation and consumed sequentially
+  - Cannot be rewound or re-read
+
+- **SeekableStream**: Reusable stream with RangeRead capability
+  - Has `rangeReader` for creating new readers on-demand
+  - `Reader` should ONLY be created when actually needed for sequential reading
+  - **DO NOT create Reader early** - use lazy initialization via `generateReader()`
+
+**Common Pitfall - Early Reader Creation**:
+```go
+// ❌ WRONG: Creating Reader early
+if _, ok := rr.(*model.FileRangeReader); ok {
+    rc, _ := rr.RangeRead(ctx, http_range.Range{Length: -1})
+    fs.Reader = rc  // This will be consumed by intermediate operations!
+}
+
+// ✅ CORRECT: Let generateReader() create it on-demand
+// Reader will be created only when Read() is called
+return &SeekableStream{FileStream: fs, rangeReader: rr}, nil
+```
+
+**Why This Matters**:
+- Hash calculation uses `StreamHashFile()` which reads the file via RangeRead
+- If Reader is created early, it may be at EOF when HTTP upload actually needs it
+- Result: `http: ContentLength=X with Body length 0` error
+
+**Hash Calculation for Uploads**:
+```go
+// For SeekableStream: Use RangeRead to avoid consuming Reader
+if _, ok := file.(*SeekableStream); ok {
+    hash, err = stream.StreamHashFile(file, utils.MD5, 40, &up)
+    // StreamHashFile uses RangeRead internally, Reader remains unused
+}
+
+// For FileStream: Must cache first, then calculate hash
+_, hash, err = stream.CacheFullAndHash(file, &up, utils.MD5)
+```
 
 **Link Refresh Pattern**:
 ```go

@@ -226,28 +226,97 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 	if err != nil {
 		return err
 	}
+
 	sha1 := file.GetHash().GetHash(utils.SHA1)
-	if len(sha1) != utils.SHA1.Width {
-		// 流式计算SHA1
-		sha1, err = stream.StreamHashFile(file, utils.SHA1, 100, &up)
+	sha1128k := file.GetHash().GetHash(utils.SHA1_128K)
+
+	// 检查是否是可重复读取的流
+	_, isSeekable := file.(*stream.SeekableStream)
+
+	// 如果有预计算的 hash，先尝试秒传
+	if len(sha1) == utils.SHA1.Width && len(sha1128k) == utils.SHA1_128K.Width {
+		resp, err := d.client.UploadInit(ctx, &sdk.UploadInitReq{
+			FileName: file.GetName(),
+			FileSize: file.GetSize(),
+			Target:   dstDir.GetID(),
+			FileID:   strings.ToUpper(sha1),
+			PreID:    strings.ToUpper(sha1128k),
+		})
 		if err != nil {
 			return err
 		}
+		if resp.Status == 2 {
+			up(100)
+			return nil
+		}
+		// 秒传失败，继续后续流程
 	}
-	const PreHashSize int64 = 128 * utils.KB
-	hashSize := PreHashSize
-	if file.GetSize() < PreHashSize {
-		hashSize = file.GetSize()
+
+	if isSeekable {
+		// 可重复读取的流，使用 RangeRead 计算 hash，不缓存
+		if len(sha1) != utils.SHA1.Width {
+			sha1, err = stream.StreamHashFile(file, utils.SHA1, 100, &up)
+			if err != nil {
+				return err
+			}
+		}
+		// 计算 sha1_128k（如果没有预计算）
+		if len(sha1128k) != utils.SHA1_128K.Width {
+			const PreHashSize int64 = 128 * utils.KB
+			hashSize := PreHashSize
+			if file.GetSize() < PreHashSize {
+				hashSize = file.GetSize()
+			}
+			reader, err := file.RangeRead(http_range.Range{Start: 0, Length: hashSize})
+			if err != nil {
+				return err
+			}
+			sha1128k, err = utils.HashReader(utils.SHA1, reader)
+			if err != nil {
+				return err
+			}
+		}
+	} else {
+		// 不可重复读取的流（如 HTTP body）
+		// 如果有预计算的 hash，上面已经尝试过秒传了
+		if len(sha1) == utils.SHA1.Width && len(sha1128k) == utils.SHA1_128K.Width {
+			// 秒传失败，需要缓存文件进行实际上传
+			_, err = file.CacheFullAndWriter(&up, nil)
+			if err != nil {
+				return err
+			}
+		} else {
+			// 没有预计算的 hash，缓存整个文件并计算
+			if len(sha1) != utils.SHA1.Width {
+				_, sha1, err = stream.CacheFullAndHash(file, &up, utils.SHA1)
+				if err != nil {
+					return err
+				}
+			} else if file.GetFile() == nil {
+				// 有 SHA1 但没有缓存，需要缓存以支持后续 RangeRead
+				_, err = file.CacheFullAndWriter(&up, nil)
+				if err != nil {
+					return err
+				}
+			}
+			// 计算 sha1_128k
+			const PreHashSize int64 = 128 * utils.KB
+			hashSize := PreHashSize
+			if file.GetSize() < PreHashSize {
+				hashSize = file.GetSize()
+			}
+			reader, err := file.RangeRead(http_range.Range{Start: 0, Length: hashSize})
+			if err != nil {
+				return err
+			}
+			sha1128k, err = utils.HashReader(utils.SHA1, reader)
+			if err != nil {
+				return err
+			}
+		}
 	}
-	reader, err := file.RangeRead(http_range.Range{Start: 0, Length: hashSize})
-	if err != nil {
-		return err
-	}
-	sha1128k, err := utils.HashReader(utils.SHA1, reader)
-	if err != nil {
-		return err
-	}
-	// 1. Init
+
+	// 1. Init（SeekableStream 或已缓存的 FileStream）
 	resp, err := d.client.UploadInit(ctx, &sdk.UploadInitReq{
 		FileName: file.GetName(),
 		FileSize: file.GetSize(),
@@ -273,11 +342,11 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		if err != nil {
 			return err
 		}
-		reader, err = file.RangeRead(http_range.Range{Start: start, Length: end - start + 1})
+		signReader, err := file.RangeRead(http_range.Range{Start: start, Length: end - start + 1})
 		if err != nil {
 			return err
 		}
-		signVal, err := utils.HashReader(utils.SHA1, reader)
+		signVal, err := utils.HashReader(utils.SHA1, signReader)
 		if err != nil {
 			return err
 		}
