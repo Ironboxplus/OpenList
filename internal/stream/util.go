@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
@@ -174,6 +175,45 @@ func CacheFullAndHash(stream model.FileStreamer, up *model.UpdateProgress, hashT
 	return tmpF, hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// readFullWithRangeRead 使用 RangeRead 从文件流中读取数据到 buf
+// file: 文件流
+// buf: 目标缓冲区
+// off: 读取的起始偏移量
+// 返回值: 实际读取的字节数和错误
+// 支持自动重试（最多3次），每次重试之间有递增延迟（3秒、6秒、9秒）
+func readFullWithRangeRead(file model.FileStreamer, buf []byte, off int64) (int, error) {
+	length := int64(len(buf))
+	var lastErr error
+
+	// 重试最多3次
+	for retry := 0; retry < 3; retry++ {
+		reader, err := file.RangeRead(http_range.Range{Start: off, Length: length})
+		if err != nil {
+			lastErr = fmt.Errorf("RangeRead failed at offset %d: %w", off, err)
+			log.Debugf("RangeRead retry %d failed: %v", retry+1, lastErr)
+			// 递增延迟：3秒、6秒、9秒，等待代理恢复
+			time.Sleep(time.Duration(retry+1) * 3 * time.Second)
+			continue
+		}
+
+		n, err := io.ReadFull(reader, buf)
+		if closer, ok := reader.(io.Closer); ok {
+			closer.Close()
+		}
+
+		if err == nil {
+			return n, nil
+		}
+
+		lastErr = fmt.Errorf("failed to read all data via RangeRead at offset %d: (expect=%d, actual=%d) %w", off, length, n, err)
+		log.Debugf("RangeRead retry %d read failed: %v", retry+1, lastErr)
+		// 递增延迟：3秒、6秒、9秒，等待网络恢复
+		time.Sleep(time.Duration(retry+1) * 3 * time.Second)
+	}
+
+	return 0, lastErr
+}
+
 // StreamHashFile 流式计算文件哈希值，避免将整个文件加载到内存
 // file: 文件流
 // hashType: 哈希算法类型
@@ -197,36 +237,38 @@ func StreamHashFile(file model.FileStreamer, hashType *utils.HashType, progressW
 	hashFunc := hashType.NewFunc()
 	size := file.GetSize()
 	chunkSize := int64(10 * 1024 * 1024) // 10MB per chunk
+	buf := make([]byte, chunkSize)
 	var offset int64 = 0
-	const maxRetries = 3
+
 	for offset < size {
 		readSize := chunkSize
 		if size-offset < chunkSize {
 			readSize = size - offset
 		}
 
-		var lastErr error
-		for retry := 0; retry < maxRetries; retry++ {
-			reader, err := file.RangeRead(http_range.Range{Start: offset, Length: readSize})
+		var n int
+		var err error
+
+		// 对于 SeekableStream，优先使用 RangeRead 避免消耗 Reader
+		// 这样后续发送时 Reader 还能正常工作
+		if _, ok := file.(*SeekableStream); ok {
+			n, err = readFullWithRangeRead(file, buf[:readSize], offset)
+		} else {
+			// 对于 FileStream，首先尝试顺序流读取（不消耗额外资源，适用于所有流类型）
+			n, err = io.ReadFull(file, buf[:readSize])
 			if err != nil {
-				lastErr = fmt.Errorf("range read for hash calculation failed: %w", err)
-				continue
+				// 顺序流读取失败，尝试使用 RangeRead 重试（适用于 SeekableStream）
+				log.Warnf("StreamHashFile: sequential read failed at offset %d, retrying with RangeRead: %v", offset, err)
+				n, err = readFullWithRangeRead(file, buf[:readSize], offset)
 			}
-			_, err = io.Copy(hashFunc, reader)
-			if closer, ok := reader.(io.Closer); ok {
-				closer.Close()
-			}
-			if err == nil {
-				lastErr = nil
-				break
-			}
-			lastErr = fmt.Errorf("calculate hash failed at offset %d: %w", offset, err)
-		}
-		if lastErr != nil {
-			return "", lastErr
 		}
 
-		offset += readSize
+		if err != nil {
+			return "", fmt.Errorf("calculate hash failed at offset %d: %w", offset, err)
+		}
+
+		hashFunc.Write(buf[:n])
+		offset += int64(n)
 
 		if up != nil && progressWeight > 0 {
 			progress := progressWeight * float64(offset) / float64(size)
@@ -381,12 +423,26 @@ func (ss *directSectionReader) GetSectionReader(off, length int64) (io.ReadSeeke
 	}
 	tempBuf := ss.bufPool.Get()
 	buf := tempBuf[:length]
+
+	// 首先尝试顺序流读取（不消耗额外资源，适用于所有流类型）
+	// 对于 FileStream，RangeRead 会消耗底层 oriReader，所以必须先尝试顺序流读取
 	n, err := io.ReadFull(ss.file, buf)
-	ss.fileOffset += int64(n)
-	if int64(n) != length {
-		return nil, fmt.Errorf("failed to read all data: (expect =%d, actual =%d) %w", length, n, err)
+	if err == nil {
+		ss.fileOffset = off + int64(n)
+		return &bufferSectionReader{bytes.NewReader(buf), tempBuf}, nil
 	}
-	return &bufferSectionReader{bytes.NewReader(buf), buf}, nil
+
+	// 顺序流读取失败，尝试使用 RangeRead 重试（适用于 SeekableStream）
+	log.Debugf("Sequential read failed at offset %d, retrying with RangeRead: %v", off, err)
+	n, err = readFullWithRangeRead(ss.file, buf, off)
+	if err != nil {
+		ss.bufPool.Put(tempBuf)
+		return nil, fmt.Errorf("both sequential read and RangeRead failed at offset %d: (expect=%d, actual=%d) %w", off, length, n, err)
+	}
+
+	// 更新 fileOffset
+	ss.fileOffset = off + int64(n)
+	return &bufferSectionReader{bytes.NewReader(buf), tempBuf}, nil
 }
 func (ss *directSectionReader) FreeSectionReader(rs io.ReadSeeker) {
 	if sr, ok := rs.(*bufferSectionReader); ok {
