@@ -189,9 +189,12 @@ func (d *AliyundriveOpen) upload(ctx context.Context, dstDir model.Obj, stream m
 		}
 		log.Debugf("[aliyundrive_open] pre_hash matched, start rapid upload")
 
+		// 使用通用辅助函数计算完整哈希
+		// 前1024字节已缓存，这里只需要计算完整哈希
 		hash := stream.GetHash().GetHash(utils.SHA1)
 		if len(hash) != utils.SHA1.Width {
-			_, hash, err = streamPkg.CacheFullAndHash(stream, &up, utils.SHA1)
+			// 流式计算完整哈希 - 会从已缓存的1024字节开始
+			hash, err = streamPkg.StreamHashFile(stream, utils.SHA1, 100, &up)
 			if err != nil {
 				return nil, err
 			}

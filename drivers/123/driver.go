@@ -183,7 +183,8 @@ func (d *Pan123) Put(ctx context.Context, dstDir model.Obj, file model.FileStrea
 	etag := file.GetHash().GetHash(utils.MD5)
 	var err error
 	if len(etag) < utils.MD5.Width {
-		_, etag, err = stream.CacheFullAndHash(file, &up, utils.MD5)
+		// 使用流式哈希计算，避免缓存整个文件
+		etag, err = stream.StreamHashFile(file, utils.MD5, 100, &up)
 		if err != nil {
 			return err
 		}

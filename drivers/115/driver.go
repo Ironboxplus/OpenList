@@ -8,7 +8,6 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	streamPkg "github.com/OpenListTeam/OpenList/v4/internal/stream"
-	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	driver115 "github.com/SheltonZhu/115driver/pkg/driver"
 	"github.com/pkg/errors"
@@ -171,26 +170,13 @@ func (d *Pan115) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 	//}
 
 	const PreHashSize int64 = 128 * utils.KB
-	hashSize := PreHashSize
-	if stream.GetSize() < PreHashSize {
-		hashSize = stream.GetSize()
-	}
-	reader, err := stream.RangeRead(http_range.Range{Start: 0, Length: hashSize})
-	if err != nil {
-		return nil, err
-	}
-	preHash, err := utils.HashReader(utils.SHA1, reader)
+
+	// 使用通用辅助函数计算预哈希和完整哈希
+	preHash, fullHash, err := streamPkg.ComputePreHashAndFullHash(stream, PreHashSize, utils.SHA1, 100, &up)
 	if err != nil {
 		return nil, err
 	}
 	preHash = strings.ToUpper(preHash)
-	fullHash := stream.GetHash().GetHash(utils.SHA1)
-	if len(fullHash) != utils.SHA1.Width {
-		_, fullHash, err = streamPkg.CacheFullAndHash(stream, &up, utils.SHA1)
-		if err != nil {
-			return nil, err
-		}
-	}
 	fullHash = strings.ToUpper(fullHash)
 
 	// rapid-upload
