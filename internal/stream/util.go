@@ -398,8 +398,16 @@ type directSectionReader struct {
 	bufPool    *pool.Pool[[]byte]
 }
 
-// 线程不安全
+// 线程不安全（依赖调用方保证串行调用）
+// 对于 SeekableStream：直接跳过（无需实际读取）
+// 对于 FileStream：必须顺序读取并丢弃
 func (ss *directSectionReader) DiscardSection(off int64, length int64) error {
+	// 对于 SeekableStream，直接跳过（RangeRead 支持随机访问，不需要实际读取）
+	if _, ok := ss.file.(*SeekableStream); ok {
+		return nil
+	}
+
+	// 对于 FileStream，必须顺序读取并丢弃
 	if off != ss.fileOffset {
 		return fmt.Errorf("stream not cached: request offset %d != current offset %d", off, ss.fileOffset)
 	}
@@ -416,31 +424,35 @@ type bufferSectionReader struct {
 	buf []byte
 }
 
-// 线程不安全
+// 线程不安全（依赖调用方保证串行调用）
+// 对于 SeekableStream：使用 RangeRead，支持随机访问（续传场景可跳过已上传分片）
+// 对于 FileStream：必须顺序读取
 func (ss *directSectionReader) GetSectionReader(off, length int64) (io.ReadSeeker, error) {
-	if off != ss.fileOffset {
-		return nil, fmt.Errorf("stream not cached: request offset %d != current offset %d", off, ss.fileOffset)
-	}
 	tempBuf := ss.bufPool.Get()
 	buf := tempBuf[:length]
 
-	// 首先尝试顺序流读取（不消耗额外资源，适用于所有流类型）
-	// 对于 FileStream，RangeRead 会消耗底层 oriReader，所以必须先尝试顺序流读取
-	n, err := io.ReadFull(ss.file, buf)
-	if err == nil {
-		ss.fileOffset = off + int64(n)
+	// 对于 SeekableStream，直接使用 RangeRead（支持随机访问，适用于续传场景）
+	if _, ok := ss.file.(*SeekableStream); ok {
+		n, err := readFullWithRangeRead(ss.file, buf, off)
+		if err != nil {
+			ss.bufPool.Put(tempBuf)
+			return nil, fmt.Errorf("RangeRead failed at offset %d: (expect=%d, actual=%d) %w", off, length, n, err)
+		}
 		return &bufferSectionReader{bytes.NewReader(buf), tempBuf}, nil
 	}
 
-	// 顺序流读取失败，尝试使用 RangeRead 重试（适用于 SeekableStream）
-	log.Debugf("Sequential read failed at offset %d, retrying with RangeRead: %v", off, err)
-	n, err = readFullWithRangeRead(ss.file, buf, off)
-	if err != nil {
+	// 对于 FileStream，必须顺序读取
+	if off != ss.fileOffset {
 		ss.bufPool.Put(tempBuf)
-		return nil, fmt.Errorf("both sequential read and RangeRead failed at offset %d: (expect=%d, actual=%d) %w", off, length, n, err)
+		return nil, fmt.Errorf("stream not cached: request offset %d != current offset %d", off, ss.fileOffset)
 	}
 
-	// 更新 fileOffset
+	n, err := io.ReadFull(ss.file, buf)
+	if err != nil {
+		ss.bufPool.Put(tempBuf)
+		return nil, fmt.Errorf("sequential read failed at offset %d: (expect=%d, actual=%d) %w", off, length, n, err)
+	}
+
 	ss.fileOffset = off + int64(n)
 	return &bufferSectionReader{bytes.NewReader(buf), tempBuf}, nil
 }
