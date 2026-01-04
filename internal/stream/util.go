@@ -246,15 +246,25 @@ func StreamHashFile(file model.FileStreamer, hashType *utils.HashType, progressW
 			readSize = size - offset
 		}
 
-		// 首先尝试顺序流读取（不消耗额外资源，适用于所有流类型）
-		n, err := io.ReadFull(file, buf[:readSize])
-		if err != nil {
-			// 顺序流读取失败，尝试使用 RangeRead 重试（适用于 SeekableStream）
-			log.Warnf("StreamHashFile: sequential read failed at offset %d, retrying with RangeRead: %v", offset, err)
+		var n int
+		var err error
+
+		// 对于 SeekableStream，优先使用 RangeRead 避免消耗 Reader
+		// 这样后续发送时 Reader 还能正常工作
+		if _, ok := file.(*SeekableStream); ok {
 			n, err = readFullWithRangeRead(file, buf[:readSize], offset)
+		} else {
+			// 对于 FileStream，首先尝试顺序流读取（不消耗额外资源，适用于所有流类型）
+			n, err = io.ReadFull(file, buf[:readSize])
 			if err != nil {
-				return "", fmt.Errorf("calculate hash failed at offset %d: sequential read and RangeRead both failed: %w", offset, err)
+				// 顺序流读取失败，尝试使用 RangeRead 重试（适用于 SeekableStream）
+				log.Warnf("StreamHashFile: sequential read failed at offset %d, retrying with RangeRead: %v", offset, err)
+				n, err = readFullWithRangeRead(file, buf[:readSize], offset)
 			}
+		}
+
+		if err != nil {
+			return "", fmt.Errorf("calculate hash failed at offset %d: %w", offset, err)
 		}
 
 		hashFunc.Write(buf[:n])

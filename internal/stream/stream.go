@@ -299,15 +299,9 @@ func NewSeekableStream(fs *FileStream, link *model.Link) (*SeekableStream, error
 		if err != nil {
 			return nil, err
 		}
-		if _, ok := rr.(*model.FileRangeReader); ok {
-			var rc io.ReadCloser
-			rc, err = rr.RangeRead(fs.Ctx, http_range.Range{Length: -1})
-			if err != nil {
-				return nil, err
-			}
-			fs.Reader = rc
-			fs.Add(rc)
-		}
+		// IMPORTANT: Do NOT create Reader early for FileRangeReader!
+		// Let generateReader() create it on-demand when actually needed for reading
+		// This prevents the Reader from being consumed by intermediate operations like hash calculation
 		fs.size = size
 		fs.Add(link)
 		return &SeekableStream{FileStream: fs, rangeReader: rr}, nil
