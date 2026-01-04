@@ -226,23 +226,11 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 	if err != nil {
 		return err
 	}
-	sha1 := file.GetHash().GetHash(utils.SHA1)
-	if len(sha1) != utils.SHA1.Width {
-		_, sha1, err = stream.CacheFullAndHash(file, &up, utils.SHA1)
-		if err != nil {
-			return err
-		}
-	}
+
 	const PreHashSize int64 = 128 * utils.KB
-	hashSize := PreHashSize
-	if file.GetSize() < PreHashSize {
-		hashSize = file.GetSize()
-	}
-	reader, err := file.RangeRead(http_range.Range{Start: 0, Length: hashSize})
-	if err != nil {
-		return err
-	}
-	sha1128k, err := utils.HashReader(utils.SHA1, reader)
+
+	// 使用通用辅助函数计算预哈希和完整哈希
+	sha1128k, sha1, err := stream.ComputePreHashAndFullHash(file, PreHashSize, utils.SHA1, 100, &up)
 	if err != nil {
 		return err
 	}
@@ -272,7 +260,7 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		if err != nil {
 			return err
 		}
-		reader, err = file.RangeRead(http_range.Range{Start: start, Length: end - start + 1})
+		reader, err := file.RangeRead(http_range.Range{Start: start, Length: end - start + 1})
 		if err != nil {
 			return err
 		}

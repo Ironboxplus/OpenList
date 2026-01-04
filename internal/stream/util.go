@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
@@ -174,6 +175,144 @@ func CacheFullAndHash(stream model.FileStreamer, up *model.UpdateProgress, hashT
 	return tmpF, hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// readFullWithRangeRead 使用 RangeRead 从文件流中读取数据到 buf
+// file: 文件流
+// buf: 目标缓冲区
+// off: 读取的起始偏移量
+// 返回值: 实际读取的字节数和错误
+// 支持自动重试（最多3次），每次重试之间有递增延迟（3秒、6秒、9秒）
+func readFullWithRangeRead(file model.FileStreamer, buf []byte, off int64) (int, error) {
+	length := int64(len(buf))
+	var lastErr error
+
+	// 重试最多3次
+	for retry := 0; retry < 3; retry++ {
+		reader, err := file.RangeRead(http_range.Range{Start: off, Length: length})
+		if err != nil {
+			lastErr = fmt.Errorf("RangeRead failed at offset %d: %w", off, err)
+			log.Debugf("RangeRead retry %d failed: %v", retry+1, lastErr)
+			// 递增延迟：3秒、6秒、9秒，等待代理恢复
+			time.Sleep(time.Duration(retry+1) * 3 * time.Second)
+			continue
+		}
+
+		n, err := io.ReadFull(reader, buf)
+		if closer, ok := reader.(io.Closer); ok {
+			closer.Close()
+		}
+
+		if err == nil {
+			return n, nil
+		}
+
+		lastErr = fmt.Errorf("failed to read all data via RangeRead at offset %d: (expect=%d, actual=%d) %w", off, length, n, err)
+		log.Debugf("RangeRead retry %d read failed: %v", retry+1, lastErr)
+		// 递增延迟：3秒、6秒、9秒，等待网络恢复
+		time.Sleep(time.Duration(retry+1) * 3 * time.Second)
+	}
+
+	return 0, lastErr
+}
+
+// StreamHashFile 流式计算文件哈希值，避免将整个文件加载到内存
+// file: 文件流
+// hashType: 哈希算法类型
+// progressWeight: 进度权重（0-100），用于计算整体进度
+// up: 进度回调函数
+func StreamHashFile(file model.FileStreamer, hashType *utils.HashType, progressWeight float64, up *model.UpdateProgress) (string, error) {
+	// 如果已经有完整缓存文件，直接使用
+	if cache := file.GetFile(); cache != nil {
+		hashFunc := hashType.NewFunc()
+		cache.Seek(0, io.SeekStart)
+		_, err := io.Copy(hashFunc, cache)
+		if err != nil {
+			return "", err
+		}
+		if up != nil && progressWeight > 0 {
+			(*up)(progressWeight)
+		}
+		return hex.EncodeToString(hashFunc.Sum(nil)), nil
+	}
+
+	hashFunc := hashType.NewFunc()
+	size := file.GetSize()
+	chunkSize := int64(10 * 1024 * 1024) // 10MB per chunk
+	buf := make([]byte, chunkSize)
+	var offset int64 = 0
+
+	for offset < size {
+		readSize := chunkSize
+		if size-offset < chunkSize {
+			readSize = size - offset
+		}
+
+		// 首先尝试顺序流读取（不消耗额外资源，适用于所有流类型）
+		n, err := io.ReadFull(file, buf[:readSize])
+		if err != nil {
+			// 顺序流读取失败，尝试使用 RangeRead 重试（适用于 SeekableStream）
+			log.Warnf("StreamHashFile: sequential read failed at offset %d, retrying with RangeRead: %v", offset, err)
+			n, err = readFullWithRangeRead(file, buf[:readSize], offset)
+			if err != nil {
+				return "", fmt.Errorf("calculate hash failed at offset %d: sequential read and RangeRead both failed: %w", offset, err)
+			}
+		}
+
+		hashFunc.Write(buf[:n])
+		offset += int64(n)
+
+		if up != nil && progressWeight > 0 {
+			progress := progressWeight * float64(offset) / float64(size)
+			(*up)(progress)
+		}
+	}
+
+	return hex.EncodeToString(hashFunc.Sum(nil)), nil
+}
+
+// ComputePreHashAndFullHash 计算预哈希和完整哈希，针对需要秒传验证的云盘驱动（如115、阿里云盘等）
+// 通过先 RangeRead 预哈希部分并缓存，然后 StreamHashFile 计算完整哈希，避免流消耗顺序错误
+//
+// 参数:
+//   - file: 文件流
+//   - preHashSize: 预哈希的大小（如115的128KB）
+//   - hashType: 哈希算法类型
+//   - progressWeight: 完整哈希计算的进度权重（0-100）
+//   - up: 进度回调函数
+//
+// 返回:
+//   - preHash: 预哈希值（前 preHashSize 字节的哈希）
+//   - fullHash: 完整文件哈希值
+//   - err: 错误
+func ComputePreHashAndFullHash(file model.FileStreamer, preHashSize int64, hashType *utils.HashType, progressWeight float64, up *model.UpdateProgress) (preHash, fullHash string, err error) {
+	// 如果文件大小小于预哈希大小，使用实际大小
+	hashSize := preHashSize
+	if file.GetSize() < preHashSize {
+		hashSize = file.GetSize()
+	}
+
+	// 步骤1：先读取前 N 字节（会缓存到 FileStream.peekBuff）
+	reader, err := file.RangeRead(http_range.Range{Start: 0, Length: hashSize})
+	if err != nil {
+		return "", "", err
+	}
+	preHash, err = utils.HashReader(hashType, reader)
+	if err != nil {
+		return "", "", err
+	}
+
+	// 步骤2：检查是否已有完整哈希
+	fullHash = file.GetHash().GetHash(hashType)
+	if len(fullHash) != hashType.Width {
+		// 流式计算完整哈希 - 会从已缓存的 peekBuff 开始，不会重复读取
+		fullHash, err = StreamHashFile(file, hashType, progressWeight, up)
+		if err != nil {
+			return "", "", err
+		}
+	}
+
+	return preHash, fullHash, nil
+}
+
 type StreamSectionReaderIF interface {
 	// 线程不安全
 	GetSectionReader(off, length int64) (io.ReadSeeker, error)
@@ -188,37 +327,9 @@ func NewStreamSectionReader(file model.FileStreamer, maxBufferSize int, up *mode
 	}
 
 	maxBufferSize = min(maxBufferSize, int(file.GetSize()))
-	if maxBufferSize > conf.MaxBufferLimit {
-		f, err := os.CreateTemp(conf.Conf.TempDir, "file-*")
-		if err != nil {
-			return nil, err
-		}
 
-		if f.Truncate(file.GetSize()) != nil {
-			// fallback to full cache
-			_, _ = f.Close(), os.Remove(f.Name())
-			cache, err := file.CacheFullAndWriter(up, nil)
-			if err != nil {
-				return nil, err
-			}
-			return &cachedSectionReader{cache}, nil
-		}
-
-		ss := &fileSectionReader{file: file, temp: f}
-		ss.bufPool = &pool.Pool[*offsetWriterWithBase]{
-			New: func() *offsetWriterWithBase {
-				base := ss.tempOffset
-				ss.tempOffset += int64(maxBufferSize)
-				return &offsetWriterWithBase{io.NewOffsetWriter(ss.temp, base), base}
-			},
-		}
-		file.Add(utils.CloseFunc(func() error {
-			ss.bufPool.Reset()
-			return errors.Join(ss.temp.Close(), os.Remove(ss.temp.Name()))
-		}))
-		return ss, nil
-	}
-
+	// 始终使用 directSectionReader，只在内存中缓存当前分片
+	// 避免创建临时文件导致中间文件增长到整个文件大小
 	ss := &directSectionReader{file: file}
 	if conf.MmapThreshold > 0 && maxBufferSize >= conf.MmapThreshold {
 		ss.bufPool = &pool.Pool[[]byte]{
@@ -346,12 +457,26 @@ func (ss *directSectionReader) GetSectionReader(off, length int64) (io.ReadSeeke
 	}
 	tempBuf := ss.bufPool.Get()
 	buf := tempBuf[:length]
+
+	// 首先尝试顺序流读取（不消耗额外资源，适用于所有流类型）
+	// 对于 FileStream，RangeRead 会消耗底层 oriReader，所以必须先尝试顺序流读取
 	n, err := io.ReadFull(ss.file, buf)
-	ss.fileOffset += int64(n)
-	if int64(n) != length {
-		return nil, fmt.Errorf("failed to read all data: (expect =%d, actual =%d) %w", length, n, err)
+	if err == nil {
+		ss.fileOffset = off + int64(n)
+		return &bufferSectionReader{bytes.NewReader(buf), tempBuf}, nil
 	}
-	return &bufferSectionReader{bytes.NewReader(buf), buf}, nil
+
+	// 顺序流读取失败，尝试使用 RangeRead 重试（适用于 SeekableStream）
+	log.Debugf("Sequential read failed at offset %d, retrying with RangeRead: %v", off, err)
+	n, err = readFullWithRangeRead(ss.file, buf, off)
+	if err != nil {
+		ss.bufPool.Put(tempBuf)
+		return nil, fmt.Errorf("both sequential read and RangeRead failed at offset %d: (expect=%d, actual=%d) %w", off, length, n, err)
+	}
+
+	// 更新 fileOffset
+	ss.fileOffset = off + int64(n)
+	return &bufferSectionReader{bytes.NewReader(buf), tempBuf}, nil
 }
 func (ss *directSectionReader) FreeSectionReader(rs io.ReadSeeker) {
 	if sr, ok := rs.(*bufferSectionReader); ok {
