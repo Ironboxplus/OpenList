@@ -8,6 +8,7 @@ import (
 	"hash"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
@@ -18,6 +19,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/avast/retry-go"
 	"github.com/go-resty/resty/v2"
+	log "github.com/sirupsen/logrus"
 )
 
 type QuarkOpen struct {
@@ -144,30 +146,84 @@ func (d *QuarkOpen) Remove(ctx context.Context, obj model.Obj) error {
 
 func (d *QuarkOpen) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
 	md5Str, sha1Str := stream.GetHash().GetHash(utils.MD5), stream.GetHash().GetHash(utils.SHA1)
-	var (
-		md5  hash.Hash
-		sha1 hash.Hash
-	)
-	writers := []io.Writer{}
-	if len(md5Str) != utils.MD5.Width {
-		md5 = utils.MD5.NewFunc()
-		writers = append(writers, md5)
-	}
-	if len(sha1Str) != utils.SHA1.Width {
-		sha1 = utils.SHA1.NewFunc()
-		writers = append(writers, sha1)
-	}
 
-	if len(writers) > 0 {
-		_, err := stream.CacheFullAndWriter(&up, io.MultiWriter(writers...))
-		if err != nil {
-			return err
-		}
-		if md5 != nil {
-			md5Str = hex.EncodeToString(md5.Sum(nil))
-		}
-		if sha1 != nil {
-			sha1Str = hex.EncodeToString(sha1.Sum(nil))
+	// 检查是否需要计算hash
+	needMD5 := len(md5Str) != utils.MD5.Width
+	needSHA1 := len(sha1Str) != utils.SHA1.Width
+
+	if needMD5 || needSHA1 {
+		// 检查是否为可重复读取的流
+		_, isSeekable := stream.(*streamPkg.SeekableStream)
+
+		if isSeekable {
+			// 可重复读取的流，使用 RangeRead 一次性计算所有hash，避免重复读取
+			var md5 hash.Hash
+			var sha1 hash.Hash
+			writers := []io.Writer{}
+
+			if needMD5 {
+				md5 = utils.MD5.NewFunc()
+				writers = append(writers, md5)
+			}
+			if needSHA1 {
+				sha1 = utils.SHA1.NewFunc()
+				writers = append(writers, sha1)
+			}
+
+			// 使用 RangeRead 分块读取文件，同时计算多个hash
+			multiWriter := io.MultiWriter(writers...)
+			size := stream.GetSize()
+			chunkSize := int64(10 * utils.MB) // 10MB per chunk
+			buf := make([]byte, chunkSize)
+			var offset int64 = 0
+
+			for offset < size {
+				readSize := min(chunkSize, size-offset)
+
+				n, err := streamPkg.ReadFullWithRangeRead(stream, buf[:readSize], offset)
+				if err != nil {
+					return fmt.Errorf("calculate hash failed at offset %d: %w", offset, err)
+				}
+
+				multiWriter.Write(buf[:n])
+				offset += int64(n)
+
+				// 更新进度（hash计算占用40%的进度）
+				up(40 * float64(offset) / float64(size))
+			}
+
+			if md5 != nil {
+				md5Str = hex.EncodeToString(md5.Sum(nil))
+			}
+			if sha1 != nil {
+				sha1Str = hex.EncodeToString(sha1.Sum(nil))
+			}
+		} else {
+			// 不可重复读取的流（如网络流），需要缓存并计算hash
+			var md5 hash.Hash
+			var sha1 hash.Hash
+			writers := []io.Writer{}
+
+			if needMD5 {
+				md5 = utils.MD5.NewFunc()
+				writers = append(writers, md5)
+			}
+			if needSHA1 {
+				sha1 = utils.SHA1.NewFunc()
+				writers = append(writers, sha1)
+			}
+
+			_, err := stream.CacheFullAndWriter(&up, io.MultiWriter(writers...))
+			if err != nil {
+				return err
+			}
+
+			if md5 != nil {
+				md5Str = hex.EncodeToString(md5.Sum(nil))
+			}
+			if sha1 != nil {
+				sha1Str = hex.EncodeToString(sha1.Sum(nil))
+			}
 		}
 	}
 	// pre
@@ -210,24 +266,43 @@ func (d *QuarkOpen) Put(ctx context.Context, dstDir model.Obj, stream model.File
 		if err != nil {
 			return err
 		}
+
+		// 上传重试逻辑，包含URL刷新
+		var etag string
 		err = retry.Do(func() error {
 			rd.Seek(0, io.SeekStart)
-			etag, err := d.upPart(ctx, upUrlInfo, i, driver.NewLimitedUploadStream(ctx, rd))
-			if err != nil {
-				return err
+			var uploadErr error
+			etag, uploadErr = d.upPart(ctx, upUrlInfo, i, driver.NewLimitedUploadStream(ctx, rd))
+
+			// 检查是否为URL过期错误
+			if uploadErr != nil && strings.Contains(uploadErr.Error(), "expire") {
+				log.Warnf("[quark_open] Upload URL expired for part %d, refreshing...", i)
+				// 刷新上传URL
+				newUpUrlInfo, refreshErr := d.upUrl(ctx, pre, partInfo)
+				if refreshErr != nil {
+					return fmt.Errorf("failed to refresh upload url: %w", refreshErr)
+				}
+				upUrlInfo = newUpUrlInfo
+				log.Infof("[quark_open] Upload URL refreshed successfully")
+
+				// 使用新URL重试上传
+				rd.Seek(0, io.SeekStart)
+				etag, uploadErr = d.upPart(ctx, upUrlInfo, i, driver.NewLimitedUploadStream(ctx, rd))
 			}
-			etags = append(etags, etag)
-			return nil
+
+			return uploadErr
 		},
 			retry.Context(ctx),
 			retry.Attempts(3),
 			retry.DelayType(retry.BackOffDelay),
 			retry.Delay(time.Second))
+
 		ss.FreeSectionReader(rd)
 		if err != nil {
 			return fmt.Errorf("failed to upload part %d: %w", i, err)
 		}
 
+		etags = append(etags, etag)
 		up(95 * float64(offset+size) / float64(total))
 	}
 
