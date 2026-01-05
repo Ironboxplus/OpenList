@@ -25,6 +25,7 @@ type BaiduNetdisk struct {
 }
 
 var ErrUploadIDExpired = errors.New("uploadid expired")
+var ErrUploadURLExpired = errors.New("upload url expired or unavailable")
 
 func (d *BaiduNetdisk) Config() driver.Config {
 	return config

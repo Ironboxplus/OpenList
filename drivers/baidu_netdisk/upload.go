@@ -129,6 +129,13 @@ func (d *BaiduNetdisk) uploadChunksStream(
 		retry.RetryIf(func(err error) bool {
 			return !errors.Is(err, ErrUploadIDExpired)
 		}),
+		retry.OnRetry(func(n uint, err error) {
+			// 重试前检测是否需要刷新上传 URL
+			if errors.Is(err, ErrUploadURLExpired) {
+				log.Infof("[baidu_netdisk] refreshing upload URL due to error: %v", err)
+				precreateResp.UploadURL = d.getUploadUrl(path, precreateResp.Uploadid)
+			}
+		}),
 		retry.LastErrorOnly(true))
 
 	totalParts := len(precreateResp.BlockList)
@@ -233,6 +240,11 @@ func (d *BaiduNetdisk) uploadSliceStream(
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		// 检测超时或网络错误，标记需要刷新上传 URL
+		if isUploadURLError(err) {
+			log.Warnf("[baidu_netdisk] upload slice failed with network error: %v, will refresh upload URL", err)
+			return errors.Join(err, ErrUploadURLExpired)
+		}
 		return err
 	}
 	defer resp.Body.Close()
@@ -257,4 +269,31 @@ func (d *BaiduNetdisk) uploadSliceStream(
 		return errs.NewErr(errs.StreamIncomplete, "error uploading to baidu, response=%s", respStr)
 	}
 	return nil
+}
+
+// isUploadURLError 判断是否为需要刷新上传 URL 的错误
+// 包括：超时、连接被拒绝、连接重置、DNS 解析失败等网络错误
+func isUploadURLError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	// 超时错误
+	if strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "deadline exceeded") {
+		return true
+	}
+	// 连接错误
+	if strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "connection reset") ||
+		strings.Contains(errStr, "no such host") ||
+		strings.Contains(errStr, "network is unreachable") {
+		return true
+	}
+	// EOF 错误（连接被服务器关闭）
+	if strings.Contains(errStr, "eof") ||
+		strings.Contains(errStr, "broken pipe") {
+		return true
+	}
+	return false
 }
