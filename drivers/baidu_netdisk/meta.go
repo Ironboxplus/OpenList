@@ -31,8 +31,8 @@ type Addition struct {
 const (
 	UPLOAD_FALLBACK_API          = "https://d.pcs.baidu.com" // 备用上传地址
 	UPLOAD_URL_EXPIRE_TIME       = time.Minute * 60          // 上传地址有效期(分钟)
-	DEFAULT_UPLOAD_SLICE_TIMEOUT = time.Second * 60          // 上传分片请求默认超时时间
-	UPLOAD_RETRY_COUNT           = 3
+	DEFAULT_UPLOAD_SLICE_TIMEOUT = time.Second * 180         // 上传分片请求默认超时时间（增加到3分钟以应对慢速网络）
+	UPLOAD_RETRY_COUNT           = 5                         // 增加重试次数以提高成功率
 	UPLOAD_RETRY_WAIT_TIME       = time.Second * 1
 	UPLOAD_RETRY_MAX_WAIT_TIME   = time.Second * 5
 )

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	stdnet "net"  // 标准库net包，用于Dialer
 	"net/http"
 	"strconv"
 	"strings"
@@ -286,12 +287,20 @@ func NewHttpClient() *http.Client {
 	transport := &http.Transport{
 		Proxy:           http.ProxyFromEnvironment,
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: conf.Conf.TlsInsecureSkipVerify},
+		// 快速连接超时：10秒建立连接，失败快速重试
+		DialContext: (&stdnet.Dialer{
+			Timeout:   10 * time.Second,  // TCP握手超时
+			KeepAlive: 30 * time.Second,  // TCP keep-alive
+		}).DialContext,
+		// 响应头超时：15秒等待服务器响应头（平衡API调用与下载检测）
+		ResponseHeaderTimeout: 15 * time.Second,
+		// 允许长时间读取数据（无 IdleConnTimeout 限制）
 	}
 
 	SetProxyIfConfigured(transport)
 
 	return &http.Client{
-		Timeout:   time.Hour * 48,
+		Timeout:   time.Hour * 48,  // 总超时保持48小时（允许大文件慢速下载）
 		Transport: transport,
 	}
 }
