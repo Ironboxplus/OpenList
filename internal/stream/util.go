@@ -24,6 +24,14 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const (
+	// 链接刷新相关常量
+	MAX_LINK_REFRESH_COUNT = 50 // 下载链接最大刷新次数（支持长时间传输）
+
+	// RangeRead 重试相关常量
+	MAX_RANGE_READ_RETRY_COUNT = 5 // RangeRead 最大重试次数（从3增加到5）
+)
+
 type RangeReaderFunc func(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error)
 
 func (f RangeReaderFunc) RangeRead(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
@@ -156,8 +164,8 @@ func (r *RefreshableRangeReader) ForceRefresh(ctx context.Context) bool {
 
 // doRefreshLocked 执行实际的刷新逻辑（需要持有锁）
 func (r *RefreshableRangeReader) doRefreshLocked(ctx context.Context) error {
-	if r.refreshCount >= 3 {
-		return fmt.Errorf("max refresh attempts reached")
+	if r.refreshCount >= MAX_LINK_REFRESH_COUNT {
+		return fmt.Errorf("max refresh attempts (%d) reached", MAX_LINK_REFRESH_COUNT)
 	}
 
 	log.Infof("Link expired, attempting to refresh...")
@@ -332,20 +340,20 @@ func CacheFullAndHash(stream model.FileStreamer, up *model.UpdateProgress, hashT
 // buf: 目标缓冲区
 // off: 读取的起始偏移量
 // 返回值: 实际读取的字节数和错误
-// 支持自动重试（最多3次），每次重试之间有递增延迟（3秒、6秒、9秒）
+// 支持自动重试（最多5次），快速重试策略（1秒、2秒、3秒、4秒、5秒）
 // 支持链接刷新：当检测到 0 字节读取时，会自动刷新下载链接
 func ReadFullWithRangeRead(file model.FileStreamer, buf []byte, off int64) (int, error) {
 	length := int64(len(buf))
 	var lastErr error
 
-	// 重试最多3次
-	for retry := 0; retry < 3; retry++ {
+	// 重试最多 MAX_RANGE_READ_RETRY_COUNT 次
+	for retry := 0; retry < MAX_RANGE_READ_RETRY_COUNT; retry++ {
 		reader, err := file.RangeRead(http_range.Range{Start: off, Length: length})
 		if err != nil {
 			lastErr = fmt.Errorf("RangeRead failed at offset %d: %w", off, err)
 			log.Debugf("RangeRead retry %d failed: %v", retry+1, lastErr)
-			// 递增延迟：3秒、6秒、9秒，等待代理恢复
-			time.Sleep(time.Duration(retry+1) * 3 * time.Second)
+			// 快速重试：1秒、2秒、3秒、4秒、5秒（连接失败快速重试）
+			time.Sleep(time.Duration(retry+1) * time.Second)
 			continue
 		}
 
@@ -382,8 +390,8 @@ func ReadFullWithRangeRead(file model.FileStreamer, buf []byte, off int64) (int,
 			}
 		}
 
-		// 递增延迟：3秒、6秒、9秒，等待网络恢复
-		time.Sleep(time.Duration(retry+1) * 3 * time.Second)
+		// 快速重试：1秒、2秒、3秒、4秒、5秒（读取失败快速重试）
+		time.Sleep(time.Duration(retry+1) * time.Second)
 	}
 
 	return 0, lastErr
