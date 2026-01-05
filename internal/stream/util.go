@@ -30,6 +30,13 @@ func (f RangeReaderFunc) RangeRead(ctx context.Context, httpRange http_range.Ran
 	return f(ctx, httpRange)
 }
 
+// LinkRefresher 接口用于在读取数据失败时强制刷新链接
+type LinkRefresher interface {
+	// ForceRefreshLink 强制刷新下载链接
+	// 返回 true 表示刷新成功，false 表示无法刷新
+	ForceRefreshLink(ctx context.Context) bool
+}
+
 // IsLinkExpiredError checks if the error indicates an expired download link
 func IsLinkExpiredError(err error) bool {
 	if err == nil {
@@ -123,14 +130,40 @@ func (r *RefreshableRangeReader) refreshAndRetry(ctx context.Context, httpRange 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if err := r.doRefreshLocked(ctx); err != nil {
+		return nil, err
+	}
+
+	reader, err := r.getInnerReader()
+	if err != nil {
+		return nil, err
+	}
+	return reader.RangeRead(ctx, httpRange)
+}
+
+// ForceRefresh 强制刷新链接，用于读取数据失败（如读取 0 字节）的情况
+// 返回 true 表示刷新成功，false 表示无法刷新（没有 Refresher 或达到最大刷新次数）
+func (r *RefreshableRangeReader) ForceRefresh(ctx context.Context) bool {
+	if r.link.Refresher == nil {
+		return false
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.doRefreshLocked(ctx) == nil
+}
+
+// doRefreshLocked 执行实际的刷新逻辑（需要持有锁）
+func (r *RefreshableRangeReader) doRefreshLocked(ctx context.Context) error {
 	if r.refreshCount >= 3 {
-		return nil, fmt.Errorf("max refresh attempts reached")
+		return fmt.Errorf("max refresh attempts reached")
 	}
 
 	log.Infof("Link expired, attempting to refresh...")
 	newLink, _, refreshErr := r.link.Refresher(ctx)
 	if refreshErr != nil {
-		return nil, fmt.Errorf("failed to refresh link: %w", refreshErr)
+		return fmt.Errorf("failed to refresh link: %w", refreshErr)
 	}
 
 	newLink.Refresher = r.link.Refresher
@@ -138,13 +171,8 @@ func (r *RefreshableRangeReader) refreshAndRetry(ctx context.Context, httpRange 
 	r.innerReader = nil
 	r.refreshCount++
 
-	log.Infof("Link refreshed successfully, retrying request...")
-
-	reader, err := r.getInnerReader()
-	if err != nil {
-		return nil, err
-	}
-	return reader.RangeRead(ctx, httpRange)
+	log.Infof("Link refreshed successfully")
+	return nil
 }
 
 func GetRangeReaderFromLink(size int64, link *model.Link) (model.RangeReaderIF, error) {
@@ -299,13 +327,14 @@ func CacheFullAndHash(stream model.FileStreamer, up *model.UpdateProgress, hashT
 	return tmpF, hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// readFullWithRangeRead 使用 RangeRead 从文件流中读取数据到 buf
+// ReadFullWithRangeRead 使用 RangeRead 从文件流中读取数据到 buf
 // file: 文件流
 // buf: 目标缓冲区
 // off: 读取的起始偏移量
 // 返回值: 实际读取的字节数和错误
 // 支持自动重试（最多3次），每次重试之间有递增延迟（3秒、6秒、9秒）
-func readFullWithRangeRead(file model.FileStreamer, buf []byte, off int64) (int, error) {
+// 支持链接刷新：当检测到 0 字节读取时，会自动刷新下载链接
+func ReadFullWithRangeRead(file model.FileStreamer, buf []byte, off int64) (int, error) {
 	length := int64(len(buf))
 	var lastErr error
 
@@ -331,6 +360,28 @@ func readFullWithRangeRead(file model.FileStreamer, buf []byte, off int64) (int,
 
 		lastErr = fmt.Errorf("failed to read all data via RangeRead at offset %d: (expect=%d, actual=%d) %w", off, length, n, err)
 		log.Debugf("RangeRead retry %d read failed: %v", retry+1, lastErr)
+
+		// 检测是否可能是链接过期（读取 0 字节或 EOF）
+		if n == 0 && (err == io.EOF || err == io.ErrUnexpectedEOF) {
+			// 尝试刷新链接
+			if refresher, ok := file.(LinkRefresher); ok {
+				// 获取 context - 从 FileStream 或 SeekableStream 中获取
+				var ctx context.Context
+				if fs, ok := file.(*FileStream); ok {
+					ctx = fs.Ctx
+				} else if ss, ok := file.(*SeekableStream); ok {
+					ctx = ss.Ctx
+				} else {
+					ctx = context.Background()
+				}
+
+				if refresher.ForceRefreshLink(ctx) {
+					log.Infof("Link refreshed after 0-byte read, retrying immediately...")
+					continue // 立即重试，不延迟
+				}
+			}
+		}
+
 		// 递增延迟：3秒、6秒、9秒，等待网络恢复
 		time.Sleep(time.Duration(retry+1) * 3 * time.Second)
 	}
@@ -376,14 +427,14 @@ func StreamHashFile(file model.FileStreamer, hashType *utils.HashType, progressW
 		// 对于 SeekableStream，优先使用 RangeRead 避免消耗 Reader
 		// 这样后续发送时 Reader 还能正常工作
 		if _, ok := file.(*SeekableStream); ok {
-			n, err = readFullWithRangeRead(file, buf[:readSize], offset)
+			n, err = ReadFullWithRangeRead(file, buf[:readSize], offset)
 		} else {
 			// 对于 FileStream，首先尝试顺序流读取（不消耗额外资源，适用于所有流类型）
 			n, err = io.ReadFull(file, buf[:readSize])
 			if err != nil {
 				// 顺序流读取失败，尝试使用 RangeRead 重试（适用于 SeekableStream）
 				log.Warnf("StreamHashFile: sequential read failed at offset %d, retrying with RangeRead: %v", offset, err)
-				n, err = readFullWithRangeRead(file, buf[:readSize], offset)
+				n, err = ReadFullWithRangeRead(file, buf[:readSize], offset)
 			}
 		}
 
@@ -557,7 +608,7 @@ func (ss *directSectionReader) GetSectionReader(off, length int64) (io.ReadSeeke
 
 	// 对于 SeekableStream，直接使用 RangeRead（支持随机访问，适用于续传场景）
 	if _, ok := ss.file.(*SeekableStream); ok {
-		n, err := readFullWithRangeRead(ss.file, buf, off)
+		n, err := ReadFullWithRangeRead(ss.file, buf, off)
 		if err != nil {
 			ss.bufPool.Put(tempBuf)
 			return nil, fmt.Errorf("RangeRead failed at offset %d: (expect=%d, actual=%d) %w", off, length, n, err)
