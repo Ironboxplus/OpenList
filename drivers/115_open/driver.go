@@ -17,6 +17,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
 )
 
@@ -74,13 +75,20 @@ func (d *Open115) Drop(ctx context.Context) error {
 }
 
 func (d *Open115) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
+	start := time.Now()
+	log.Infof("[115] List request started for dir: %s (ID: %s)", dir.GetName(), dir.GetID())
+
 	var res []model.Obj
 	pageSize := int64(d.PageSize)
 	offset := int64(0)
+	pageCount := 0
+
 	for {
 		if err := d.WaitLimit(ctx); err != nil {
 			return nil, err
 		}
+
+		pageStart := time.Now()
 		resp, err := d.client.GetFiles(ctx, &sdk.GetFilesReq{
 			CID:    dir.GetID(),
 			Limit:  pageSize,
@@ -90,7 +98,12 @@ func (d *Open115) List(ctx context.Context, dir model.Obj, args model.ListArgs) 
 			// Cur:     1,
 			ShowDir: true,
 		})
+		pageDuration := time.Since(pageStart)
+		pageCount++
+		log.Infof("[115] GetFiles page %d took: %v (offset=%d, limit=%d)", pageCount, pageDuration, offset, pageSize)
+
 		if err != nil {
+			log.Errorf("[115] GetFiles page %d failed after %v: %v", pageCount, pageDuration, err)
 			return nil, err
 		}
 		res = append(res, utils.MustSliceConvert(resp.Data, func(src sdk.GetFilesResp_File) model.Obj {
@@ -102,10 +115,17 @@ func (d *Open115) List(ctx context.Context, dir model.Obj, args model.ListArgs) 
 		}
 		offset += pageSize
 	}
+
+	totalDuration := time.Since(start)
+	log.Infof("[115] List request completed in %v (%d pages, %d files)", totalDuration, pageCount, len(res))
+
 	return res, nil
 }
 
 func (d *Open115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
+	start := time.Now()
+	log.Infof("[115] Link request started for file: %s", file.GetName())
+
 	if err := d.WaitLimit(ctx); err != nil {
 		return nil, err
 	}
@@ -121,14 +141,25 @@ func (d *Open115) Link(ctx context.Context, file model.Obj, args model.LinkArgs)
 		return nil, fmt.Errorf("can't convert obj")
 	}
 	pc := obj.Pc
+
+	apiStart := time.Now()
+	log.Infof("[115] Calling DownURL API...")
 	resp, err := d.client.DownURL(ctx, pc, ua)
+	apiDuration := time.Since(apiStart)
+	log.Infof("[115] DownURL API took: %v", apiDuration)
+
 	if err != nil {
+		log.Errorf("[115] DownURL API failed after %v: %v", apiDuration, err)
 		return nil, err
 	}
 	u, ok := resp[obj.GetID()]
 	if !ok {
 		return nil, fmt.Errorf("can't get link")
 	}
+
+	totalDuration := time.Since(start)
+	log.Infof("[115] Link request completed in %v (API: %v)", totalDuration, apiDuration)
+
 	return &model.Link{
 		URL: u.URL.URL,
 		Header: http.Header{
