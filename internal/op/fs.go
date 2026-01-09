@@ -150,6 +150,7 @@ func Get(ctx context.Context, storage driver.Driver, path string, excludeTempObj
 				Modified: storage.GetStorage().Modified,
 				IsFolder: true,
 				Mask:     model.Locked,
+				HashInfo: utils.NewHashInfo(nil, ""),
 			}, nil
 		case driver.IRootPath:
 			return &model.Object{
@@ -158,6 +159,7 @@ func Get(ctx context.Context, storage driver.Driver, path string, excludeTempObj
 				Modified: storage.GetStorage().Modified,
 				Mask:     model.Locked,
 				IsFolder: true,
+				HashInfo: utils.NewHashInfo(nil, ""),
 			}, nil
 		}
 		return nil, errors.New("please implement GetRooter or IRootPath or IRootId interface")
@@ -380,6 +382,7 @@ func MakeDir(ctx context.Context, storage driver.Driver, path string) error {
 					Modified: t,
 					Ctime:    t,
 					Mask:     model.Temp,
+					HashInfo: utils.NewHashInfo(nil, ""),
 				}
 			}
 			dirCache.UpdateObject("", wrapObjName(storage, newObj))
@@ -704,6 +707,7 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 						Modified: file.ModTime(),
 						Ctime:    file.CreateTime(),
 						Mask:     model.Temp,
+						HashInfo: utils.NewHashInfo(nil, ""),
 					}
 				}
 				newObj = wrapObjName(storage, newObj)
@@ -772,6 +776,7 @@ func PutURL(ctx context.Context, storage driver.Driver, dstDirPath, dstName, url
 						Modified: t,
 						Ctime:    t,
 						Mask:     model.Temp,
+						HashInfo: utils.NewHashInfo(nil, ""),
 					}
 				}
 				newObj = wrapObjName(storage, newObj)
