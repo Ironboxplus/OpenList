@@ -424,6 +424,7 @@ func getStorageVirtualFilesByPath(prefix string, rootCallback func(driver.Driver
 			Name:     name,
 			Modified: v.GetStorage().Modified,
 			IsFolder: true,
+			HashInfo: utils.NewHashInfo(nil, ""),
 		}
 		if !found {
 			idx := len(files)
