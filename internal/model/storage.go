@@ -75,6 +75,21 @@ func (d DiskUsage) MarshalJSON() ([]byte, error) {
 	})
 }
 
+func (d DiskUsage) UsedSpace() uint64 {
+	if d.TotalSpace > d.FreeSpace {
+		return d.TotalSpace - d.FreeSpace
+	}
+	return 0
+}
+
+func (d DiskUsage) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"total_space": d.TotalSpace,
+		"free_space":  d.FreeSpace,
+		"used_space":  d.UsedSpace(),
+	})
+}
+
 type StorageDetails struct {
 	DiskUsage
 }

@@ -231,6 +231,10 @@ func toObjsResp(objs []model.Obj, parent string, encrypt bool) []ObjResp {
 	for _, obj := range objs {
 		thumb, _ := model.GetThumb(obj)
 		mountDetails, _ := model.GetStorageDetails(obj)
+		hashInfo := obj.GetHash().Export()
+		if hashInfo == nil {
+			hashInfo = make(map[*utils.HashType]string)
+		}
 		resp = append(resp, ObjResp{
 			Name:         obj.GetName(),
 			Size:         obj.GetSize(),
@@ -238,7 +242,7 @@ func toObjsResp(objs []model.Obj, parent string, encrypt bool) []ObjResp {
 			Modified:     obj.ModTime(),
 			Created:      obj.CreateTime(),
 			HashInfoStr:  obj.GetHash().String(),
-			HashInfo:     obj.GetHash().Export(),
+			HashInfo:     hashInfo,
 			Sign:         common.Sign(obj, parent, encrypt),
 			Thumb:        thumb,
 			Type:         utils.GetObjType(obj.GetName(), obj.IsDir()),

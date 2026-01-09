@@ -355,7 +355,7 @@ func GetStorageVirtualFilesWithDetailsByPath(ctx context.Context, prefix string,
 		ret := &model.ObjStorageDetails{
 			Obj: obj,
 			StorageDetailsWithName: model.StorageDetailsWithName{
-				StorageDetails: nil,
+				StorageDetails: &model.StorageDetails{}, // 初始化为空结构体而不是nil
 				DriverName:     d.Config().Name,
 			},
 		}
@@ -371,7 +371,9 @@ func GetStorageVirtualFilesWithDetailsByPath(ctx context.Context, prefix string,
 		}(d)
 		select {
 		case r := <-resultChan:
-			ret.StorageDetails = r
+			if r != nil {
+				ret.StorageDetails = r
+			}
 		case <-time.After(time.Second):
 		}
 		return ret
