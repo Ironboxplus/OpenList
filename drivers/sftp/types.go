@@ -48,8 +48,8 @@ func (d *SFTP) fileToObj(f os.FileInfo, dir string) (model.Obj, error) {
 		Size:     _f.Size(),
 		Modified: _f.ModTime(),
 		IsFolder: _f.IsDir(),
-		Path:     target,
+		Path:     path, // Use symlink's own path, not target path
 	}
-	log.Debugf("[sftp] obj: %+v, is symlink: %v", obj, symlink)
+	log.Debugf("[sftp] obj: %+v, is symlink: %v, target: %s", obj, symlink, target)
 	return obj, nil
 }
