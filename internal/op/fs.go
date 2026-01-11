@@ -350,9 +350,16 @@ func MakeDir(ctx context.Context, storage driver.Driver, path string) error {
 			return nil, errors.WithMessagef(err, "failed to make parent dir [%s]", parentPath)
 		}
 		parentDir, err := GetUnwrap(ctx, storage, parentPath)
-		// this should not happen
 		if err != nil {
-			return nil, errors.WithMessagef(err, "failed to get parent dir [%s]", parentPath)
+			if errs.IsObjectNotFound(err) {
+				// Retry once after a short delay (handles cloud storage API sync delay)
+				log.Debugf("[op] parent dir [%s] not found immediately after creation, retrying...", parentPath)
+				time.Sleep(100 * time.Millisecond)
+				parentDir, err = GetUnwrap(ctx, storage, parentPath)
+			}
+			if err != nil {
+				return nil, errors.WithMessagef(err, "failed to get parent dir [%s]", parentPath)
+			}
 		}
 		if model.ObjHasMask(parentDir, model.NoWrite) {
 			return nil, errors.WithStack(errs.PermissionDenied)
