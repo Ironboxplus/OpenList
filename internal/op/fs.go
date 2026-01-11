@@ -150,6 +150,7 @@ func Get(ctx context.Context, storage driver.Driver, path string, excludeTempObj
 				Modified: storage.GetStorage().Modified,
 				IsFolder: true,
 				Mask:     model.Locked,
+				HashInfo: utils.NewHashInfo(nil, ""),
 			}, nil
 		case driver.IRootPath:
 			return &model.Object{
@@ -158,6 +159,7 @@ func Get(ctx context.Context, storage driver.Driver, path string, excludeTempObj
 				Modified: storage.GetStorage().Modified,
 				Mask:     model.Locked,
 				IsFolder: true,
+				HashInfo: utils.NewHashInfo(nil, ""),
 			}, nil
 		}
 		return nil, errors.New("please implement GetRooter or IRootPath or IRootId interface")
@@ -262,6 +264,28 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed get link")
 		}
+
+		// Set up link refresher for automatic refresh on expiry during long downloads
+		// This enables all download scenarios to handle link expiration gracefully
+		if link.Refresher == nil {
+			storageCopy := storage
+			pathCopy := path
+			argsCopy := args
+			link.Refresher = func(refreshCtx context.Context) (*model.Link, model.Obj, error) {
+				log.Infof("Refreshing download link for: %s", pathCopy)
+				// Get fresh link directly from storage, bypassing cache
+				file, err := GetUnwrap(refreshCtx, storageCopy, pathCopy)
+				if err != nil {
+					return nil, nil, errors.WithMessage(err, "failed to get file for refresh")
+				}
+				newLink, err := storageCopy.Link(refreshCtx, file, argsCopy)
+				if err != nil {
+					return nil, nil, errors.Wrapf(err, "failed to refresh link")
+				}
+				return newLink, file, nil
+			}
+		}
+
 		ol := &objWithLink{link: link, obj: file}
 		if link.Expiration != nil {
 			Cache.linkCache.SetTypeWithTTL(key, typeKey, ol, *link.Expiration)
@@ -326,9 +350,16 @@ func MakeDir(ctx context.Context, storage driver.Driver, path string) error {
 			return nil, errors.WithMessagef(err, "failed to make parent dir [%s]", parentPath)
 		}
 		parentDir, err := GetUnwrap(ctx, storage, parentPath)
-		// this should not happen
 		if err != nil {
-			return nil, errors.WithMessagef(err, "failed to get parent dir [%s]", parentPath)
+			if errs.IsObjectNotFound(err) {
+				// Retry once after a short delay (handles cloud storage API sync delay)
+				log.Debugf("[op] parent dir [%s] not found immediately after creation, retrying...", parentPath)
+				time.Sleep(100 * time.Millisecond)
+				parentDir, err = GetUnwrap(ctx, storage, parentPath)
+			}
+			if err != nil {
+				return nil, errors.WithMessagef(err, "failed to get parent dir [%s]", parentPath)
+			}
 		}
 		if model.ObjHasMask(parentDir, model.NoWrite) {
 			return nil, errors.WithStack(errs.PermissionDenied)
@@ -358,6 +389,7 @@ func MakeDir(ctx context.Context, storage driver.Driver, path string) error {
 					Modified: t,
 					Ctime:    t,
 					Mask:     model.Temp,
+					HashInfo: utils.NewHashInfo(nil, ""),
 				}
 			}
 			dirCache.UpdateObject("", wrapObjName(storage, newObj))
@@ -682,6 +714,7 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 						Modified: file.ModTime(),
 						Ctime:    file.CreateTime(),
 						Mask:     model.Temp,
+						HashInfo: utils.NewHashInfo(nil, ""),
 					}
 				}
 				newObj = wrapObjName(storage, newObj)
@@ -750,6 +783,7 @@ func PutURL(ctx context.Context, storage driver.Driver, dstDirPath, dstName, url
 						Modified: t,
 						Ctime:    t,
 						Mask:     model.Temp,
+						HashInfo: utils.NewHashInfo(nil, ""),
 					}
 				}
 				newObj = wrapObjName(storage, newObj)
