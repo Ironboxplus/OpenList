@@ -237,16 +237,57 @@ func (d *QuarkOpen) Put(ctx context.Context, dstDir model.Obj, stream model.File
 		return nil
 	}
 
-	// get part info
-	partInfo := d._getPartInfo(stream, pre.Data.PartSize)
-	// get upload url info
-	upUrlInfo, err := d.upUrl(ctx, pre, partInfo)
-	if err != nil {
+	// 带重试的分片大小调整逻辑：如果检测到 "part list exceed" 错误，自动翻倍分片大小
+	var upUrlInfo UpUrlInfo
+	var partInfo []base.Json
+	currentPartSize := pre.Data.PartSize
+	const maxRetries = 5
+	const maxPartSize = 1024 * utils.MB // 1GB 上限
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// 计算分片信息
+		partInfo = d._getPartInfo(stream, currentPartSize)
+
+		// 尝试获取上传 URL
+		upUrlInfo, err = d.upUrl(ctx, pre, partInfo)
+		if err == nil {
+			// 成功获取上传 URL
+			log.Infof("[quark_open] Successfully obtained upload URLs with part size: %d MB (%d parts)",
+				currentPartSize/(1024*1024), len(partInfo))
+			break
+		}
+
+		// 检查是否为分片超限错误
+		if strings.Contains(err.Error(), "exceed") {
+			if attempt < maxRetries-1 {
+				// 还有重试机会，翻倍分片大小
+				newPartSize := currentPartSize * 2
+
+				// 检查是否超过上限
+				if newPartSize > maxPartSize {
+					return fmt.Errorf("part list exceeded and cannot increase part size (current: %d MB, max: %d MB). File may be too large for Quark API",
+						currentPartSize/(1024*1024), maxPartSize/(1024*1024))
+				}
+
+				log.Warnf("[quark_open] Part list exceeded (attempt %d/%d, %d parts). Retrying with doubled part size: %d MB -> %d MB",
+					attempt+1, maxRetries, len(partInfo),
+					currentPartSize/(1024*1024), newPartSize/(1024*1024))
+
+				currentPartSize = newPartSize
+				continue // 重试
+			} else {
+				// 已达到最大重试次数
+				return fmt.Errorf("part list exceeded after %d retries. Last attempt: part size %d MB, %d parts",
+					maxRetries, currentPartSize/(1024*1024), len(partInfo))
+			}
+		}
+
+		// 其他错误，直接返回
 		return err
 	}
 
-	// part up
-	ss, err := streamPkg.NewStreamSectionReader(stream, int(pre.Data.PartSize), &up)
+	// part up - 使用调整后的 currentPartSize
+	ss, err := streamPkg.NewStreamSectionReader(stream, int(currentPartSize), &up)
 	if err != nil {
 		return err
 	}
@@ -260,8 +301,8 @@ func (d *QuarkOpen) Put(ctx context.Context, dstDir model.Obj, stream model.File
 			return ctx.Err()
 		}
 
-		offset := int64(i) * pre.Data.PartSize
-		size := min(pre.Data.PartSize, total-offset)
+		offset := int64(i) * currentPartSize
+		size := min(currentPartSize, total-offset)
 		rd, err := ss.GetSectionReader(offset, size)
 		if err != nil {
 			return err
