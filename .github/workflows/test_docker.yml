@@ -22,6 +22,8 @@ env:
   RELEASE_PLATFORMS: 'linux/amd64'
   # 👇 关键修改：强制允许推送，不用管是不是 push 事件
   IMAGE_PUSH: 'true'
+  # 👇 使用自己的前端仓库
+  FRONTEND_REPO: 'Ironboxplus/OpenList-Frontend'
   IMAGE_TAGS_BETA: |
     type=ref,event=pr
     type=raw,value=beta-retry
