@@ -6,7 +6,8 @@ on:
       - main
   pull_request:
     branches:
-      - fix   # 👈 允许你的 fix 分支触发
+      - copy
+
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
