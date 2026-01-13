@@ -38,13 +38,6 @@ func (f RangeReaderFunc) RangeRead(ctx context.Context, httpRange http_range.Ran
 	return f(ctx, httpRange)
 }
 
-// LinkRefresher 接口用于在读取数据失败时强制刷新链接
-type LinkRefresher interface {
-	// ForceRefreshLink 强制刷新下载链接
-	// 返回 true 表示刷新成功，false 表示无法刷新
-	ForceRefreshLink(ctx context.Context) bool
-}
-
 // IsLinkExpiredError checks if the error indicates an expired download link
 func IsLinkExpiredError(err error) bool {
 	if err == nil {
@@ -131,7 +124,16 @@ func (r *RefreshableRangeReader) RangeRead(ctx context.Context, httpRange http_r
 		}
 	}
 
-	return rc, nil
+	// Wrap the ReadCloser with self-healing capability to detect 0-byte reads
+	// This handles cases where cloud providers return 200 OK but empty body for expired links
+	return &selfHealingReadCloser{
+		ReadCloser: rc,
+		refresher:  r,
+		ctx:        ctx,
+		httpRange:  httpRange,
+		firstRead:  false,
+		closed:     false,
+	}, nil
 }
 
 func (r *RefreshableRangeReader) refreshAndRetry(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
@@ -147,19 +149,6 @@ func (r *RefreshableRangeReader) refreshAndRetry(ctx context.Context, httpRange 
 		return nil, err
 	}
 	return reader.RangeRead(ctx, httpRange)
-}
-
-// ForceRefresh 强制刷新链接，用于读取数据失败（如读取 0 字节）的情况
-// 返回 true 表示刷新成功，false 表示无法刷新（没有 Refresher 或达到最大刷新次数）
-func (r *RefreshableRangeReader) ForceRefresh(ctx context.Context) bool {
-	if r.link.Refresher == nil {
-		return false
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	return r.doRefreshLocked(ctx) == nil
 }
 
 // doRefreshLocked 执行实际的刷新逻辑（需要持有锁）
@@ -181,6 +170,84 @@ func (r *RefreshableRangeReader) doRefreshLocked(ctx context.Context) error {
 
 	log.Infof("Link refreshed successfully")
 	return nil
+}
+
+// selfHealingReadCloser wraps an io.ReadCloser and automatically refreshes the link
+// if it detects 0-byte reads (common with expired links from some cloud providers)
+type selfHealingReadCloser struct {
+	io.ReadCloser
+	refresher *RefreshableRangeReader
+	ctx       context.Context
+	httpRange http_range.Range
+	firstRead bool
+	closed    bool
+	mu        sync.Mutex
+}
+
+func (s *selfHealingReadCloser) Read(p []byte) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return 0, errors.New("read from closed reader")
+	}
+
+	n, err = s.ReadCloser.Read(p)
+
+	// Detect 0-byte read on first attempt (indicates link may be expired but returned 200 OK)
+	if !s.firstRead && n == 0 && (err == io.EOF || err == io.ErrUnexpectedEOF) {
+		s.firstRead = true
+		log.Warnf("Detected 0-byte read on first attempt, attempting to refresh link...")
+
+		// Try to refresh the link
+		s.refresher.mu.Lock()
+		refreshErr := s.refresher.doRefreshLocked(s.ctx)
+		s.refresher.mu.Unlock()
+
+		if refreshErr != nil {
+			log.Errorf("Failed to refresh link after 0-byte read: %v", refreshErr)
+			return n, err
+		}
+
+		// Close old connection
+		s.ReadCloser.Close()
+
+		// Get new reader and retry
+		s.refresher.mu.Lock()
+		reader, getErr := s.refresher.getInnerReader()
+		s.refresher.mu.Unlock()
+
+		if getErr != nil {
+			log.Errorf("Failed to get inner reader after refresh: %v", getErr)
+			return n, err
+		}
+
+		newRc, rangeErr := reader.RangeRead(s.ctx, s.httpRange)
+		if rangeErr != nil {
+			log.Errorf("Failed to create new range reader after refresh: %v", rangeErr)
+			return n, err
+		}
+
+		s.ReadCloser = newRc
+		log.Infof("Successfully refreshed link and reconnected after 0-byte read")
+
+		// Retry read with new connection
+		return s.ReadCloser.Read(p)
+	}
+
+	s.firstRead = true
+	return n, err
+}
+
+func (s *selfHealingReadCloser) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	return s.ReadCloser.Close()
 }
 
 func GetRangeReaderFromLink(size int64, link *model.Link) (model.RangeReaderIF, error) {
@@ -341,7 +408,7 @@ func CacheFullAndHash(stream model.FileStreamer, up *model.UpdateProgress, hashT
 // off: 读取的起始偏移量
 // 返回值: 实际读取的字节数和错误
 // 支持自动重试（最多5次），快速重试策略（1秒、2秒、3秒、4秒、5秒）
-// 支持链接刷新：当检测到 0 字节读取时，会自动刷新下载链接
+// 注意：链接刷新现在由 RefreshableRangeReader 内部的 selfHealingReadCloser 自动处理
 func ReadFullWithRangeRead(file model.FileStreamer, buf []byte, off int64) (int, error) {
 	length := int64(len(buf))
 	var lastErr error
@@ -369,28 +436,8 @@ func ReadFullWithRangeRead(file model.FileStreamer, buf []byte, off int64) (int,
 		lastErr = fmt.Errorf("failed to read all data via RangeRead at offset %d: (expect=%d, actual=%d) %w", off, length, n, err)
 		log.Debugf("RangeRead retry %d read failed: %v", retry+1, lastErr)
 
-		// 检测是否可能是链接过期（读取 0 字节或 EOF）
-		if n == 0 && (err == io.EOF || err == io.ErrUnexpectedEOF) {
-			// 尝试刷新链接
-			if refresher, ok := file.(LinkRefresher); ok {
-				// 获取 context - 从 FileStream 或 SeekableStream 中获取
-				var ctx context.Context
-				if fs, ok := file.(*FileStream); ok {
-					ctx = fs.Ctx
-				} else if ss, ok := file.(*SeekableStream); ok {
-					ctx = ss.Ctx
-				} else {
-					ctx = context.Background()
-				}
-
-				if refresher.ForceRefreshLink(ctx) {
-					log.Infof("Link refreshed after 0-byte read, retrying immediately...")
-					continue // 立即重试，不延迟
-				}
-			}
-		}
-
 		// 快速重试：1秒、2秒、3秒、4秒、5秒（读取失败快速重试）
+		// 注意：0字节读取导致的链接过期现在由 selfHealingReadCloser 自动处理
 		time.Sleep(time.Duration(retry+1) * time.Second)
 	}
 

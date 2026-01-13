@@ -346,14 +346,6 @@ func (ss *SeekableStream) generateReader() error {
 	return nil
 }
 
-// ForceRefreshLink 实现 LinkRefresher 接口，用于在读取失败时刷新链接
-func (ss *SeekableStream) ForceRefreshLink(ctx context.Context) bool {
-	if rr, ok := ss.rangeReader.(*RefreshableRangeReader); ok {
-		return rr.ForceRefresh(ctx)
-	}
-	return false
-}
-
 func (ss *SeekableStream) CacheFullAndWriter(up *model.UpdateProgress, writer io.Writer) (model.File, error) {
 	if err := ss.generateReader(); err != nil {
 		return nil, err
