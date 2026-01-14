@@ -296,7 +296,58 @@ func (d *GoogleDrive) getFiles(id string) ([]File, error) {
 
 		res = append(res, resp.Files...)
 	}
+
+	// Handle duplicate filenames by adding suffixes like (1), (2), etc.
+	// Google Drive allows multiple files with the same name in one folder,
+	// but OpenList uses path-based file system which requires unique names
+	res = handleDuplicateNames(res)
+
 	return res, nil
+}
+
+// handleDuplicateNames adds suffixes to duplicate filenames to make them unique
+// For example: file.txt, file (1).txt, file (2).txt
+func handleDuplicateNames(files []File) []File {
+	if len(files) <= 1 {
+		return files
+	}
+
+	// Track how many files with each name we've seen
+	nameCount := make(map[string]int)
+
+	// First pass: count occurrences of each name
+	for _, file := range files {
+		nameCount[file.Name]++
+	}
+
+	// Second pass: add suffixes to duplicates
+	nameIndex := make(map[string]int)
+	for i := range files {
+		name := files[i].Name
+		if nameCount[name] > 1 {
+			index := nameIndex[name]
+			nameIndex[name]++
+
+			if index > 0 {
+				// Add suffix for all except the first occurrence
+				// Split name into base and extension
+				ext := ""
+				base := name
+				for j := len(name) - 1; j >= 0; j-- {
+					if name[j] == '.' {
+						ext = name[j:]
+						base = name[:j]
+						break
+					}
+				}
+
+				// Add (1), (2), etc. suffix
+				files[i].Name = fmt.Sprintf("%s (%d)%s", base, index, ext)
+			}
+		}
+	}
+
+	return files
 }
 
 // getTargetFileInfo gets target file details for shortcuts
