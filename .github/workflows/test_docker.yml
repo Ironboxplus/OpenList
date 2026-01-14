@@ -22,8 +22,8 @@ env:
   RELEASE_PLATFORMS: 'linux/amd64'
   # 👇 关键修改：强制允许推送，不用管是不是 push 事件
   IMAGE_PUSH: 'true'
-  # 👇 使用自己的前端仓库
-  FRONTEND_REPO: 'Ironboxplus/OpenList-Frontend'
+  # 👇 使用默认的前端仓库 (OpenListTeam/OpenList-Frontend)
+  # FRONTEND_REPO: 'Ironboxplus/OpenList-Frontend'
   IMAGE_TAGS_BETA: |
     type=ref,event=pr
     type=raw,value=beta-retry
@@ -47,8 +47,15 @@ jobs:
       - name: Get Frontend Commit SHA
         id: frontend-sha
         run: |
-          FRONTEND_SHA=$(curl -s https://api.github.com/repos/${{ env.FRONTEND_REPO }}/commits/main | jq -r '.sha')
+          FRONTEND_REPO="${{ env.FRONTEND_REPO }}"
+          # 如果未设置FRONTEND_REPO，使用默认值
+          if [ -z "$FRONTEND_REPO" ]; then
+            FRONTEND_REPO="OpenListTeam/OpenList-Frontend"
+          fi
+          FRONTEND_SHA=$(curl -s https://api.github.com/repos/$FRONTEND_REPO/commits/main | jq -r '.sha')
           echo "sha=$FRONTEND_SHA" >> $GITHUB_OUTPUT
+          echo "repo=$FRONTEND_REPO" >> $GITHUB_OUTPUT
+          echo "Frontend repo: $FRONTEND_REPO"
           echo "Frontend repo latest commit: $FRONTEND_SHA"
 
       # 缓存前端下载 - key包含前端仓库的commit SHA
@@ -57,9 +64,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: public/dist
-          key: frontend-${{ env.FRONTEND_REPO }}-${{ steps.frontend-sha.outputs.sha }}
+          key: frontend-${{ steps.frontend-sha.outputs.repo }}-${{ steps.frontend-sha.outputs.sha }}
           restore-keys: |
-            frontend-${{ env.FRONTEND_REPO }}-
+            frontend-${{ steps.frontend-sha.outputs.repo }}-
 
       # 即使只构建 x64，我们也需要 musl 工具链（因为 BuildDockerMultiplatform 默认会检查它）
       - name: Cache Musl
@@ -80,7 +87,7 @@ jobs:
         run: bash build.sh beta docker-multiplatform
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FRONTEND_REPO: ${{ env.FRONTEND_REPO }}
+          # FRONTEND_REPO 使用 build.sh 默认值 (OpenListTeam/OpenList-Frontend)
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
