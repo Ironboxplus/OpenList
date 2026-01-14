@@ -43,6 +43,13 @@ func IsLinkExpiredError(err error) bool {
 	if err == nil {
 		return false
 	}
+
+	// Don't treat context cancellation as link expiration
+	// This happens when user pauses/seeks video or cancels download
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
 	errStr := strings.ToLower(err.Error())
 
 	// Common expired link error keywords
@@ -62,8 +69,8 @@ func IsLinkExpiredError(err error) bool {
 	if statusErr, ok := errs.UnwrapOrSelf(err).(net.HttpStatusCodeError); ok {
 		code := int(statusErr)
 		// 401 Unauthorized, 403 Forbidden, 410 Gone are common for expired links
-		// 500 Internal Server Error - some providers (e.g., Baidu) return 500 when link expires
-		if code == 401 || code == 403 || code == 410 || code == 500 {
+		// Note: Removed 500 to avoid false positives from temporary network errors
+		if code == 401 || code == 403 || code == 410 {
 			return true
 		}
 	}
@@ -158,7 +165,9 @@ func (r *RefreshableRangeReader) doRefreshLocked(ctx context.Context) error {
 	}
 
 	log.Infof("Link expired, attempting to refresh...")
-	newLink, _, refreshErr := r.link.Refresher(ctx)
+	// Use independent context for refresh to prevent cancellation from affecting link refresh
+	refreshCtx := context.WithoutCancel(ctx)
+	newLink, _, refreshErr := r.link.Refresher(refreshCtx)
 	if refreshErr != nil {
 		return fmt.Errorf("failed to refresh link: %w", refreshErr)
 	}
