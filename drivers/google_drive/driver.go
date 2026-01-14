@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
@@ -14,6 +15,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/go-resty/resty/v2"
+	log "github.com/sirupsen/logrus"
 )
 
 type GoogleDrive struct {
@@ -69,12 +71,37 @@ func (d *GoogleDrive) Link(ctx context.Context, file model.Obj, args model.LinkA
 }
 
 func (d *GoogleDrive) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
+	// Check if folder already exists to avoid duplicates
+	// Google Drive allows multiple files with same name, but we want unique folders
+	var existingFiles Files
+	// Escape single quotes in dirName to prevent query injection
+	escapedDirName := strings.ReplaceAll(dirName, "'", "\\'")
+	query := map[string]string{
+		"q":      fmt.Sprintf("name='%s' and '%s' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false", escapedDirName, parentDir.GetID()),
+		"fields": "files(id)",
+	}
+	_, err := d.request("https://www.googleapis.com/drive/v3/files", http.MethodGet, func(req *resty.Request) {
+		req.SetQueryParams(query)
+	}, &existingFiles)
+
+	// If query succeeded and folder exists, return success (idempotent)
+	if err == nil && len(existingFiles.Files) > 0 {
+		log.Debugf("[google_drive] Folder '%s' already exists in parent %s, skipping creation", dirName, parentDir.GetID())
+		return nil
+	}
+	// If query failed, return error to prevent duplicate creation
+	// Google Drive allows multiple files with same name, so we must ensure check succeeds
+	if err != nil {
+		return fmt.Errorf("failed to check existing folder '%s': %w", dirName, err)
+	}
+
+	// Create new folder (only when confirmed folder doesn't exist)
 	data := base.Json{
 		"name":     dirName,
 		"parents":  []string{parentDir.GetID()},
 		"mimeType": "application/vnd.google-apps.folder",
 	}
-	_, err := d.request("https://www.googleapis.com/drive/v3/files", http.MethodPost, func(req *resty.Request) {
+	_, err = d.request("https://www.googleapis.com/drive/v3/files", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(data)
 	}, nil)
 	return err
