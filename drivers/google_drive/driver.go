@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
@@ -14,9 +16,14 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+	"github.com/avast/retry-go"
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
 )
+
+// mkdirLocks prevents race conditions when creating folders with the same name
+// Google Drive allows duplicate folder names, so we need application-level locking
+var mkdirLocks sync.Map // map[string]*sync.Mutex - key is parentID + "/" + dirName
 
 type GoogleDrive struct {
 	model.Storage
@@ -71,18 +78,34 @@ func (d *GoogleDrive) Link(ctx context.Context, file model.Obj, args model.LinkA
 }
 
 func (d *GoogleDrive) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
-	// Check if folder already exists to avoid duplicates
-	// Google Drive allows multiple files with same name, but we want unique folders
-	var existingFiles Files
-	// Escape single quotes in dirName to prevent query injection
+	// Use per-folder lock to prevent concurrent creation of same folder
+	// This is critical because Google Drive allows duplicate folder names
+	lockKey := parentDir.GetID() + "/" + dirName
+	lockVal, _ := mkdirLocks.LoadOrStore(lockKey, &sync.Mutex{})
+	lock := lockVal.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// Check if folder already exists with retry to handle API eventual consistency
 	escapedDirName := strings.ReplaceAll(dirName, "'", "\\'")
 	query := map[string]string{
 		"q":      fmt.Sprintf("name='%s' and '%s' in parents and mimeType='application/vnd.google-apps.folder' and trashed=false", escapedDirName, parentDir.GetID()),
 		"fields": "files(id)",
 	}
-	_, err := d.request("https://www.googleapis.com/drive/v3/files", http.MethodGet, func(req *resty.Request) {
-		req.SetQueryParams(query)
-	}, &existingFiles)
+
+	var existingFiles Files
+	err := retry.Do(func() error {
+		var checkErr error
+		_, checkErr = d.request("https://www.googleapis.com/drive/v3/files", http.MethodGet, func(req *resty.Request) {
+			req.SetQueryParams(query)
+		}, &existingFiles)
+		return checkErr
+	},
+		retry.Context(ctx),
+		retry.Attempts(3),
+		retry.DelayType(retry.BackOffDelay),
+		retry.Delay(200*time.Millisecond),
+	)
 
 	// If query succeeded and folder exists, return success (idempotent)
 	if err == nil && len(existingFiles.Files) > 0 {
@@ -90,7 +113,6 @@ func (d *GoogleDrive) MakeDir(ctx context.Context, parentDir model.Obj, dirName 
 		return nil
 	}
 	// If query failed, return error to prevent duplicate creation
-	// Google Drive allows multiple files with same name, so we must ensure check succeeds
 	if err != nil {
 		return fmt.Errorf("failed to check existing folder '%s': %w", dirName, err)
 	}
@@ -101,10 +123,30 @@ func (d *GoogleDrive) MakeDir(ctx context.Context, parentDir model.Obj, dirName 
 		"parents":  []string{parentDir.GetID()},
 		"mimeType": "application/vnd.google-apps.folder",
 	}
-	_, err = d.request("https://www.googleapis.com/drive/v3/files", http.MethodPost, func(req *resty.Request) {
-		req.SetBody(data)
-	}, nil)
-	return err
+
+	var createErr error
+	err = retry.Do(func() error {
+		_, createErr = d.request("https://www.googleapis.com/drive/v3/files", http.MethodPost, func(req *resty.Request) {
+			req.SetBody(data)
+		}, nil)
+		return createErr
+	},
+		retry.Context(ctx),
+		retry.Attempts(3),
+		retry.DelayType(retry.BackOffDelay),
+		retry.Delay(500*time.Millisecond),
+	)
+
+	if err != nil {
+		return err
+	}
+
+	// Wait briefly for API eventual consistency before releasing lock
+	// This helps prevent race conditions where a concurrent request
+	// checks for folder existence before the newly created folder is visible
+	time.Sleep(100 * time.Millisecond)
+
+	return nil
 }
 
 func (d *GoogleDrive) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
