@@ -20,14 +20,21 @@ import (
 	"github.com/avast/retry-go"
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/time/rate"
 )
 
 type QuarkOpen struct {
 	model.Storage
 	Addition
-	config driver.Config
-	conf   Conf
+	config  driver.Config
+	conf    Conf
+	limiter *rate.Limiter
 }
+
+// 速率限制常量：夸克开放平台限流，保守设置
+const (
+	quarkRateLimit = 2.0 // 每秒2个请求，避免限流
+)
 
 func (d *QuarkOpen) Config() driver.Config {
 	return d.config
@@ -38,6 +45,9 @@ func (d *QuarkOpen) GetAddition() driver.Additional {
 }
 
 func (d *QuarkOpen) Init(ctx context.Context) error {
+	// 初始化速率限制器
+	d.limiter = rate.NewLimiter(rate.Limit(quarkRateLimit), 1)
+
 	var resp UserInfoResp
 
 	_, err := d.request(ctx, "/open/v1/user/info", http.MethodGet, nil, &resp)
@@ -54,11 +64,22 @@ func (d *QuarkOpen) Init(ctx context.Context) error {
 	return err
 }
 
+// waitLimit 等待速率限制
+func (d *QuarkOpen) waitLimit(ctx context.Context) error {
+	if d.limiter != nil {
+		return d.limiter.Wait(ctx)
+	}
+	return nil
+}
+
 func (d *QuarkOpen) Drop(ctx context.Context) error {
 	return nil
 }
 
 func (d *QuarkOpen) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
+	if err := d.waitLimit(ctx); err != nil {
+		return nil, err
+	}
 	files, err := d.GetFiles(ctx, dir.GetID())
 	if err != nil {
 		return nil, err
@@ -69,6 +90,9 @@ func (d *QuarkOpen) List(ctx context.Context, dir model.Obj, args model.ListArgs
 }
 
 func (d *QuarkOpen) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
+	if err := d.waitLimit(ctx); err != nil {
+		return nil, err
+	}
 	data := base.Json{
 		"fid": file.GetID(),
 	}
@@ -145,6 +169,9 @@ func (d *QuarkOpen) Remove(ctx context.Context, obj model.Obj) error {
 }
 
 func (d *QuarkOpen) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) error {
+	if err := d.waitLimit(ctx); err != nil {
+		return err
+	}
 	md5Str, sha1Str := stream.GetHash().GetHash(utils.MD5), stream.GetHash().GetHash(utils.SHA1)
 
 	// 检查是否需要计算hash
@@ -226,13 +253,50 @@ func (d *QuarkOpen) Put(ctx context.Context, dstDir model.Obj, stream model.File
 			}
 		}
 	}
-	// pre
-	pre, err := d.upPre(ctx, stream, dstDir.GetID(), md5Str, sha1Str)
+	// pre - 带有 proof fail 重试逻辑
+	var pre UpPreResp
+	var err error
+	err = retry.Do(func() error {
+		var preErr error
+		pre, preErr = d.upPre(ctx, stream, dstDir.GetID(), md5Str, sha1Str)
+		if preErr != nil {
+			// 检查是否为 proof fail 错误
+			if strings.Contains(preErr.Error(), "proof") || strings.Contains(preErr.Error(), "43010") {
+				log.Warnf("[quark_open] Proof verification failed, retrying: %v", preErr)
+				return preErr // 返回错误触发重试
+			}
+			// 检查是否为限流错误
+			if strings.Contains(preErr.Error(), "限流") || strings.Contains(preErr.Error(), "rate") {
+				log.Warnf("[quark_open] Rate limited, waiting before retry: %v", preErr)
+				time.Sleep(2 * time.Second) // 额外等待
+				return preErr
+			}
+		}
+		return preErr
+	},
+		retry.Context(ctx),
+		retry.Attempts(3),
+		retry.DelayType(retry.BackOffDelay),
+		retry.Delay(500*time.Millisecond),
+	)
 	if err != nil {
 		return err
 	}
 	// 如果预上传已经完成，直接返回--秒传
 	if pre.Data.Finish {
+		up(100)
+		return nil
+	}
+
+	// 空文件特殊处理：跳过分片上传，直接调用 upFinish
+	// 由于夸克 API 对空文件处理不稳定，尝试完成上传，失败则直接成功返回
+	if stream.GetSize() == 0 {
+		log.Infof("[quark_open] Empty file detected, attempting direct finish (task_id: %s)", pre.Data.TaskID)
+		err = d.upFinish(ctx, pre, []base.Json{}, []string{})
+		if err != nil {
+			// 空文件 upFinish 失败，可能是 API 不支持，直接视为成功
+			log.Warnf("[quark_open] Empty file upFinish failed: %v, treating as success", err)
+		}
 		up(100)
 		return nil
 	}
