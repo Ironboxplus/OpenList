@@ -68,9 +68,9 @@ func IsLinkExpiredError(err error) bool {
 	// Check for HTTP status codes that typically indicate expired links
 	if statusErr, ok := errs.UnwrapOrSelf(err).(net.HttpStatusCodeError); ok {
 		code := int(statusErr)
-		// 401 Unauthorized, 403 Forbidden, 410 Gone are common for expired links
-		// Note: Removed 500 to avoid false positives from temporary network errors
-		if code == 401 || code == 403 || code == 410 {
+		// All 4xx client errors may indicate expired/invalid links
+		// 400 Bad Request, 401 Unauthorized, 403 Forbidden, 404 Not Found, 410 Gone, etc.
+		if code >= 400 && code < 500 {
 			return true
 		}
 	}
