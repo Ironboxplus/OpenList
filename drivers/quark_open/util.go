@@ -20,6 +20,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/go-resty/resty/v2"
 	log "github.com/sirupsen/logrus"
 )
@@ -283,8 +284,15 @@ func (d *QuarkOpen) getProofRange(proofSeed string, fileSize int64) (*ProofRange
 
 func (d *QuarkOpen) _getPartInfo(stream model.FileStreamer, partSize int64) []base.Json {
 	// 计算分片信息
-	partInfo := make([]base.Json, 0)
 	total := stream.GetSize()
+
+	// 确保partSize合理：最小4MB，避免分片过多
+	const minPartSize int64 = 4 * utils.MB
+	if partSize < minPartSize {
+		partSize = minPartSize
+	}
+
+	partInfo := make([]base.Json, 0)
 	left := total
 	partNumber := 1
 
@@ -304,6 +312,7 @@ func (d *QuarkOpen) _getPartInfo(stream model.FileStreamer, partSize int64) []ba
 		partNumber++
 	}
 
+	log.Infof("[quark_open] Upload plan: file_size=%d, part_size=%d, part_count=%d", total, partSize, len(partInfo))
 	return partInfo
 }
 
@@ -315,11 +324,17 @@ func (d *QuarkOpen) upUrl(ctx context.Context, pre UpPreResp, partInfo []base.Js
 	}
 	var resp UpUrlResp
 
+	log.Infof("[quark_open] Requesting upload URLs for %d parts (task_id: %s)", len(partInfo), pre.Data.TaskID)
+
 	_, err = d.request(ctx, "/open/v1/file/get_upload_urls", http.MethodPost, func(req *resty.Request) {
 		req.SetBody(data)
 	}, &resp)
 
 	if err != nil {
+		// 如果是分片超限错误，记录详细信息
+		if strings.Contains(err.Error(), "part list exceed") {
+			log.Errorf("[quark_open] Part list exceeded limit! Requested %d parts. Please check Quark API documentation for actual limit.", len(partInfo))
+		}
 		return upUrlInfo, err
 	}
 
@@ -340,12 +355,42 @@ func (d *QuarkOpen) upPart(ctx context.Context, upUrlInfo UpUrlInfo, partNumber 
 	req.Header.Set("Accept-Encoding", "gzip")
 	req.Header.Set("User-Agent", "Go-http-client/1.1")
 
+	// ✅ 关键修复：使用更长的超时时间（10分钟）
+	// 慢速网络下大文件分片上传可能需要很长时间
+	client := &http.Client{
+		Timeout: 10 * time.Minute,
+		Transport: base.HttpClient.Transport,
+	}
+
 	// 发送请求
-	resp, err := base.HttpClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
+
+	// 检查是否为URL过期错误（403, 410等状态码）
+	if resp.StatusCode == 403 || resp.StatusCode == 410 {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("upload url expired (status: %d): %s", resp.StatusCode, string(body))
+	}
+
+	// ✅ 关键修复：409 PartAlreadyExist 不是错误！
+	// 夸克使用Sequential模式，超时重试时如果分片已存在，说明第一次其实成功了
+	if resp.StatusCode == 409 {
+		body, _ := io.ReadAll(resp.Body)
+		// 从响应体中提取已存在分片的ETag
+		if strings.Contains(string(body), "PartAlreadyExist") {
+			// 尝试从XML响应中提取ETag
+			if etag := extractEtagFromXML(string(body)); etag != "" {
+				log.Infof("[quark_open] Part %d already exists (409), using existing ETag: %s", partNumber+1, etag)
+				return etag, nil
+			}
+			// 如果无法提取ETag，返回错误
+			log.Warnf("[quark_open] Part %d already exists but cannot extract ETag from response: %s", partNumber+1, string(body))
+			return "", fmt.Errorf("part already exists but ETag not found in response")
+		}
+	}
 
 	if resp.StatusCode != 200 {
 		body, _ := io.ReadAll(resp.Body)
@@ -353,6 +398,23 @@ func (d *QuarkOpen) upPart(ctx context.Context, upUrlInfo UpUrlInfo, partNumber 
 	}
 	// 返回 Etag 作为分片上传的标识
 	return resp.Header.Get("Etag"), nil
+}
+
+// extractEtagFromXML 从OSS的XML错误响应中提取ETag
+// 示例: <PartEtag>"2F796AC486BB2891E3237D8BFDE020B5"</PartEtag>
+func extractEtagFromXML(xmlBody string) string {
+	start := strings.Index(xmlBody, "<PartEtag>")
+	if start == -1 {
+		return ""
+	}
+	start += len("<PartEtag>")
+	end := strings.Index(xmlBody[start:], "</PartEtag>")
+	if end == -1 {
+		return ""
+	}
+	etag := xmlBody[start : start+end]
+	// 移除引号
+	return strings.Trim(etag, "\"")
 }
 
 func (d *QuarkOpen) upFinish(ctx context.Context, pre UpPreResp, partInfo []base.Json, etags []string) error {
@@ -417,25 +479,36 @@ func (d *QuarkOpen) generateReqSign(method string, pathname string, signKey stri
 }
 
 func (d *QuarkOpen) refreshToken() error {
-	refresh, access, err := d._refreshToken()
+	refresh, access, appID, signKey, err := d._refreshToken()
 	for i := 0; i < 3; i++ {
 		if err == nil {
 			break
 		} else {
 			log.Errorf("[quark_open] failed to refresh token: %s", err)
 		}
-		refresh, access, err = d._refreshToken()
+		refresh, access, appID, signKey, err = d._refreshToken()
 	}
 	if err != nil {
 		return err
 	}
 	log.Infof("[quark_open] token exchange: %s -> %s", d.RefreshToken, refresh)
 	d.RefreshToken, d.AccessToken = refresh, access
+
+	// 如果在线API返回了AppID和SignKey，保存它们（不为空时才更新）
+	if appID != "" && appID != d.AppID {
+		d.AppID = appID
+		log.Infof("[quark_open] AppID updated from online API: %s", appID)
+	}
+	if signKey != "" && signKey != d.SignKey {
+		d.SignKey = signKey
+		log.Infof("[quark_open] SignKey updated from online API")
+	}
+
 	op.MustSaveDriverStorage(d)
 	return nil
 }
 
-func (d *QuarkOpen) _refreshToken() (string, string, error) {
+func (d *QuarkOpen) _refreshToken() (string, string, string, string, error) {
 	if d.UseOnlineAPI && d.APIAddress != "" {
 		u := d.APIAddress
 		var resp RefreshTokenOnlineAPIResp
@@ -448,19 +521,20 @@ func (d *QuarkOpen) _refreshToken() (string, string, error) {
 			}).
 			Get(u)
 		if err != nil {
-			return "", "", err
+			return "", "", "", "", err
 		}
 		if resp.RefreshToken == "" || resp.AccessToken == "" {
 			if resp.ErrorMessage != "" {
-				return "", "", fmt.Errorf("failed to refresh token: %s", resp.ErrorMessage)
+				return "", "", "", "", fmt.Errorf("failed to refresh token: %s", resp.ErrorMessage)
 			}
-			return "", "", fmt.Errorf("empty token returned from official API, a wrong refresh token may have been used")
+			return "", "", "", "", fmt.Errorf("empty token returned from official API, a wrong refresh token may have been used")
 		}
-		return resp.RefreshToken, resp.AccessToken, nil
+		// 返回所有字段，包括AppID和SignKey
+		return resp.RefreshToken, resp.AccessToken, resp.AppID, resp.SignKey, nil
 	}
 
 	// TODO 本地刷新逻辑
-	return "", "", fmt.Errorf("local refresh token logic is not implemented yet, please use online API or contact the developer")
+	return "", "", "", "", fmt.Errorf("local refresh token logic is not implemented yet, please use online API or contact the developer")
 }
 
 // 生成认证 Cookie
