@@ -245,10 +245,9 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 	}
 	key := Key(storage, path)
 	if ol, exists := Cache.linkCache.GetType(key, typeKey); exists {
-		if ol.link.Expiration != nil ||
-			ol.link.SyncClosers.AcquireReference() || !ol.link.RequireReference {
-			return ol.link, ol.obj, nil
-		}
+		// 缓存命中：直接返回缓存的链接
+		// 链接过期由 RefreshableRangeReader 在 HTTP 请求失败时检测并刷新
+		return ol.link, ol.obj, nil
 	}
 
 	fn := func() (*objWithLink, error) {
@@ -290,19 +289,18 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 		if link.Expiration != nil {
 			Cache.linkCache.SetTypeWithTTL(key, typeKey, ol, *link.Expiration)
 		} else {
-			Cache.linkCache.SetTypeWithExpirable(key, typeKey, ol, &link.SyncClosers)
+			// 不使用 SyncClosers 作为过期判断，使用默认 TTL
+			// 链接真正过期时由 RefreshableRangeReader 检测并刷新
+			Cache.linkCache.SetType(key, typeKey, ol)
 		}
 		return ol, nil
 	}
-	for {
-		ol, err, _ := linkG.Do(key+"/"+typeKey, fn)
-		if err != nil {
-			return nil, nil, err
-		}
-		if ol.link.SyncClosers.AcquireReference() || !ol.link.RequireReference {
-			return ol.link, ol.obj, nil
-		}
+	// 直接执行获取链接，不再依赖 SyncClosers 引用计数
+	ol, err, _ := linkG.Do(key+"/"+typeKey, fn)
+	if err != nil {
+		return nil, nil, err
 	}
+	return ol.link, ol.obj, nil
 }
 
 // Other api
