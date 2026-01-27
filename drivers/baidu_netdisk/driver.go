@@ -1,30 +1,18 @@
 package baidu_netdisk
 
 import (
-	"bytes"
 	"context"
-	"crypto/md5"
-	"encoding/hex"
 	"errors"
-	"io"
-	"mime/multipart"
-	"net/http"
 	"net/url"
-	"os"
 	stdpath "path"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
-	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
-	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
-	"github.com/OpenListTeam/OpenList/v4/internal/net"
-	"github.com/OpenListTeam/OpenList/v4/pkg/errgroup"
+	streamPkg "github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
-	"github.com/avast/retry-go"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -37,6 +25,7 @@ type BaiduNetdisk struct {
 }
 
 var ErrUploadIDExpired = errors.New("uploadid expired")
+var ErrUploadURLExpired = errors.New("upload url expired or unavailable")
 
 func (d *BaiduNetdisk) Config() driver.Config {
 	return config
@@ -199,80 +188,26 @@ func (d *BaiduNetdisk) Put(ctx context.Context, dstDir model.Obj, stream model.F
 		return newObj, nil
 	}
 
-	var (
-		cache = stream.GetFile()
-		tmpF  *os.File
-		err   error
-	)
-	if cache == nil {
-		tmpF, err = os.CreateTemp(conf.Conf.TempDir, "file-*")
-		if err != nil {
-			return nil, err
-		}
-		defer func() {
-			_ = tmpF.Close()
-			_ = os.Remove(tmpF.Name())
-		}()
-		cache = tmpF
-	}
-
 	streamSize := stream.GetSize()
 	sliceSize := d.getSliceSize(streamSize)
 	count := 1
 	if streamSize > sliceSize {
 		count = int((streamSize + sliceSize - 1) / sliceSize)
 	}
-	lastBlockSize := streamSize % sliceSize
-	if lastBlockSize == 0 {
-		lastBlockSize = sliceSize
-	}
 
-	// cal md5 for first 256k data
-	const SliceSize int64 = 256 * utils.KB
-	blockList := make([]string, 0, count)
-	byteSize := sliceSize
-	fileMd5H := md5.New()
-	sliceMd5H := md5.New()
-	sliceMd5H2 := md5.New()
-	slicemd5H2Write := utils.LimitWriter(sliceMd5H2, SliceSize)
-	writers := []io.Writer{fileMd5H, sliceMd5H, slicemd5H2Write}
-	if tmpF != nil {
-		writers = append(writers, tmpF)
-	}
-	written := int64(0)
-
-	for i := 1; i <= count; i++ {
-		if utils.IsCanceled(ctx) {
-			return nil, ctx.Err()
-		}
-		if i == count {
-			byteSize = lastBlockSize
-		}
-		n, err := utils.CopyWithBufferN(io.MultiWriter(writers...), stream, byteSize)
-		written += n
-		if err != nil && err != io.EOF {
-			return nil, err
-		}
-		blockList = append(blockList, hex.EncodeToString(sliceMd5H.Sum(nil)))
-		sliceMd5H.Reset()
-	}
-	if tmpF != nil {
-		if written != streamSize {
-			return nil, errs.NewErr(err, "CreateTempFile failed, size mismatch: %d != %d ", written, streamSize)
-		}
-		_, err = tmpF.Seek(0, io.SeekStart)
-		if err != nil {
-			return nil, errs.NewErr(err, "CreateTempFile failed, can't seek to 0 ")
-		}
-	}
-	contentMd5 := hex.EncodeToString(fileMd5H.Sum(nil))
-	sliceMd5 := hex.EncodeToString(sliceMd5H2.Sum(nil))
-	blockListStr, _ := utils.Json.MarshalToString(blockList)
 	path := stdpath.Join(dstDir.GetPath(), stream.GetName())
 	mtime := stream.ModTime().Unix()
 	ctime := stream.CreateTime().Unix()
 
-	// step.1 尝试读取已保存进度
+	// step.1 流式计算MD5哈希值（使用 RangeRead，不会消耗流）
+	contentMd5, sliceMd5, blockList, err := d.calculateHashesStream(ctx, stream, sliceSize, &up)
+	if err != nil {
+		return nil, err
+	}
+
+	blockListStr, _ := utils.Json.MarshalToString(blockList)
+
+	// step.2 尝试读取已保存进度或执行预上传
 	precreateResp, ok := base.GetUploadProgress[*PrecreateResp](d, d.AccessToken, contentMd5)
 	if !ok {
 		// 没有进度，走预上传
@@ -288,6 +223,7 @@ func (d *BaiduNetdisk) Put(ctx context.Context, dstDir model.Obj, stream model.F
 			return fileToObj(precreateResp.File), nil
 		}
 	}
+
 	ensureUploadURL := func() {
 		if precreateResp.UploadURL != "" {
 			return
@@ -295,58 +231,20 @@ func (d *BaiduNetdisk) Put(ctx context.Context, dstDir model.Obj, stream model.F
 		precreateResp.UploadURL = d.getUploadUrl(path, precreateResp.Uploadid)
 	}
 
-	// step.2 上传分片
+	// step.3 流式上传分片
+	// 创建 StreamSectionReader 用于上传
+	ss, err := streamPkg.NewStreamSectionReader(stream, int(sliceSize), &up)
+	if err != nil {
+		return nil, err
+	}
+
 uploadLoop:
 	for range 2 {
 		// 获取上传域名
 		ensureUploadURL()
-		// 并发上传
-		threadG, upCtx := errgroup.NewGroupWithContext(ctx, d.uploadThread,
-			retry.Attempts(UPLOAD_RETRY_COUNT),
-			retry.Delay(UPLOAD_RETRY_WAIT_TIME),
-			retry.MaxDelay(UPLOAD_RETRY_MAX_WAIT_TIME),
-			retry.DelayType(retry.BackOffDelay),
-			retry.RetryIf(func(err error) bool {
-				return !errors.Is(err, ErrUploadIDExpired)
-			}),
-			retry.LastErrorOnly(true))
 
-		totalParts := len(precreateResp.BlockList)
-
-		for i, partseq := range precreateResp.BlockList {
-			if utils.IsCanceled(upCtx) {
-				break
-			}
-			if partseq < 0 {
-				continue
-			}
-			i, partseq := i, partseq
-			offset, size := int64(partseq)*sliceSize, sliceSize
-			if partseq+1 == count {
-				size = lastBlockSize
-			}
-			threadG.Go(func(ctx context.Context) error {
-				params := map[string]string{
-					"method":       "upload",
-					"access_token": d.AccessToken,
-					"type":         "tmpfile",
-					"path":         path,
-					"uploadid":     precreateResp.Uploadid,
-					"partseq":      strconv.Itoa(partseq),
-				}
-				section := io.NewSectionReader(cache, offset, size)
-				err := d.uploadSlice(ctx, precreateResp.UploadURL, params, stream.GetName(), section)
-				if err != nil {
-					return err
-				}
-				precreateResp.BlockList[i] = -1
-				progress := float64(threadG.Success()+1) * 100 / float64(totalParts+1)
-				up(progress)
-				return nil
-			})
-		}
-
-		err = threadG.Wait()
+		// 流式并发上传
+		err = d.uploadChunksStream(ctx, ss, stream, precreateResp, path, sliceSize, count, up)
 		if err == nil {
 			break uploadLoop
 		}
@@ -372,13 +270,19 @@ uploadLoop:
 			precreateResp.UploadURL = ""
 			// 覆盖掉旧的进度
 			base.SaveUploadProgress(d, precreateResp, d.AccessToken, contentMd5)
+
+			// 尝试重新创建 StreamSectionReader（如果流支持重新读取）
+			ss, err = streamPkg.NewStreamSectionReader(stream, int(sliceSize), &up)
+			if err != nil {
+				return nil, err
+			}
 			continue uploadLoop
 		}
 		return nil, err
 	}
 	defer up(100)
 
-	// step.3 创建文件
+	// step.4 创建文件
 	var newFile File
 	_, err = d.create(path, streamSize, 0, precreateResp.Uploadid, blockListStr, &newFile, mtime, ctime)
 	if err != nil {
@@ -425,68 +329,6 @@ func (d *BaiduNetdisk) precreate(ctx context.Context, path string, streamSize in
 	}
 
 	return &precreateResp, nil
-}
-
-func (d *BaiduNetdisk) uploadSlice(ctx context.Context, uploadUrl string, params map[string]string, fileName string, file *io.SectionReader) error {
-	b := bytes.NewBuffer(make([]byte, 0, bytes.MinRead))
-	mw := multipart.NewWriter(b)
-	_, err := mw.CreateFormFile("file", fileName)
-	if err != nil {
-		return err
-	}
-	headSize := b.Len()
-	err = mw.Close()
-	if err != nil {
-		return err
-	}
-	head := bytes.NewReader(b.Bytes()[:headSize])
-	tail := bytes.NewReader(b.Bytes()[headSize:])
-	rateLimitedRd := driver.NewLimitedUploadStream(ctx, io.MultiReader(head, file, tail))
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, uploadUrl+"/rest/2.0/pcs/superfile2", rateLimitedRd)
-	if err != nil {
-		return err
-	}
-	query := req.URL.Query()
-	for k, v := range params {
-		query.Set(k, v)
-	}
-	req.URL.RawQuery = query.Encode()
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	req.ContentLength = int64(b.Len()) + file.Size()
-
-	client := net.NewHttpClient()
-	if d.UploadSliceTimeout > 0 {
-		client.Timeout = time.Second * time.Duration(d.UploadSliceTimeout)
-	} else {
-		client.Timeout = DEFAULT_UPLOAD_SLICE_TIMEOUT
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	b.Reset()
-	_, err = b.ReadFrom(resp.Body)
-	if err != nil {
-		return err
-	}
-	body := b.Bytes()
-	respStr := string(body)
-	log.Debugln(respStr)
-	lower := strings.ToLower(respStr)
-	// 合并 uploadid 过期检测逻辑
-	if strings.Contains(lower, "uploadid") &&
-		(strings.Contains(lower, "invalid") || strings.Contains(lower, "expired") || strings.Contains(lower, "not found")) {
-		return ErrUploadIDExpired
-	}
-
-	errCode := utils.Json.Get(body, "error_code").ToInt()
-	errNo := utils.Json.Get(body, "errno").ToInt()
-	if errCode != 0 || errNo != 0 {
-		return errs.NewErr(errs.StreamIncomplete, "error uploading to baidu, response=%s", respStr)
-	}
-	return nil
 }
 
 func (d *BaiduNetdisk) GetDetails(ctx context.Context) (*model.StorageDetails, error) {
