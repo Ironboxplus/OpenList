@@ -147,7 +147,7 @@ func (t *DownloadTask) Update() (bool, error) {
 	if err != nil {
 		t.callStatusRetried++
 		log.Errorf("failed to get status of %s, retried %d times", t.ID, t.callStatusRetried)
-		if t.callStatusRetried > 5 {
+		if t.callStatusRetried > 10 {
 			return true, errors.Errorf("failed to get status of %s, retried %d times", t.ID, t.callStatusRetried)
 		}
 		return false, nil
