@@ -420,9 +420,20 @@ func (d *Open115) DeleteOfflineTask(ctx context.Context, infoHash string, delete
 }
 
 func (d *Open115) OfflineList(ctx context.Context) (*sdk.OfflineTaskListResp, error) {
+	// 获取第一页
 	resp, err := d.client.OfflineTaskList(ctx, 1)
 	if err != nil {
 		return nil, err
+	}
+	// 如果有多页，获取所有页面的任务
+	if resp.PageCount > 1 {
+		for page := 2; page <= resp.PageCount; page++ {
+			pageResp, err := d.client.OfflineTaskList(ctx, int64(page))
+			if err != nil {
+				return nil, err
+			}
+			resp.Tasks = append(resp.Tasks, pageResp.Tasks...)
+		}
 	}
 	return resp, nil
 }
