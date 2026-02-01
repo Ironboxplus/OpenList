@@ -174,8 +174,8 @@ func (o *Open115) Status(task *tool.DownloadTask) (*tool.Status, error) {
 			return s, nil
 		}
 	}
-	s.Err = fmt.Errorf("the task has been deleted")
-	return nil, nil
+	// 任务不在列表中，可能已完成或被删除
+	return nil, fmt.Errorf("task %s not found in offline list", task.GID)
 }
 
 var _ tool.Tool = (*Open115)(nil)
