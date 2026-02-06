@@ -93,6 +93,12 @@ func FsStream(c *gin.Context) {
 	if sha256 := c.GetHeader("X-File-Sha256"); sha256 != "" {
 		h[utils.SHA256] = sha256
 	}
+	if sha1_128k := c.GetHeader("X-File-Sha1-128k"); sha1_128k != "" {
+		h[utils.SHA1_128K] = sha1_128k
+	}
+	if preHash := c.GetHeader("X-File-Pre-Hash"); preHash != "" {
+		h[utils.PRE_HASH] = preHash
+	}
 	mimetype := c.GetHeader("Content-Type")
 	if len(mimetype) == 0 {
 		mimetype = utils.GetMimeType(name)
@@ -189,6 +195,12 @@ func FsForm(c *gin.Context) {
 	}
 	if sha256 := c.GetHeader("X-File-Sha256"); sha256 != "" {
 		h[utils.SHA256] = sha256
+	}
+	if sha1_128k := c.GetHeader("X-File-Sha1-128k"); sha1_128k != "" {
+		h[utils.SHA1_128K] = sha1_128k
+	}
+	if preHash := c.GetHeader("X-File-Pre-Hash"); preHash != "" {
+		h[utils.PRE_HASH] = preHash
 	}
 	mimetype := file.Header.Get("Content-Type")
 	if len(mimetype) == 0 {
