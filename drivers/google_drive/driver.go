@@ -141,10 +141,11 @@ func (d *GoogleDrive) MakeDir(ctx context.Context, parentDir model.Obj, dirName 
 		return err
 	}
 
-	// Wait briefly for API eventual consistency before releasing lock
+	// Wait for API eventual consistency before releasing lock
 	// This helps prevent race conditions where a concurrent request
 	// checks for folder existence before the newly created folder is visible
-	time.Sleep(100 * time.Millisecond)
+	// 500ms is needed because Google Drive API has significant sync delay
+	time.Sleep(500 * time.Millisecond)
 
 	return nil
 }
