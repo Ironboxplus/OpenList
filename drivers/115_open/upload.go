@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"io"
+	"strings"
 	"time"
 
 	sdk "github.com/OpenListTeam/115-sdk-go"
@@ -13,7 +14,18 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"github.com/avast/retry-go"
+	log "github.com/sirupsen/logrus"
 )
+
+// isTokenExpiredError 检测是否为OSS凭证过期错误
+func isTokenExpiredError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "SecurityTokenExpired") ||
+		strings.Contains(errStr, "InvalidAccessKeyId")
+}
 
 func calPartSize(fileSize int64) int64 {
 	var partSize int64 = 20 * utils.MB
@@ -70,11 +82,16 @@ func (d *Open115) singleUpload(ctx context.Context, tempF model.File, tokenResp 
 // }
 
 func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer, up driver.UpdateProgress, tokenResp *sdk.UploadGetTokenResp, initResp *sdk.UploadInitResp) error {
-	ossClient, err := oss.New(tokenResp.Endpoint, tokenResp.AccessKeyId, tokenResp.AccessKeySecret, oss.SecurityToken(tokenResp.SecurityToken))
-	if err != nil {
-		return err
+	// 创建OSS客户端的辅助函数
+	createBucket := func(token *sdk.UploadGetTokenResp) (*oss.Bucket, error) {
+		ossClient, err := oss.New(token.Endpoint, token.AccessKeyId, token.AccessKeySecret, oss.SecurityToken(token.SecurityToken))
+		if err != nil {
+			return nil, err
+		}
+		return ossClient.Bucket(initResp.Bucket)
 	}
-	bucket, err := ossClient.Bucket(initResp.Bucket)
+
+	bucket, err := createBucket(tokenResp)
 	if err != nil {
 		return err
 	}
@@ -119,7 +136,24 @@ func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer,
 			retry.Context(ctx),
 			retry.Attempts(3),
 			retry.DelayType(retry.BackOffDelay),
-			retry.Delay(time.Second))
+			retry.Delay(time.Second),
+			retry.OnRetry(func(n uint, err error) {
+				// 如果是凭证过期错误，在重试前刷新凭证并重建bucket
+				if isTokenExpiredError(err) {
+					log.Warnf("115 OSS token expired, refreshing token...")
+					if newToken, refreshErr := d.client.UploadGetToken(ctx); refreshErr == nil {
+						tokenResp = newToken
+						if newBucket, bucketErr := createBucket(tokenResp); bucketErr == nil {
+							bucket = newBucket
+							log.Infof("115 OSS token refreshed successfully")
+						} else {
+							log.Errorf("Failed to create new bucket with refreshed token: %v", bucketErr)
+						}
+					} else {
+						log.Errorf("Failed to refresh 115 OSS token: %v", refreshErr)
+					}
+				}
+			}))
 		ss.FreeSectionReader(rd)
 		if err != nil {
 			return err
