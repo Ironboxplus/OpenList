@@ -245,9 +245,12 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 	}
 	key := Key(storage, path)
 	if ol, exists := Cache.linkCache.GetType(key, typeKey); exists {
-		// 缓存命中：直接返回缓存的链接
-		// 链接过期由 RefreshableRangeReader 在 HTTP 请求失败时检测并刷新
-		return ol.link, ol.obj, nil
+		if ol.link.Expiration != nil ||
+			ol.link.SyncClosers.AcquireReference() || !ol.link.RequireReference {
+			return ol.link, ol.obj, nil
+		}
+		// SyncClosers 已关闭（文件句柄已关闭），删除缓存条目，重新获取
+		Cache.linkCache.DeleteKey(key)
 	}
 
 	fn := func() (*objWithLink, error) {
@@ -288,19 +291,24 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 		ol := &objWithLink{link: link, obj: file}
 		if link.Expiration != nil {
 			Cache.linkCache.SetTypeWithTTL(key, typeKey, ol, *link.Expiration)
+		} else if link.RequireReference {
+			// 本地文件等需要引用计数的链接，缓存与文件句柄生命周期绑定
+			Cache.linkCache.SetTypeWithExpirable(key, typeKey, ol, &link.SyncClosers)
 		} else {
-			// 不使用 SyncClosers 作为过期判断，使用默认 TTL
-			// 链接真正过期时由 RefreshableRangeReader 检测并刷新
+			// 不需要引用计数（如云盘链接无过期时间），使用默认 TTL，多客户端复用
 			Cache.linkCache.SetType(key, typeKey, ol)
 		}
 		return ol, nil
 	}
-	// 直接执行获取链接，不再依赖 SyncClosers 引用计数
-	ol, err, _ := linkG.Do(key+"/"+typeKey, fn)
-	if err != nil {
-		return nil, nil, err
+	for {
+		ol, err, _ := linkG.Do(key+"/"+typeKey, fn)
+		if err != nil {
+			return nil, nil, err
+		}
+		if ol.link.SyncClosers.AcquireReference() || !ol.link.RequireReference {
+			return ol.link, ol.obj, nil
+		}
 	}
-	return ol.link, ol.obj, nil
 }
 
 // Other api
