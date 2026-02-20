@@ -17,6 +17,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+	log "github.com/sirupsen/logrus"
 	"golang.org/x/time/rate"
 )
 
@@ -74,13 +75,20 @@ func (d *Open115) Drop(ctx context.Context) error {
 }
 
 func (d *Open115) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
+	start := time.Now()
+	log.Infof("[115] List request started for dir: %s (ID: %s)", dir.GetName(), dir.GetID())
+
 	var res []model.Obj
 	pageSize := int64(d.PageSize)
 	offset := int64(0)
+	pageCount := 0
+
 	for {
 		if err := d.WaitLimit(ctx); err != nil {
 			return nil, err
 		}
+
+		pageStart := time.Now()
 		resp, err := d.client.GetFiles(ctx, &sdk.GetFilesReq{
 			CID:    dir.GetID(),
 			Limit:  pageSize,
@@ -90,7 +98,12 @@ func (d *Open115) List(ctx context.Context, dir model.Obj, args model.ListArgs) 
 			// Cur:     1,
 			ShowDir: true,
 		})
+		pageDuration := time.Since(pageStart)
+		pageCount++
+		log.Infof("[115] GetFiles page %d took: %v (offset=%d, limit=%d)", pageCount, pageDuration, offset, pageSize)
+
 		if err != nil {
+			log.Errorf("[115] GetFiles page %d failed after %v: %v", pageCount, pageDuration, err)
 			return nil, err
 		}
 		res = append(res, utils.MustSliceConvert(resp.Data, func(src sdk.GetFilesResp_File) model.Obj {
@@ -102,10 +115,17 @@ func (d *Open115) List(ctx context.Context, dir model.Obj, args model.ListArgs) 
 		}
 		offset += pageSize
 	}
+
+	totalDuration := time.Since(start)
+	log.Infof("[115] List request completed in %v (%d pages, %d files)", totalDuration, pageCount, len(res))
+
 	return res, nil
 }
 
 func (d *Open115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
+	start := time.Now()
+	log.Infof("[115] Link request started for file: %s", file.GetName())
+
 	if err := d.WaitLimit(ctx); err != nil {
 		return nil, err
 	}
@@ -121,14 +141,25 @@ func (d *Open115) Link(ctx context.Context, file model.Obj, args model.LinkArgs)
 		return nil, fmt.Errorf("can't convert obj")
 	}
 	pc := obj.Pc
+
+	apiStart := time.Now()
+	log.Infof("[115] Calling DownURL API...")
 	resp, err := d.client.DownURL(ctx, pc, ua)
+	apiDuration := time.Since(apiStart)
+	log.Infof("[115] DownURL API took: %v", apiDuration)
+
 	if err != nil {
+		log.Errorf("[115] DownURL API failed after %v: %v", apiDuration, err)
 		return nil, err
 	}
 	u, ok := resp[obj.GetID()]
 	if !ok {
 		return nil, fmt.Errorf("can't get link")
 	}
+
+	totalDuration := time.Since(start)
+	log.Infof("[115] Link request completed in %v (API: %v)", totalDuration, apiDuration)
+
 	return &model.Link{
 		URL: u.URL.URL,
 		Header: http.Header{
@@ -176,7 +207,7 @@ func (d *Open115) Rename(ctx context.Context, srcObj model.Obj, newName string) 
 	}
 	_, err := d.client.UpdateFile(ctx, &sdk.UpdateFileReq{
 		FileID:  srcObj.GetID(),
-		FileNma: newName,
+		FileName: newName,
 	})
 	if err != nil {
 		return nil, err
@@ -226,27 +257,97 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 	if err != nil {
 		return err
 	}
+
 	sha1 := file.GetHash().GetHash(utils.SHA1)
-	if len(sha1) != utils.SHA1.Width {
-		_, sha1, err = stream.CacheFullAndHash(file, &up, utils.SHA1)
+	sha1128k := file.GetHash().GetHash(utils.SHA1_128K)
+
+	// 检查是否是可重复读取的流
+	_, isSeekable := file.(*stream.SeekableStream)
+
+	// 如果有预计算的 hash，先尝试秒传
+	if len(sha1) == utils.SHA1.Width && len(sha1128k) == utils.SHA1_128K.Width {
+		resp, err := d.client.UploadInit(ctx, &sdk.UploadInitReq{
+			FileName: file.GetName(),
+			FileSize: file.GetSize(),
+			Target:   dstDir.GetID(),
+			FileID:   strings.ToUpper(sha1),
+			PreID:    strings.ToUpper(sha1128k),
+		})
 		if err != nil {
 			return err
 		}
+		if resp.Status == 2 {
+			up(100)
+			return nil
+		}
+		// 秒传失败，继续后续流程
 	}
-	const PreHashSize int64 = 128 * utils.KB
-	hashSize := PreHashSize
-	if file.GetSize() < PreHashSize {
-		hashSize = file.GetSize()
+
+	if isSeekable {
+		// 可重复读取的流，使用 RangeRead 计算 hash，不缓存
+		if len(sha1) != utils.SHA1.Width {
+			sha1, err = stream.StreamHashFile(file, utils.SHA1, 100, &up)
+			if err != nil {
+				return err
+			}
+		}
+		// 计算 sha1_128k（如果没有预计算）
+		if len(sha1128k) != utils.SHA1_128K.Width {
+			const PreHashSize int64 = 128 * utils.KB
+			hashSize := PreHashSize
+			if file.GetSize() < PreHashSize {
+				hashSize = file.GetSize()
+			}
+			reader, err := file.RangeRead(http_range.Range{Start: 0, Length: hashSize})
+			if err != nil {
+				return err
+			}
+			sha1128k, err = utils.HashReader(utils.SHA1, reader)
+			if err != nil {
+				return err
+			}
+		}
+	} else {
+		// 不可重复读取的流（如 HTTP body）
+		// 如果有预计算的 hash，上面已经尝试过秒传了
+		if len(sha1) == utils.SHA1.Width && len(sha1128k) == utils.SHA1_128K.Width {
+			// 秒传失败，需要缓存文件进行实际上传
+			_, err = file.CacheFullAndWriter(&up, nil)
+			if err != nil {
+				return err
+			}
+		} else {
+			// 没有预计算的 hash，缓存整个文件并计算
+			if len(sha1) != utils.SHA1.Width {
+				_, sha1, err = stream.CacheFullAndHash(file, &up, utils.SHA1)
+				if err != nil {
+					return err
+				}
+			} else if file.GetFile() == nil {
+				// 有 SHA1 但没有缓存，需要缓存以支持后续 RangeRead
+				_, err = file.CacheFullAndWriter(&up, nil)
+				if err != nil {
+					return err
+				}
+			}
+			// 计算 sha1_128k
+			const PreHashSize int64 = 128 * utils.KB
+			hashSize := PreHashSize
+			if file.GetSize() < PreHashSize {
+				hashSize = file.GetSize()
+			}
+			reader, err := file.RangeRead(http_range.Range{Start: 0, Length: hashSize})
+			if err != nil {
+				return err
+			}
+			sha1128k, err = utils.HashReader(utils.SHA1, reader)
+			if err != nil {
+				return err
+			}
+		}
 	}
-	reader, err := file.RangeRead(http_range.Range{Start: 0, Length: hashSize})
-	if err != nil {
-		return err
-	}
-	sha1128k, err := utils.HashReader(utils.SHA1, reader)
-	if err != nil {
-		return err
-	}
-	// 1. Init
+
+	// 1. Init（SeekableStream 或已缓存的 FileStream）
 	resp, err := d.client.UploadInit(ctx, &sdk.UploadInitReq{
 		FileName: file.GetName(),
 		FileSize: file.GetSize(),
@@ -272,11 +373,11 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		if err != nil {
 			return err
 		}
-		reader, err = file.RangeRead(http_range.Range{Start: start, Length: end - start + 1})
+		signReader, err := file.RangeRead(http_range.Range{Start: start, Length: end - start + 1})
 		if err != nil {
 			return err
 		}
-		signVal, err := utils.HashReader(utils.SHA1, reader)
+		signVal, err := utils.HashReader(utils.SHA1, signReader)
 		if err != nil {
 			return err
 		}
@@ -319,9 +420,20 @@ func (d *Open115) DeleteOfflineTask(ctx context.Context, infoHash string, delete
 }
 
 func (d *Open115) OfflineList(ctx context.Context) (*sdk.OfflineTaskListResp, error) {
+	// 获取第一页
 	resp, err := d.client.OfflineTaskList(ctx, 1)
 	if err != nil {
 		return nil, err
+	}
+	// 如果有多页，获取所有页面的任务
+	if resp.PageCount > 1 {
+		for page := 2; page <= resp.PageCount; page++ {
+			pageResp, err := d.client.OfflineTaskList(ctx, int64(page))
+			if err != nil {
+				return nil, err
+			}
+			resp.Tasks = append(resp.Tasks, pageResp.Tasks...)
+		}
 	}
 	return resp, nil
 }

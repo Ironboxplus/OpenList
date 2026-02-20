@@ -163,21 +163,29 @@ func (d *AliyundriveOpen) upload(ctx context.Context, dstDir model.Obj, stream m
 	}
 	count := int(math.Ceil(float64(stream.GetSize()) / float64(partSize)))
 	createData["part_info_list"] = makePartInfos(count)
+
+	// 检查是否是可重复读取的流
+	_, isSeekable := stream.(*streamPkg.SeekableStream)
+
 	// rapid upload
 	rapidUpload := !stream.IsForceStreamUpload() && stream.GetSize() > 100*utils.KB && d.RapidUpload
 	if rapidUpload {
 		log.Debugf("[aliyundrive_open] start cal pre_hash")
-		// read 1024 bytes to calculate pre hash
-		reader, err := stream.RangeRead(http_range.Range{Start: 0, Length: 1024})
-		if err != nil {
-			return nil, err
-		}
-		hash, err := utils.HashReader(utils.SHA1, reader)
-		if err != nil {
-			return nil, err
+		// 优先使用预计算的 pre_hash
+		preHash := stream.GetHash().GetHash(utils.PRE_HASH)
+		if len(preHash) != utils.PRE_HASH.Width {
+			// 没有预计算的 pre_hash，使用 RangeRead 计算
+			reader, err := stream.RangeRead(http_range.Range{Start: 0, Length: 1024})
+			if err != nil {
+				return nil, err
+			}
+			preHash, err = utils.HashReader(utils.SHA1, reader)
+			if err != nil {
+				return nil, err
+			}
 		}
 		createData["size"] = stream.GetSize()
-		createData["pre_hash"] = hash
+		createData["pre_hash"] = preHash
 	}
 	var createResp CreateResp
 	_, err, e := d.requestReturnErrResp(ctx, limiterOther, "/adrive/v1.0/openFile/create", http.MethodPost, func(req *resty.Request) {
@@ -191,9 +199,18 @@ func (d *AliyundriveOpen) upload(ctx context.Context, dstDir model.Obj, stream m
 
 		hash := stream.GetHash().GetHash(utils.SHA1)
 		if len(hash) != utils.SHA1.Width {
-			_, hash, err = streamPkg.CacheFullAndHash(stream, &up, utils.SHA1)
-			if err != nil {
-				return nil, err
+			if isSeekable {
+				// 可重复读取的流，使用 StreamHashFile（RangeRead），不缓存
+				hash, err = streamPkg.StreamHashFile(stream, utils.SHA1, 50, &up)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				// 不可重复读取的流，缓存并计算
+				_, hash, err = streamPkg.CacheFullAndHash(stream, &up, utils.SHA1)
+				if err != nil {
+					return nil, err
+				}
 			}
 		}
 

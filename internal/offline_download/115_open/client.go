@@ -3,6 +3,7 @@ package _115_open
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	_115_open "github.com/OpenListTeam/OpenList/v4/drivers/115_open"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -70,8 +71,52 @@ func (o *Open115) AddURL(args *tool.AddUrlArgs) (string, error) {
 	}
 
 	hashs, err := driver115Open.OfflineDownload(ctx, []string{args.Url}, parentDir)
-	if err != nil || len(hashs) < 1 {
+
+	// 检查是否是重复链接错误 (code: 10008)
+	if err != nil {
+		// 尝试从错误信息中判断是否是重复链接
+		errStr := err.Error()
+		isDuplicateError := false
+
+		// 检查是否包含"重复"、"已存在"等关键词，或错误码10008
+		if strings.Contains(errStr, "10008") ||
+			strings.Contains(errStr, "重复") ||
+			strings.Contains(errStr, "已存在") ||
+			strings.Contains(errStr, "duplicate") {
+			isDuplicateError = true
+		}
+
+		if isDuplicateError {
+			// 尝试查找并删除已存在的相同URL任务，然后重试
+			taskList, listErr := driver115Open.OfflineList(ctx)
+			if listErr == nil && taskList != nil {
+				// 查找匹配的任务
+				for _, task := range taskList.Tasks {
+					if task.URL == args.Url {
+						// 找到重复任务，删除它
+						deleteErr := driver115Open.DeleteOfflineTask(ctx, task.InfoHash, false)
+						if deleteErr == nil {
+							// 删除成功，重新尝试添加
+							hashs, err = driver115Open.OfflineDownload(ctx, []string{args.Url}, parentDir)
+							if err != nil {
+								return "", fmt.Errorf("failed to add offline download task after removing duplicate: %w", err)
+							}
+							if len(hashs) > 0 {
+								return hashs[0], nil
+							}
+						}
+						break
+					}
+				}
+			}
+		}
+
+		// 如果不是重复错误或处理失败，返回原始错误
 		return "", fmt.Errorf("failed to add offline download task: %w", err)
+	}
+
+	if len(hashs) < 1 {
+		return "", fmt.Errorf("failed to add offline download task: no task hash returned")
 	}
 
 	return hashs[0], nil
@@ -129,8 +174,8 @@ func (o *Open115) Status(task *tool.DownloadTask) (*tool.Status, error) {
 			return s, nil
 		}
 	}
-	s.Err = fmt.Errorf("the task has been deleted")
-	return nil, nil
+	// 任务不在列表中，可能已完成或被删除
+	return nil, fmt.Errorf("task %s not found in offline list", task.GID)
 }
 
 var _ tool.Tool = (*Open115)(nil)

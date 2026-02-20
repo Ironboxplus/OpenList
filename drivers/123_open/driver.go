@@ -175,20 +175,71 @@ func (d *Open123) Remove(ctx context.Context, obj model.Obj) error {
 }
 
 func (d *Open123) Put(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
-	// 1. 创建文件
+	// 1. 准备参数
 	// parentFileID 父目录id，上传到根目录时填写 0
 	parentFileId, err := strconv.ParseInt(dstDir.GetID(), 10, 64)
 	if err != nil {
 		return nil, fmt.Errorf("parse parentFileID error: %v", err)
 	}
+
+	// 尝试 SHA1 秒传
+	sha1Hash := file.GetHash().GetHash(utils.SHA1)
+	if len(sha1Hash) == utils.SHA1.Width {
+		resp, err := d.sha1Reuse(parentFileId, file.GetName(), sha1Hash, file.GetSize(), 2)
+		if err == nil && resp.Data.Reuse {
+			return File{
+				FileName: file.GetName(),
+				Size:     file.GetSize(),
+				FileId:   resp.Data.FileID,
+				Type:     2,
+				SHA1:     sha1Hash,
+			}, nil
+		}
+	}
+
+
 	// etag 文件md5
 	etag := file.GetHash().GetHash(utils.MD5)
-	if len(etag) < utils.MD5.Width {
+
+	// 检查是否是可重复读取的流
+	_, isSeekable := file.(*stream.SeekableStream)
+
+	// 如果有预计算的 hash，先尝试秒传
+	if len(etag) >= utils.MD5.Width {
+		createResp, err := d.create(parentFileId, file.GetName(), etag, file.GetSize(), 2, false)
+		if err != nil {
+			return nil, err
+		}
+		if createResp.Data.Reuse && createResp.Data.FileID != 0 {
+			return File{
+				FileName: file.GetName(),
+				Size:     file.GetSize(),
+				FileId:   createResp.Data.FileID,
+				Type:     2,
+				Etag:     etag,
+			}, nil
+		}
+		// 秒传失败，继续后续流程
+	}
+
+	if isSeekable {
+		// 可重复读取的流，使用 RangeRead 计算 hash，不缓存
+		if len(etag) < utils.MD5.Width {
+			etag, err = stream.StreamHashFile(file, utils.MD5, 40, &up)
+			if err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		// 不可重复读取的流（如 HTTP body）
+		// 秒传失败或没有 hash，缓存整个文件并计算 MD5
 		_, etag, err = stream.CacheFullAndHash(file, &up, utils.MD5)
 		if err != nil {
 			return nil, err
 		}
 	}
+
+	// 2. 创建上传任务（或再次尝试秒传）
 	createResp, err := d.create(parentFileId, file.GetName(), etag, file.GetSize(), 2, false)
 	if err != nil {
 		return nil, err
@@ -207,13 +258,16 @@ func (d *Open123) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		}
 	}
 
-	// 2. 上传分片
-	err = d.Upload(ctx, file, createResp, up)
+	// 3. 上传分片
+	uploadProgress := func(p float64) {
+		up(40 + p*0.6)
+	}
+	err = d.Upload(ctx, file, createResp, uploadProgress)
 	if err != nil {
 		return nil, err
 	}
 
-	// 3. 上传完毕
+	// 4. 合并分片/完成上传
 	for range 60 {
 		uploadCompleteResp, err := d.complete(createResp.Data.PreuploadID)
 		// 返回错误代码未知，如：20103，文档也没有具体说
