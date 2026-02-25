@@ -203,7 +203,7 @@ func (t *FileTransferTask) RunWithNextTaskCallback(f func(nextTask *FileTransfer
 		// Pre-create subdirectories (up to 1 level deep) to avoid deep recursion issues
 		// Balances between reducing API calls and maintaining fault tolerance
 		t.Status = "pre-creating subdirectories"
-		if err := t.preCreateDirectoryTree(objs, dstActualPath, 1); err != nil {
+		if err := t.preCreateDirectoryTree(objs, t.SrcActualPath, dstActualPath, 1); err != nil {
 			log.Warnf("[copy_move] failed to pre-create directory tree: %v, will continue", err)
 			// Continue anyway - individual directories will be created on-demand
 		}
@@ -282,7 +282,9 @@ func (t *FileTransferTask) RunWithNextTaskCallback(f func(nextTask *FileTransfer
 // preCreateDirectoryTree recursively scans source directory tree and pre-creates
 // directories on destination up to maxDepth levels to avoid deep MakeDir recursion issues.
 // maxDepth=0 means only current level, maxDepth=1 means current+1 level, etc.
-func (t *FileTransferTask) preCreateDirectoryTree(objs []model.Obj, dstBasePath string, maxDepth int) error {
+// srcBasePath is the current source directory being scanned (must be passed explicitly to
+// support correct path building during recursion; do NOT use t.SrcActualPath inside).
+func (t *FileTransferTask) preCreateDirectoryTree(objs []model.Obj, srcBasePath, dstBasePath string, maxDepth int) error {
 	// First pass: create immediate subdirectories
 	var subdirs []model.Obj
 	for _, obj := range objs {
@@ -298,6 +300,9 @@ func (t *FileTransferTask) preCreateDirectoryTree(objs []model.Obj, dstBasePath 
 				// Continue with other directories
 			}
 			subdirs = append(subdirs, obj)
+			// No explicit sleep here: drivers that have QPS limits (e.g. 115, BaiduNetDisk)
+			// implement WaitLimit via a token-bucket rate.Limiter and call it inside their
+			// MakeDir, so op.MakeDir already blocks at the correct per-driver rate.
 		}
 	}
 
@@ -312,8 +317,9 @@ func (t *FileTransferTask) preCreateDirectoryTree(objs []model.Obj, dstBasePath 
 			return err
 		}
 
-		// List contents of this subdirectory
-		subdirSrcPath := stdpath.Join(t.SrcActualPath, subdir.GetName())
+		// Build paths relative to srcBasePath (NOT t.SrcActualPath) so that
+		// deeper recursion levels resolve to the correct source paths.
+		subdirSrcPath := stdpath.Join(srcBasePath, subdir.GetName())
 		subdirDstPath := stdpath.Join(dstBasePath, subdir.GetName())
 
 		subObjs, err := op.List(t.Ctx(), t.SrcStorage, subdirSrcPath, model.ListArgs{})
@@ -323,7 +329,7 @@ func (t *FileTransferTask) preCreateDirectoryTree(objs []model.Obj, dstBasePath 
 		}
 
 		// Recursively create subdirectories with decreased depth
-		if err := t.preCreateDirectoryTree(subObjs, subdirDstPath, maxDepth-1); err != nil {
+		if err := t.preCreateDirectoryTree(subObjs, subdirSrcPath, subdirDstPath, maxDepth-1); err != nil {
 			return err
 		}
 	}
