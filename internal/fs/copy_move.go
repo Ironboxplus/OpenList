@@ -207,7 +207,6 @@ func (t *FileTransferTask) RunWithNextTaskCallback(f func(nextTask *FileTransfer
 			log.Warnf("[copy_move] failed to pre-create directory tree: %v, will continue", err)
 			// Continue anyway - individual directories will be created on-demand
 		}
-
 		existedObjs := make(map[string]bool)
 		if t.TaskType == merge {
 			dstObjs, err := op.List(t.Ctx(), t.DstStorage, dstActualPath, model.ListArgs{})
@@ -279,23 +278,47 @@ func (t *FileTransferTask) RunWithNextTaskCallback(f func(nextTask *FileTransfer
 	return op.Put(context.WithValue(t.Ctx(), conf.SkipHookKey, struct{}{}), t.DstStorage, t.DstActualPath, ss, t.SetProgress)
 }
 
-// preCreateDirectoryTree recursively scans source directory tree and pre-creates
-// directories on destination up to maxDepth levels to avoid deep MakeDir recursion issues.
-// maxDepth=0 means only current level, maxDepth=1 means current+1 level, etc.
-// srcBasePath is the current source directory being scanned (must be passed explicitly to
-// support correct path building during recursion; do NOT use t.SrcActualPath inside).
+// preCreateDirectoryTree is a thin method wrapper that resolves the storage-bound
+// makeDir / listSrc functions and delegates to the pure preCreateDirTreeFn helper.
 func (t *FileTransferTask) preCreateDirectoryTree(objs []model.Obj, srcBasePath, dstBasePath string, maxDepth int) error {
+	makeDir := func(ctx context.Context, path string) error {
+		return op.MakeDir(ctx, t.DstStorage, path)
+	}
+	listSrc := func(ctx context.Context, path string) ([]model.Obj, error) {
+		return op.List(ctx, t.SrcStorage, path, model.ListArgs{})
+	}
+	return preCreateDirTreeFn(t.Ctx(), objs, srcBasePath, dstBasePath, maxDepth, makeDir, listSrc)
+}
+
+// preCreateDirTreeFn recursively scans source directory tree and pre-creates
+// directories on destination up to maxDepth levels to avoid deep MakeDir recursion issues.
+//
+//   - maxDepth=0 – only create dirs in the current objs list (no recursion)
+//   - maxDepth=1 – also recurse one level deeper, etc.
+//   - srcBasePath – current source directory path; passed explicitly through all
+//     recursion levels so that subdirSrcPath is always correct (do NOT use
+//     t.SrcActualPath, which is fixed at the top-level path).
+//
+// makeDir and listSrc are injected to enable testing without a real storage driver.
+func preCreateDirTreeFn(
+	ctx context.Context,
+	objs []model.Obj,
+	srcBasePath, dstBasePath string,
+	maxDepth int,
+	makeDir func(context.Context, string) error,
+	listSrc func(context.Context, string) ([]model.Obj, error),
+) error {
 	// First pass: create immediate subdirectories
 	var subdirs []model.Obj
 	for _, obj := range objs {
 		// Check for cancellation
-		if err := t.Ctx().Err(); err != nil {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 
 		if obj.IsDir() {
 			subdirPath := stdpath.Join(dstBasePath, obj.GetName())
-			if err := op.MakeDir(t.Ctx(), t.DstStorage, subdirPath); err != nil {
+			if err := makeDir(ctx, subdirPath); err != nil {
 				log.Debugf("[copy_move] failed to pre-create dir [%s]: %v", subdirPath, err)
 				// Continue with other directories
 			}
@@ -313,7 +336,7 @@ func (t *FileTransferTask) preCreateDirectoryTree(objs []model.Obj, srcBasePath,
 
 	// Second pass: recursively scan and create nested subdirectories
 	for _, subdir := range subdirs {
-		if err := t.Ctx().Err(); err != nil {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 
@@ -322,14 +345,14 @@ func (t *FileTransferTask) preCreateDirectoryTree(objs []model.Obj, srcBasePath,
 		subdirSrcPath := stdpath.Join(srcBasePath, subdir.GetName())
 		subdirDstPath := stdpath.Join(dstBasePath, subdir.GetName())
 
-		subObjs, err := op.List(t.Ctx(), t.SrcStorage, subdirSrcPath, model.ListArgs{})
+		subObjs, err := listSrc(ctx, subdirSrcPath)
 		if err != nil {
 			log.Debugf("[copy_move] failed to list subdir [%s] for pre-creation: %v", subdirSrcPath, err)
 			continue // Skip this subdirectory, will handle when processing
 		}
 
 		// Recursively create subdirectories with decreased depth
-		if err := t.preCreateDirectoryTree(subObjs, subdirSrcPath, subdirDstPath, maxDepth-1); err != nil {
+		if err := preCreateDirTreeFn(ctx, subObjs, subdirSrcPath, subdirDstPath, maxDepth-1, makeDir, listSrc); err != nil {
 			return err
 		}
 	}
