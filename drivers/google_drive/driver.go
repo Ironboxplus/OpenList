@@ -3,6 +3,7 @@ package google_drive
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -268,15 +269,26 @@ func (d *GoogleDrive) Put(ctx context.Context, dstDir model.Obj, file model.File
 	putUrl := res.Header().Get("location")
 	if file.GetSize() < d.ChunkSize*1024*1024 {
 		// 小文件上传：使用 RangeRead 读取整个文件（避免消费已计算hash的stream）
-		reader, err := file.RangeRead(http_range.Range{Start: 0, Length: file.GetSize()})
-		if err != nil {
-			return err
-		}
+		err = retry.Do(func() error {
+			reader, err := file.RangeRead(http_range.Range{Start: 0, Length: file.GetSize()})
+			if err != nil {
+				return err
+			}
+			if closer, ok := reader.(io.Closer); ok {
+				defer closer.Close()
+			}
 
-		_, err = d.request(putUrl, http.MethodPut, func(req *resty.Request) {
-			req.SetHeader("Content-Length", strconv.FormatInt(file.GetSize(), 10)).
-				SetBody(driver.NewLimitedUploadStream(ctx, reader))
-		}, nil)
+			_, err = d.request(putUrl, http.MethodPut, func(req *resty.Request) {
+				req.SetHeader("Content-Length", strconv.FormatInt(file.GetSize(), 10)).
+					SetBody(driver.NewLimitedUploadStream(ctx, reader))
+			}, nil)
+			return err
+		},
+			retry.Context(ctx),
+			retry.Attempts(3),
+			retry.DelayType(retry.BackOffDelay),
+			retry.Delay(time.Second),
+		)
 		return err
 	} else {
 		// 大文件分片上传
