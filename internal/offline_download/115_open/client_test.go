@@ -7,242 +7,576 @@ import (
 	"testing"
 
 	sdk "github.com/OpenListTeam/115-sdk-go"
-	_115_open "github.com/OpenListTeam/OpenList/v4/drivers/115_open"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
-	"github.com/OpenListTeam/OpenList/v4/internal/offline_download/tool"
 )
 
-// Mock implementation of Open115 driver for testing
-type mockOpen115 struct {
-	_115_open.Open115
-	offlineDownloadFunc func(ctx context.Context, uris []string, dstDir model.Obj) ([]string, error)
-	offlineListFunc     func(ctx context.Context) (*sdk.OfflineTaskListResp, error)
-	deleteOfflineFunc   func(ctx context.Context, infoHash string, deleteFiles bool) error
+type mockOfflineTaskClient struct {
+	offlineDownloadFunc            func(ctx context.Context, uris []string, dstDir model.Obj) ([]string, error)
+	offlineDownloadWithDetailsFunc func(ctx context.Context, uris []string, dstDir model.Obj) ([]string, []sdk.AddOfflineTaskURIsResp, string, error)
+	offlineListFunc                func(ctx context.Context) (*sdk.OfflineTaskListResp, error)
+	deleteOfflineFunc              func(ctx context.Context, infoHash string, deleteFiles bool) error
 }
 
-func (m *mockOpen115) OfflineDownload(ctx context.Context, uris []string, dstDir model.Obj) ([]string, error) {
-	if m.offlineDownloadFunc != nil {
-		return m.offlineDownloadFunc(ctx, uris, dstDir)
+func (m *mockOfflineTaskClient) OfflineDownload(ctx context.Context, uris []string, dstDir model.Obj) ([]string, error) {
+	return m.offlineDownloadFunc(ctx, uris, dstDir)
+}
+
+func (m *mockOfflineTaskClient) OfflineDownloadWithDetails(ctx context.Context, uris []string, dstDir model.Obj) ([]string, []sdk.AddOfflineTaskURIsResp, string, error) {
+	if m.offlineDownloadWithDetailsFunc == nil {
+		hashes, err := m.OfflineDownload(ctx, uris, dstDir)
+		return hashes, nil, "", err
 	}
-	return nil, fmt.Errorf("not implemented")
+	return m.offlineDownloadWithDetailsFunc(ctx, uris, dstDir)
 }
 
-func (m *mockOpen115) OfflineList(ctx context.Context) (*sdk.OfflineTaskListResp, error) {
-	if m.offlineListFunc != nil {
-		return m.offlineListFunc(ctx)
+func (m *mockOfflineTaskClient) OfflineList(ctx context.Context) (*sdk.OfflineTaskListResp, error) {
+	return m.offlineListFunc(ctx)
+}
+
+func (m *mockOfflineTaskClient) DeleteOfflineTask(ctx context.Context, infoHash string, deleteFiles bool) error {
+	return m.deleteOfflineFunc(ctx, infoHash, deleteFiles)
+}
+
+func TestIsDuplicateOfflineTaskError(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "code 10008", err: fmt.Errorf("code: 10008"), want: true},
+		{name: "chinese duplicate", err: fmt.Errorf("任务重复"), want: true},
+		{name: "already exists", err: fmt.Errorf("任务已存在"), want: true},
+		{name: "english duplicate", err: fmt.Errorf("duplicate task"), want: true},
+		{name: "other", err: fmt.Errorf("network timeout"), want: false},
 	}
-	return nil, fmt.Errorf("not implemented")
-}
 
-func (m *mockOpen115) DeleteOfflineTask(ctx context.Context, infoHash string, deleteFiles bool) error {
-	if m.deleteOfflineFunc != nil {
-		return m.deleteOfflineFunc(ctx, infoHash, deleteFiles)
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isDuplicateOfflineTaskError(tc.err); got != tc.want {
+				t.Fatalf("want %v, got %v", tc.want, got)
+			}
+		})
 	}
-	return fmt.Errorf("not implemented")
 }
 
-// TestAddURL_Success tests successful URL addition
-func TestAddURL_Success(t *testing.T) {
-	t.Skip("需要真实的storage环境，跳过此测试")
+func TestOfflineTaskURLMatches(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		taskURL string
+		rawURL  string
+		want    bool
+	}{
+		{
+			name:    "exact match",
+			taskURL: "ed2k://|file|test.avi|123|ABC|/",
+			rawURL:  "ed2k://|file|test.avi|123|ABC|/",
+			want:    true,
+		},
+		{
+			name:    "percent encoded file name",
+			taskURL: "ed2k://|file|[AVS]Azumi Mizushima [ネオパンストフェティッシュ Ver.19 水嶋あずみ](NOP-019)(2011.01.13).avi|1593601796|9E5CCC55541BD46EE8252BF100EFC46D|/",
+			rawURL:  "ed2k://|file|[AVS]Azumi%20Mizushima%20[ネオパンストフェティッシュ%20Ver.19%20水嶋あずみ](NOP-019)(2011.01.13).avi|1593601796|9E5CCC55541BD46EE8252BF100EFC46D|/",
+			want:    true,
+		},
+		{
+			name:    "case and trailing slash normalized",
+			taskURL: "ED2K://|FILE|TEST.AVI|123|ABC|",
+			rawURL:  "ed2k://|file|test.avi|123|abc|/",
+			want:    true,
+		},
+		{
+			name:    "different link",
+			taskURL: "ed2k://|file|a.avi|123|ABC|/",
+			rawURL:  "ed2k://|file|b.avi|123|ABC|/",
+			want:    false,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := offlineTaskURLMatches(tc.taskURL, tc.rawURL); got != tc.want {
+				t.Fatalf("want %v, got %v", tc.want, got)
+			}
+		})
+	}
 }
 
-// TestAddURL_DuplicateHandling tests the duplicate URL handling logic
-func TestAddURL_DuplicateHandling(t *testing.T) {
-	t.Skip("需要真实的storage环境，跳过此测试")
-}
+func TestOfflineTaskMatches(t *testing.T) {
+	t.Parallel()
 
-// TestDuplicateLinkRetryLogic tests the logic without actual API calls
-func TestDuplicateLinkRetryLogic(t *testing.T) {
-	testURL := "https://example.com/test.torrent"
-	testHash := "test_hash_123"
+	t.Run("match ed2k by parsed fields when task url differs", func(t *testing.T) {
+		t.Parallel()
 
-	t.Run("首次添加成功", func(t *testing.T) {
-		// 模拟首次添加成功的场景
-		callCount := 0
-		mock := &mockOpen115{
-			offlineDownloadFunc: func(ctx context.Context, uris []string, dstDir model.Obj) ([]string, error) {
-				callCount++
-				if callCount == 1 {
-					return []string{testHash}, nil
-				}
-				return nil, fmt.Errorf("unexpected call")
-			},
+		task := sdk.OfflineTask{
+			InfoHash: "server-task-hash",
+			Name:     "[AVS]Azumi Mizushima [ネオパンストフェティッシュ Ver.19 水嶋あずみ](NOP-019)(2011.01.13).avi",
+			Size:     1593601796,
+			URL:      "",
 		}
+		rawURL := "ed2k://|file|[AVS]Azumi%20Mizushima%20[ネオパンストフェティッシュ%20Ver.19%20水嶋あずみ](NOP-019)(2011.01.13).avi|1593601796|9E5CCC55541BD46EE8252BF100EFC46D|/"
 
-		hashes, err := mock.OfflineDownload(context.Background(), []string{testURL}, nil)
-		if err != nil {
-			t.Errorf("首次添加失败: %v", err)
-		}
-		if len(hashes) != 1 || hashes[0] != testHash {
-			t.Errorf("期望hash=%s, 实际=%v", testHash, hashes)
-		}
-		if callCount != 1 {
-			t.Errorf("期望调用1次, 实际调用%d次", callCount)
+		if !offlineTaskMatches(task, rawURL) {
+			t.Fatal("expected task to match by ed2k parsed fields")
 		}
 	})
 
-	t.Run("检测到重复错误并自动删除重试", func(t *testing.T) {
-		// 模拟重复链接错误的场景
+	t.Run("do not match different ed2k size", func(t *testing.T) {
+		t.Parallel()
+
+		task := sdk.OfflineTask{
+			Name: "[AVS]Azumi Mizushima [ネオパンストフェティッシュ Ver.19 水嶋あずみ](NOP-019)(2011.01.13).avi",
+			Size: 1,
+		}
+		rawURL := "ed2k://|file|[AVS]Azumi%20Mizushima%20[ネオパンストフェティッシュ%20Ver.19%20水嶋あずみ](NOP-019)(2011.01.13).avi|1593601796|9E5CCC55541BD46EE8252BF100EFC46D|/"
+
+		if offlineTaskMatches(task, rawURL) {
+			t.Fatal("expected task not to match")
+		}
+	})
+
+	t.Run("magnet still matches by url", func(t *testing.T) {
+		t.Parallel()
+
+		rawURL := "magnet:?xt=urn:btih:1234567890ABCDEF1234567890ABCDEF12345678&dn=test"
+		task := sdk.OfflineTask{
+			InfoHash: "1234567890abcdef1234567890abcdef12345678",
+			URL:      rawURL,
+		}
+
+		if !offlineTaskMatches(task, rawURL) {
+			t.Fatal("expected magnet task to match by url")
+		}
+	})
+
+	t.Run("match magnet by btih despite noisy tracker", func(t *testing.T) {
+		t.Parallel()
+
+		rawURL := "magnet:?xt=urn:btih:1234567890ABCDEF1234567890ABCDEF12345678&dn=test"
+		task := sdk.OfflineTask{
+			InfoHash: "1234567890abcdef1234567890abcdef12345678",
+			URL:      "magnet:?xt=urn:btih:1234567890ABCDEF1234567890ABCDEF12345678&dn=test&tr=%3C!DOCTYPE%20html%3E",
+		}
+
+		if !offlineTaskMatches(task, rawURL) {
+			t.Fatal("expected magnet task to match by btih")
+		}
+	})
+
+	t.Run("match http by host and path", func(t *testing.T) {
+		t.Parallel()
+
+		rawURL := "https://example.com/files/test.mp4"
+		task := sdk.OfflineTask{
+			URL: "https://EXAMPLE.com/files/test.mp4?token=abc",
+		}
+
+		if !offlineTaskMatches(task, rawURL) {
+			t.Fatal("expected http task to match by host and path")
+		}
+	})
+}
+
+func TestAddOfflineDownloadTask(t *testing.T) {
+	t.Parallel()
+
+	const (
+		testURL     = "https://example.com/test.torrent"
+		firstHash   = "hash-1"
+		staleHash   = "hash-stale"
+		deleteError = "delete failed"
+	)
+
+	t.Run("success on first try", func(t *testing.T) {
+		t.Parallel()
+
+		listCount := 0
+		client := &mockOfflineTaskClient{
+			offlineDownloadFunc: func(ctx context.Context, uris []string, dstDir model.Obj) ([]string, error) {
+				return []string{firstHash}, nil
+			},
+			offlineListFunc: func(ctx context.Context) (*sdk.OfflineTaskListResp, error) {
+				listCount++
+				return &sdk.OfflineTaskListResp{Tasks: nil}, nil
+			},
+			deleteOfflineFunc: func(ctx context.Context, infoHash string, deleteFiles bool) error {
+				t.Fatal("DeleteOfflineTask should not be called")
+				return nil
+			},
+		}
+
+		hashes, err := addOfflineDownloadTask(context.Background(), client, testURL, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(hashes) != 1 || hashes[0] != firstHash {
+			t.Fatalf("unexpected hashes: %+v", hashes)
+		}
+		if listCount < 1 {
+			t.Fatalf("want pre-add offline list call, got %d", listCount)
+		}
+	})
+
+	t.Run("delete duplicate and retry", func(t *testing.T) {
+		t.Parallel()
+
 		callCount := 0
 		deleteCount := 0
-
-		mock := &mockOpen115{
+		listCount := 0
+		client := &mockOfflineTaskClient{
 			offlineDownloadFunc: func(ctx context.Context, uris []string, dstDir model.Obj) ([]string, error) {
 				callCount++
 				if callCount == 1 {
-					// 首次调用返回重复错误
-					return nil, fmt.Errorf("code: 10008, message: 任务已存在，请勿输入重复的链接地址")
-				} else if callCount == 2 {
-					// 删除后重试，返回成功
-					return []string{testHash}, nil
+					return nil, fmt.Errorf("code: 10008, message: 任务已存在")
 				}
-				return nil, fmt.Errorf("unexpected call count: %d", callCount)
+				return []string{firstHash}, nil
 			},
 			offlineListFunc: func(ctx context.Context) (*sdk.OfflineTaskListResp, error) {
-				// 返回包含重复任务的列表
+				listCount++
+				return &sdk.OfflineTaskListResp{
+					Tasks: []sdk.OfflineTask{
+						{InfoHash: staleHash, URL: testURL},
+					},
+				}, nil
+			},
+			deleteOfflineFunc: func(ctx context.Context, infoHash string, deleteFiles bool) error {
+				deleteCount++
+				if infoHash != staleHash {
+					t.Fatalf("unexpected hash: %s", infoHash)
+				}
+				if deleteFiles {
+					t.Fatal("deleteFiles should be false")
+				}
+				return nil
+			},
+		}
+
+		hashes, err := addOfflineDownloadTask(context.Background(), client, testURL, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(hashes) != 1 || hashes[0] != firstHash {
+			t.Fatalf("unexpected hashes: %+v", hashes)
+		}
+		if callCount != 2 {
+			t.Fatalf("want 2 download attempts, got %d", callCount)
+		}
+		if deleteCount != 2 {
+			t.Fatalf("want 2 delete attempts (pre-add + duplicate), got %d", deleteCount)
+		}
+		if listCount < 2 {
+			t.Fatalf("want at least 2 offline list calls, got %d", listCount)
+		}
+	})
+
+	t.Run("delete duplicate magnet and retry", func(t *testing.T) {
+		t.Parallel()
+
+		callCount := 0
+		deleteCount := 0
+		listCount := 0
+		magnetURL := "magnet:?xt=urn:btih:1234567890ABCDEF1234567890ABCDEF12345678&dn=test"
+		client := &mockOfflineTaskClient{
+			offlineDownloadFunc: func(ctx context.Context, uris []string, dstDir model.Obj) ([]string, error) {
+				callCount++
+				if callCount == 1 {
+					return nil, fmt.Errorf("code: 10008, message: 任务已存在")
+				}
+				return []string{firstHash}, nil
+			},
+			offlineListFunc: func(ctx context.Context) (*sdk.OfflineTaskListResp, error) {
+				listCount++
+				return &sdk.OfflineTaskListResp{
+					Tasks: []sdk.OfflineTask{
+						{InfoHash: staleHash, URL: magnetURL},
+					},
+				}, nil
+			},
+			deleteOfflineFunc: func(ctx context.Context, infoHash string, deleteFiles bool) error {
+				deleteCount++
+				if infoHash != staleHash {
+					t.Fatalf("unexpected hash: %s", infoHash)
+				}
+				if deleteFiles {
+					t.Fatal("deleteFiles should be false")
+				}
+				return nil
+			},
+		}
+
+		hashes, err := addOfflineDownloadTask(context.Background(), client, magnetURL, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(hashes) != 1 || hashes[0] != firstHash {
+			t.Fatalf("unexpected hashes: %+v", hashes)
+		}
+		if callCount != 2 {
+			t.Fatalf("want 2 download attempts, got %d", callCount)
+		}
+		if deleteCount != 2 {
+			t.Fatalf("want 2 delete attempts (pre-add + duplicate), got %d", deleteCount)
+		}
+		if listCount < 2 {
+			t.Fatalf("want at least 2 offline list calls, got %d", listCount)
+		}
+	})
+
+	t.Run("delete duplicate and retry with decoded ed2k url", func(t *testing.T) {
+		t.Parallel()
+
+		callCount := 0
+		deleteCount := 0
+		listCount := 0
+		decodedURL := "ed2k://|file|[AVS]Azumi Mizushima [ネオパンストフェティッシュ Ver.19 水嶋あずみ](NOP-019)(2011.01.13).avi|1593601796|9E5CCC55541BD46EE8252BF100EFC46D|/"
+		encodedURL := "ed2k://|file|[AVS]Azumi%20Mizushima%20[ネオパンストフェティッシュ%20Ver.19%20水嶋あずみ](NOP-019)(2011.01.13).avi|1593601796|9E5CCC55541BD46EE8252BF100EFC46D|/"
+
+		client := &mockOfflineTaskClient{
+			offlineDownloadFunc: func(ctx context.Context, uris []string, dstDir model.Obj) ([]string, error) {
+				callCount++
+				if callCount == 1 {
+					return nil, fmt.Errorf("code: 10008, message: 任务已存在，请勿输入重复的链接地址")
+				}
+				return []string{firstHash}, nil
+			},
+			offlineListFunc: func(ctx context.Context) (*sdk.OfflineTaskListResp, error) {
+				listCount++
+				return &sdk.OfflineTaskListResp{
+					Tasks: []sdk.OfflineTask{
+						{InfoHash: staleHash, URL: decodedURL},
+					},
+				}, nil
+			},
+			deleteOfflineFunc: func(ctx context.Context, infoHash string, deleteFiles bool) error {
+				deleteCount++
+				if infoHash != staleHash {
+					t.Fatalf("unexpected hash: %s", infoHash)
+				}
+				if deleteFiles {
+					t.Fatal("deleteFiles should be false")
+				}
+				return nil
+			},
+		}
+
+		hashes, err := addOfflineDownloadTask(context.Background(), client, encodedURL, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(hashes) != 1 || hashes[0] != firstHash {
+			t.Fatalf("unexpected hashes: %+v", hashes)
+		}
+		if callCount != 2 {
+			t.Fatalf("want 2 download attempts, got %d", callCount)
+		}
+		if deleteCount != 2 {
+			t.Fatalf("want 2 delete attempts (pre-add + duplicate), got %d", deleteCount)
+		}
+		if listCount < 2 {
+			t.Fatalf("want at least 2 offline list calls, got %d", listCount)
+		}
+	})
+
+	t.Run("delete duplicate and retry with empty task url but matching name and size", func(t *testing.T) {
+		t.Parallel()
+
+		callCount := 0
+		deleteCount := 0
+		listCount := 0
+		encodedURL := "ed2k://|file|[AVS]Azumi%20Mizushima%20[ネオパンストフェティッシュ%20Ver.19%20水嶋あずみ](NOP-019)(2011.01.13).avi|1593601796|9E5CCC55541BD46EE8252BF100EFC46D|/"
+
+		client := &mockOfflineTaskClient{
+			offlineDownloadFunc: func(ctx context.Context, uris []string, dstDir model.Obj) ([]string, error) {
+				callCount++
+				if callCount == 1 {
+					return nil, fmt.Errorf("code: 10008, message: 任务已存在，请勿输入重复的链接地址")
+				}
+				return []string{firstHash}, nil
+			},
+			offlineListFunc: func(ctx context.Context) (*sdk.OfflineTaskListResp, error) {
+				listCount++
 				return &sdk.OfflineTaskListResp{
 					Tasks: []sdk.OfflineTask{
 						{
-							InfoHash: "old_hash_456",
-							URL:      testURL,
-							Status:   1, // 下载中
+							InfoHash: staleHash,
+							Name:     "[AVS]Azumi Mizushima [ネオパンストフェティッシュ Ver.19 水嶋あずみ](NOP-019)(2011.01.13).avi",
+							Size:     1593601796,
+							URL:      "",
 						},
 					},
 				}, nil
 			},
 			deleteOfflineFunc: func(ctx context.Context, infoHash string, deleteFiles bool) error {
 				deleteCount++
-				if infoHash != "old_hash_456" {
-					t.Errorf("期望删除hash=old_hash_456, 实际=%s", infoHash)
+				if infoHash != staleHash {
+					t.Fatalf("unexpected hash: %s", infoHash)
 				}
 				if deleteFiles {
-					t.Error("不应该删除源文件")
+					t.Fatal("deleteFiles should be false")
 				}
 				return nil
 			},
 		}
 
-		// 模拟完整的错误处理逻辑
-		ctx := context.Background()
-
-		// 第一次调用返回重复错误
-		_, err := mock.OfflineDownload(ctx, []string{testURL}, nil)
-		if err == nil {
-			t.Error("第一次应该返回错误")
-		}
-
-		// 检查是否是重复错误
-		errStr := err.Error()
-		if !strings.Contains(errStr, "10008") && !strings.Contains(errStr, "重复") {
-			t.Errorf("应该是重复错误，实际错误: %v", err)
-		}
-
-		// 获取任务列表
-		taskList, err := mock.OfflineList(ctx)
+		hashes, err := addOfflineDownloadTask(context.Background(), client, encodedURL, nil)
 		if err != nil {
-			t.Errorf("获取任务列表失败: %v", err)
+			t.Fatalf("unexpected error: %v", err)
 		}
-
-		// 查找并删除重复任务
-		found := false
-		for _, task := range taskList.Tasks {
-			if task.URL == testURL {
-				err := mock.DeleteOfflineTask(ctx, task.InfoHash, false)
-				if err != nil {
-					t.Errorf("删除任务失败: %v", err)
-				}
-				found = true
-				break
-			}
+		if len(hashes) != 1 || hashes[0] != firstHash {
+			t.Fatalf("unexpected hashes: %+v", hashes)
 		}
-
-		if !found {
-			t.Error("未找到重复任务")
-		}
-
-		// 重试添加
-		hashes, err := mock.OfflineDownload(ctx, []string{testURL}, nil)
-		if err != nil {
-			t.Errorf("重试添加失败: %v", err)
-		}
-		if len(hashes) != 1 || hashes[0] != testHash {
-			t.Errorf("期望hash=%s, 实际=%v", testHash, hashes)
-		}
-
 		if callCount != 2 {
-			t.Errorf("期望调用OfflineDownload 2次, 实际%d次", callCount)
+			t.Fatalf("want 2 download attempts, got %d", callCount)
 		}
-		if deleteCount != 1 {
-			t.Errorf("期望调用DeleteOfflineTask 1次, 实际%d次", deleteCount)
+		if deleteCount != 2 {
+			t.Fatalf("want 2 delete attempts (pre-add + duplicate), got %d", deleteCount)
+		}
+		if listCount < 2 {
+			t.Fatalf("want at least 2 offline list calls, got %d", listCount)
 		}
 	})
 
-	t.Run("重复链接但删除失败", func(t *testing.T) {
-		mock := &mockOpen115{
+	t.Run("delete duplicate directly from add response info hash", func(t *testing.T) {
+		t.Parallel()
+
+		callCount := 0
+		deleteCount := 0
+		listCount := 0
+		client := &mockOfflineTaskClient{
+			offlineDownloadWithDetailsFunc: func(ctx context.Context, uris []string, dstDir model.Obj) ([]string, []sdk.AddOfflineTaskURIsResp, string, error) {
+				callCount++
+				if callCount == 1 {
+					return nil, []sdk.AddOfflineTaskURIsResp{
+						{InfoHash: staleHash, URL: testURL},
+					}, `{"state":false,"code":10008,"message":"任务已存在","data":[{"info_hash":"hash-stale","url":"` + testURL + `"}]}`, fmt.Errorf("code: 10008, message: 任务已存在")
+				}
+				return []string{firstHash}, nil, "", nil
+			},
 			offlineDownloadFunc: func(ctx context.Context, uris []string, dstDir model.Obj) ([]string, error) {
-				// 始终返回重复错误
-				return nil, fmt.Errorf("code: 10008, message: 任务已存在")
+				return nil, fmt.Errorf("unexpected fallback OfflineDownload call")
 			},
 			offlineListFunc: func(ctx context.Context) (*sdk.OfflineTaskListResp, error) {
+				listCount++
+				return &sdk.OfflineTaskListResp{Tasks: nil}, nil
+			},
+			deleteOfflineFunc: func(ctx context.Context, infoHash string, deleteFiles bool) error {
+				deleteCount++
+				if infoHash != staleHash {
+					t.Fatalf("unexpected hash: %s", infoHash)
+				}
+				if deleteFiles {
+					t.Fatal("deleteFiles should be false")
+				}
+				return nil
+			},
+		}
+
+		hashes, err := addOfflineDownloadTask(context.Background(), client, testURL, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(hashes) != 1 || hashes[0] != firstHash {
+			t.Fatalf("unexpected hashes: %+v", hashes)
+		}
+		if callCount != 2 {
+			t.Fatalf("want 2 download attempts, got %d", callCount)
+		}
+		if deleteCount != 1 {
+			t.Fatalf("want 1 delete attempt, got %d", deleteCount)
+		}
+		if listCount < 1 {
+			t.Fatalf("want pre-add offline list call, got %d", listCount)
+		}
+	})
+
+	t.Run("duplicate delete failure", func(t *testing.T) {
+		t.Parallel()
+
+		listCount := 0
+		client := &mockOfflineTaskClient{
+			offlineDownloadFunc: func(ctx context.Context, uris []string, dstDir model.Obj) ([]string, error) {
+				return nil, fmt.Errorf("duplicate task")
+			},
+			offlineListFunc: func(ctx context.Context) (*sdk.OfflineTaskListResp, error) {
+				listCount++
 				return &sdk.OfflineTaskListResp{
 					Tasks: []sdk.OfflineTask{
-						{
-							InfoHash: "old_hash_789",
-							URL:      testURL,
-						},
+						{InfoHash: staleHash, URL: testURL},
 					},
 				}, nil
 			},
 			deleteOfflineFunc: func(ctx context.Context, infoHash string, deleteFiles bool) error {
-				return fmt.Errorf("删除失败：权限不足")
+				return fmt.Errorf(deleteError)
 			},
 		}
 
-		// 删除失败时应该返回错误
-		ctx := context.Background()
-		_, err := mock.OfflineDownload(ctx, []string{testURL}, nil)
+		_, err := addOfflineDownloadTask(context.Background(), client, testURL, nil)
 		if err == nil {
-			t.Error("应该返回错误")
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), deleteError) {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if listCount < 1 {
+			t.Fatalf("want pre-add offline list call, got %d", listCount)
+		}
+	})
+
+	t.Run("non duplicate error is returned", func(t *testing.T) {
+		t.Parallel()
+
+		listCount := 0
+		client := &mockOfflineTaskClient{
+			offlineDownloadFunc: func(ctx context.Context, uris []string, dstDir model.Obj) ([]string, error) {
+				return nil, fmt.Errorf("network timeout")
+			},
+			offlineListFunc: func(ctx context.Context) (*sdk.OfflineTaskListResp, error) {
+				listCount++
+				return &sdk.OfflineTaskListResp{Tasks: nil}, nil
+			},
+			deleteOfflineFunc: func(ctx context.Context, infoHash string, deleteFiles bool) error {
+				t.Fatal("DeleteOfflineTask should not be called")
+				return nil
+			},
+		}
+
+		_, err := addOfflineDownloadTask(context.Background(), client, testURL, nil)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), "network timeout") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if listCount < 1 {
+			t.Fatalf("want pre-add offline list call, got %d", listCount)
 		}
 	})
 }
 
-// TestOpen115_Name tests the Name method
-func TestOpen115_Name(t *testing.T) {
-	o := &Open115{}
-	name := o.Name()
-	expected := "115 Open"
-	if name != expected {
-		t.Errorf("期望名称=%s, 实际=%s", expected, name)
-	}
-}
+func TestOpen115BasicMethods(t *testing.T) {
+	t.Parallel()
 
-// TestOpen115_Items tests the Items method
-func TestOpen115_Items(t *testing.T) {
 	o := &Open115{}
-	items := o.Items()
-	if items != nil {
-		t.Error("Items应该返回nil")
-	}
-}
 
-// TestOpen115_Run tests the Run method
-func TestOpen115_Run(t *testing.T) {
-	o := &Open115{}
-	err := o.Run(&tool.DownloadTask{})
-	if err == nil {
-		t.Error("Run应该返回NotSupport错误")
+	if o.Name() != "115 Open" {
+		t.Fatalf("unexpected name: %s", o.Name())
 	}
-}
-
-// TestOpen115_Init tests the Init method
-func TestOpen115_Init(t *testing.T) {
-	o := &Open115{}
+	if o.Items() != nil {
+		t.Fatal("Items should return nil")
+	}
 	msg, err := o.Init()
 	if err != nil {
-		t.Errorf("Init失败: %v", err)
+		t.Fatalf("unexpected init error: %v", err)
 	}
 	if msg != "ok" {
-		t.Errorf("期望消息='ok', 实际=%s", msg)
+		t.Fatalf("unexpected init message: %s", msg)
 	}
 }
