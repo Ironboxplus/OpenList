@@ -2,6 +2,7 @@ package _115_open
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -206,7 +207,7 @@ func (d *Open115) Rename(ctx context.Context, srcObj model.Obj, newName string) 
 		return nil, err
 	}
 	_, err := d.client.UpdateFile(ctx, &sdk.UpdateFileReq{
-		FileID:  srcObj.GetID(),
+		FileID:   srcObj.GetID(),
 		FileName: newName,
 	})
 	if err != nil {
@@ -413,6 +414,28 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 
 func (d *Open115) OfflineDownload(ctx context.Context, uris []string, dstDir model.Obj) ([]string, error) {
 	return d.client.AddOfflineTaskURIs(ctx, uris, dstDir.GetID())
+}
+
+func (d *Open115) OfflineDownloadWithDetails(ctx context.Context, uris []string, dstDir model.Obj) ([]string, []sdk.AddOfflineTaskURIsResp, string, error) {
+	var envelope sdk.Resp[[]sdk.AddOfflineTaskURIsResp]
+	response, err := d.client.AuthRequestRaw(ctx, sdk.ApiAddOffline, http.MethodPost, nil, sdk.ReqWithForm(sdk.Form{
+		"urls":       strings.Join(uris, "\n"),
+		"wp_path_id": dstDir.GetID(),
+	}))
+	if response != nil {
+		_ = json.Unmarshal(response.Bytes(), &envelope)
+	}
+	hashes := make([]string, 0, len(envelope.Data))
+	for _, item := range envelope.Data {
+		if item.State && item.InfoHash != "" {
+			hashes = append(hashes, item.InfoHash)
+		}
+	}
+	rawResponse := ""
+	if response != nil {
+		rawResponse = response.String()
+	}
+	return hashes, envelope.Data, rawResponse, err
 }
 
 func (d *Open115) DeleteOfflineTask(ctx context.Context, infoHash string, deleteFiles bool) error {
