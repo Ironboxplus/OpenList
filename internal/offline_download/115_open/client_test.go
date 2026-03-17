@@ -15,6 +15,8 @@ type mockOfflineTaskClient struct {
 	offlineDownloadWithDetailsFunc func(ctx context.Context, uris []string, dstDir model.Obj) ([]string, []sdk.AddOfflineTaskURIsResp, string, error)
 	offlineListFunc                func(ctx context.Context) (*sdk.OfflineTaskListResp, error)
 	deleteOfflineFunc              func(ctx context.Context, infoHash string, deleteFiles bool) error
+	waitLimitFunc                  func(ctx context.Context) error
+	waitLimitCalls                 int
 }
 
 func (m *mockOfflineTaskClient) OfflineDownload(ctx context.Context, uris []string, dstDir model.Obj) ([]string, error) {
@@ -35,6 +37,14 @@ func (m *mockOfflineTaskClient) OfflineList(ctx context.Context) (*sdk.OfflineTa
 
 func (m *mockOfflineTaskClient) DeleteOfflineTask(ctx context.Context, infoHash string, deleteFiles bool) error {
 	return m.deleteOfflineFunc(ctx, infoHash, deleteFiles)
+}
+
+func (m *mockOfflineTaskClient) WaitLimit(ctx context.Context) error {
+	m.waitLimitCalls++
+	if m.waitLimitFunc != nil {
+		return m.waitLimitFunc(ctx)
+	}
+	return nil
 }
 
 func TestIsDuplicateOfflineTaskError(t *testing.T) {
@@ -222,6 +232,30 @@ func TestAddOfflineDownloadTask(t *testing.T) {
 		}
 		if listCount < 1 {
 			t.Fatalf("want pre-add offline list call, got %d", listCount)
+		}
+	})
+
+	t.Run("wait limit applied for add flow", func(t *testing.T) {
+		t.Parallel()
+
+		client := &mockOfflineTaskClient{
+			offlineDownloadFunc: func(ctx context.Context, uris []string, dstDir model.Obj) ([]string, error) {
+				return []string{firstHash}, nil
+			},
+			offlineListFunc: func(ctx context.Context) (*sdk.OfflineTaskListResp, error) {
+				return &sdk.OfflineTaskListResp{Tasks: nil}, nil
+			},
+			deleteOfflineFunc: func(ctx context.Context, infoHash string, deleteFiles bool) error {
+				return nil
+			},
+		}
+
+		_, err := addOfflineDownloadTask(context.Background(), client, testURL, nil)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if client.waitLimitCalls < 2 {
+			t.Fatalf("want wait limit calls >= 2, got %d", client.waitLimitCalls)
 		}
 	})
 

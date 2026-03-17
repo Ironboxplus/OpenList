@@ -36,6 +36,18 @@ type offlineTaskDetailClient interface {
 	OfflineDownloadWithDetails(ctx context.Context, uris []string, dstDir model.Obj) ([]string, []sdk.AddOfflineTaskURIsResp, string, error)
 }
 
+type offlineTaskLimiter interface {
+	WaitLimit(ctx context.Context) error
+}
+
+func waitOfflineTaskLimit(ctx context.Context, client offlineTaskClient) error {
+	limiter, ok := client.(offlineTaskLimiter)
+	if !ok {
+		return nil
+	}
+	return limiter.WaitLimit(ctx)
+}
+
 func (o *Open115) Name() string {
 	return "115 Open"
 }
@@ -137,6 +149,9 @@ func addOfflineDownloadTask(ctx context.Context, client offlineTaskClient, url s
 			continue
 		}
 		log.Infof("[115_open] deleting duplicate task directly from add response: info_hash=%s url=%s", item.InfoHash, item.URL)
+		if err := waitOfflineTaskLimit(ctx, client); err != nil {
+			return nil, err
+		}
 		if deleteErr := client.DeleteOfflineTask(ctx, item.InfoHash, false); deleteErr != nil {
 			log.Errorf("[115_open] delete duplicate task from add response failed: info_hash=%s err=%v", item.InfoHash, deleteErr)
 			return nil, fmt.Errorf("failed to delete duplicate offline download task from add response: %w", deleteErr)
@@ -154,6 +169,9 @@ func addOfflineDownloadTask(ctx context.Context, client offlineTaskClient, url s
 		}
 		return hashs, nil
 	}
+	if err := waitOfflineTaskLimit(ctx, client); err != nil {
+		return nil, err
+	}
 	taskList, listErr := client.OfflineList(ctx)
 	if listErr != nil || taskList == nil {
 		return nil, fmt.Errorf("failed to add offline download task: %w", err)
@@ -168,6 +186,9 @@ func addOfflineDownloadTask(ctx context.Context, client offlineTaskClient, url s
 		}
 		log.Infof("[115_open] matched duplicate offline task: info_hash=%s, name=%s", task.InfoHash, task.Name)
 		log.Infof("[115_open] deleting matched duplicate offline task: info_hash=%s status=%d size=%d", task.InfoHash, task.Status, task.Size)
+		if err := waitOfflineTaskLimit(ctx, client); err != nil {
+			return nil, err
+		}
 		if deleteErr := client.DeleteOfflineTask(ctx, task.InfoHash, false); deleteErr != nil {
 			log.Errorf("[115_open] delete matched duplicate offline task failed: info_hash=%s err=%v", task.InfoHash, deleteErr)
 			return nil, fmt.Errorf("failed to delete duplicate offline download task: %w", deleteErr)
@@ -190,6 +211,9 @@ func addOfflineDownloadTask(ctx context.Context, client offlineTaskClient, url s
 }
 
 func preCleanDuplicateOfflineTasks(ctx context.Context, client offlineTaskClient, url string) error {
+	if err := waitOfflineTaskLimit(ctx, client); err != nil {
+		return err
+	}
 	taskList, listErr := client.OfflineList(ctx)
 	if listErr != nil || taskList == nil {
 		log.Warnf("[115_open] pre-add offline list failed: err=%v", listErr)
@@ -205,6 +229,9 @@ func preCleanDuplicateOfflineTasks(ctx context.Context, client offlineTaskClient
 			continue
 		}
 		log.Infof("[115_open] pre-add deleting matched duplicate offline task: info_hash=%s status=%d size=%d", task.InfoHash, task.Status, task.Size)
+		if err := waitOfflineTaskLimit(ctx, client); err != nil {
+			return err
+		}
 		if deleteErr := client.DeleteOfflineTask(ctx, task.InfoHash, false); deleteErr != nil {
 			log.Errorf("[115_open] pre-add delete matched duplicate offline task failed: info_hash=%s err=%v", task.InfoHash, deleteErr)
 			return fmt.Errorf("failed to delete duplicate offline download task: %w", deleteErr)
@@ -220,6 +247,9 @@ func preCleanDuplicateOfflineTasks(ctx context.Context, client offlineTaskClient
 }
 
 func offlineDownloadWithDetails(ctx context.Context, client offlineTaskClient, url string, parentDir model.Obj) ([]string, []sdk.AddOfflineTaskURIsResp, string, error) {
+	if err := waitOfflineTaskLimit(ctx, client); err != nil {
+		return nil, nil, "", err
+	}
 	if detailClient, ok := client.(offlineTaskDetailClient); ok {
 		return detailClient.OfflineDownloadWithDetails(ctx, []string{url}, parentDir)
 	}
@@ -501,6 +531,10 @@ func mapKeys(values map[string]struct{}) []string {
 func waitForOfflineTaskRemoval(ctx context.Context, client offlineTaskClient, infoHash string) {
 	const maxChecks = 3
 	for attempt := 1; attempt <= maxChecks; attempt++ {
+		if err := waitOfflineTaskLimit(ctx, client); err != nil {
+			log.Warnf("[115_open] post-delete wait limit failed: info_hash=%s attempt=%d err=%v", infoHash, attempt, err)
+			return
+		}
 		taskList, err := client.OfflineList(ctx)
 		if err != nil {
 			log.Warnf("[115_open] post-delete check failed: info_hash=%s attempt=%d err=%v", infoHash, attempt, err)
