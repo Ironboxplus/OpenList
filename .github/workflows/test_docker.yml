@@ -87,6 +87,7 @@ jobs:
         run: bash build.sh beta docker-multiplatform
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WEB_VERSION: latest
           # FRONTEND_REPO 使用 build.sh 默认值 (OpenListTeam/OpenList-Frontend)
 
       - name: Upload artifacts

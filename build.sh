@@ -31,6 +31,10 @@ else
   webVersion=$(eval "curl -fsSL --max-time 2 $githubAuthArgs \"https://api.github.com/repos/$frontendRepo/releases/latest\"" | grep "tag_name" | head -n 1 | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')
 fi
 
+if [ -n "$WEB_VERSION" ]; then
+  webVersion="$WEB_VERSION"
+fi
+
 echo "backend version: $version"
 echo "frontend version: $webVersion"
 if [ "$useLite" = true ]; then
@@ -615,7 +619,11 @@ if [ "$buildType" = "dev" ]; then
   fi
 elif [ "$buildType" = "release" -o "$buildType" = "beta" ]; then
   if [ "$buildType" = "beta" ]; then
-    FetchWebRolling
+    if [ "$WEB_VERSION" = "latest" ]; then
+      FetchWebRelease
+    else
+      FetchWebRolling
+    fi
   else
     FetchWebRelease
   fi
