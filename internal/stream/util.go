@@ -182,13 +182,14 @@ func (r *RefreshableRangeReader) doRefreshLocked(ctx context.Context) error {
 }
 
 // selfHealingReadCloser wraps an io.ReadCloser and automatically refreshes the link
-// if it detects 0-byte reads (common with expired links from some cloud providers)
+// if the upstream reader dies before the requested range is fully delivered.
 type selfHealingReadCloser struct {
 	io.ReadCloser
 	refresher *RefreshableRangeReader
 	ctx       context.Context
 	httpRange http_range.Range
 	firstRead bool
+	bytesRead int64
 	closed    bool
 	mu        sync.Mutex
 }
@@ -202,50 +203,100 @@ func (s *selfHealingReadCloser) Read(p []byte) (n int, err error) {
 	}
 
 	n, err = s.ReadCloser.Read(p)
+	s.bytesRead += int64(n)
+	wasFirstRead := !s.firstRead
+	s.firstRead = true
 
 	// Detect 0-byte read on first attempt (indicates link may be expired but returned 200 OK)
-	if !s.firstRead && n == 0 && (err == io.EOF || err == io.ErrUnexpectedEOF) {
-		s.firstRead = true
-		log.Warnf("Detected 0-byte read on first attempt, attempting to refresh link...")
-
-		// Try to refresh the link
-		s.refresher.mu.Lock()
-		refreshErr := s.refresher.doRefreshLocked(s.ctx)
-		s.refresher.mu.Unlock()
-
-		if refreshErr != nil {
-			log.Errorf("Failed to refresh link after 0-byte read: %v", refreshErr)
+	if s.shouldReconnectAfterRead(wasFirstRead, n, err) {
+		if reconnectErr := s.reconnectFromCurrentOffsetLocked(); reconnectErr != nil {
+			log.Errorf("Failed to refresh link after interrupted read: %v", reconnectErr)
 			return n, err
 		}
 
-		// Close old connection
-		s.ReadCloser.Close()
-
-		// Get new reader and retry
-		s.refresher.mu.Lock()
-		reader, getErr := s.refresher.getInnerReader()
-		s.refresher.mu.Unlock()
-
-		if getErr != nil {
-			log.Errorf("Failed to get inner reader after refresh: %v", getErr)
-			return n, err
+		if n > 0 {
+			return n, nil
 		}
 
-		newRc, rangeErr := reader.RangeRead(s.ctx, s.httpRange)
-		if rangeErr != nil {
-			log.Errorf("Failed to create new range reader after refresh: %v", rangeErr)
-			return n, err
-		}
-
-		s.ReadCloser = newRc
-		log.Infof("Successfully refreshed link and reconnected after 0-byte read")
-
-		// Retry read with new connection
-		return s.ReadCloser.Read(p)
+		n, err = s.ReadCloser.Read(p)
+		s.bytesRead += int64(n)
+		return n, err
 	}
 
-	s.firstRead = true
 	return n, err
+}
+
+func (s *selfHealingReadCloser) shouldReconnectAfterRead(wasFirstRead bool, n int, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if s.remainingBytes() <= 0 {
+		return false
+	}
+
+	if wasFirstRead && n == 0 && (err == io.EOF || err == io.ErrUnexpectedEOF) {
+		log.Warnf("Detected 0-byte read on first attempt, attempting to refresh link...")
+		return true
+	}
+
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		log.Warnf("Detected interrupted read after %d bytes, attempting to refresh link...", s.bytesRead)
+		return true
+	}
+
+	errStr := strings.ToLower(err.Error())
+	if strings.Contains(errStr, "connection reset by peer") {
+		log.Warnf("Detected upstream connection reset after %d bytes, attempting to refresh link...", s.bytesRead)
+		return true
+	}
+
+	return false
+}
+
+func (s *selfHealingReadCloser) reconnectFromCurrentOffsetLocked() error {
+	nextRange := s.httpRange
+	nextRange.Start += s.bytesRead
+	if nextRange.Length >= 0 {
+		nextRange.Length -= s.bytesRead
+	}
+
+	s.refresher.mu.Lock()
+	refreshErr := s.refresher.doRefreshLocked(s.ctx)
+	if refreshErr != nil {
+		s.refresher.mu.Unlock()
+		return refreshErr
+	}
+
+	reader, getErr := s.refresher.getInnerReader()
+	s.refresher.mu.Unlock()
+	if getErr != nil {
+		return getErr
+	}
+
+	newRc, rangeErr := reader.RangeRead(s.ctx, nextRange)
+	if rangeErr != nil {
+		return rangeErr
+	}
+
+	_ = s.ReadCloser.Close()
+	s.ReadCloser = newRc
+	log.Infof("Successfully refreshed link and reconnected from offset %d", nextRange.Start)
+	return nil
+}
+
+func (s *selfHealingReadCloser) remainingBytes() int64 {
+	length := s.httpRange.Length
+	if length < 0 || s.httpRange.Start+length > s.refresher.size {
+		length = s.refresher.size - s.httpRange.Start
+	}
+	remaining := length - s.bytesRead
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
 }
 
 func (s *selfHealingReadCloser) Close() error {
