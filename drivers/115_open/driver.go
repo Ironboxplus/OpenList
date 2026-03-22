@@ -243,12 +243,123 @@ func (d *Open115) Remove(ctx context.Context, obj model.Obj) error {
 	if !ok {
 		return fmt.Errorf("can't convert obj")
 	}
-	_, err := d.client.DelFile(ctx, &sdk.DelFileReq{
+	resp, err := d.client.DelFile(ctx, &sdk.DelFileReq{
 		FileIDs:  _obj.GetID(),
 		ParentID: _obj.Pid,
 	})
 	if err != nil {
 		return err
+	}
+	if d.RemoveWay != "delete" {
+		return nil
+	}
+	return d.removePermanently(ctx, _obj, resp)
+}
+
+func (d *Open115) removePermanently(ctx context.Context, obj *Obj, deleteResp []string) error {
+	var directDeleteErr error
+	for _, tid := range deleteResp {
+		tid = strings.TrimSpace(tid)
+		if tid == "" {
+			continue
+		}
+		if err := d.deleteRecycleBinEntry(ctx, tid); err == nil {
+			return nil
+		} else if directDeleteErr == nil {
+			directDeleteErr = err
+		}
+	}
+
+	recycleEntry, err := d.findRecycleBinEntry(ctx, obj)
+	if err != nil {
+		if directDeleteErr != nil {
+			return fmt.Errorf("failed to permanently delete recycle-bin candidate: %w; fallback lookup failed: %v", directDeleteErr, err)
+		}
+		return err
+	}
+	if err := d.deleteRecycleBinEntry(ctx, recycleEntry.ID); err != nil {
+		if directDeleteErr != nil {
+			return fmt.Errorf("failed to permanently delete recycle-bin entry %s after candidate delete error %v: %w", recycleEntry.ID, directDeleteErr, err)
+		}
+		return err
+	}
+	return nil
+}
+
+func (d *Open115) deleteRecycleBinEntry(ctx context.Context, tid string) error {
+	if err := d.WaitLimit(ctx); err != nil {
+		return err
+	}
+	_, err := d.client.RbDelete(ctx, tid)
+	return err
+}
+
+func (d *Open115) findRecycleBinEntry(ctx context.Context, obj *Obj) (*sdk.RbListResp_FileInfo, error) {
+	pageSize := d.PageSize
+	if pageSize <= 0 {
+		pageSize = 200
+	} else if pageSize > 1150 {
+		pageSize = 1150
+	}
+
+	offset := int64(0)
+	for {
+		if err := d.WaitLimit(ctx); err != nil {
+			return nil, err
+		}
+		resp, err := d.client.RbList(ctx, pageSize, offset)
+		if err != nil {
+			return nil, err
+		}
+		if entry := matchRecycleBinEntry(obj, resp.Files); entry != nil {
+			return entry, nil
+		}
+
+		count, err := strconv.ParseInt(resp.Count, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse recycle bin count %q: %w", resp.Count, err)
+		}
+		offset += pageSize
+		if offset >= count || len(resp.Files) == 0 {
+			break
+		}
+	}
+
+	return nil, fmt.Errorf("recycle bin entry not found for object id=%s name=%s parent=%s", obj.GetID(), obj.GetName(), obj.Pid)
+}
+
+func matchRecycleBinEntry(obj *Obj, files map[string]sdk.RbListResp_FileInfo) *sdk.RbListResp_FileInfo {
+	if len(files) == 0 {
+		return nil
+	}
+	if entry, ok := files[obj.GetID()]; ok {
+		matched := entry
+		return &matched
+	}
+
+	size := strconv.FormatInt(obj.GetSize(), 10)
+	for _, entry := range files {
+		if entry.ID == obj.GetID() {
+			matched := entry
+			return &matched
+		}
+		if obj.IsDir() {
+			if entry.FileName == obj.GetName() && entry.CID == obj.Pid {
+				matched := entry
+				return &matched
+			}
+			continue
+		}
+		if obj.Sha1 != "" && entry.SHA1 != "" && strings.EqualFold(entry.SHA1, obj.Sha1) {
+			if entry.FileName == obj.GetName() || entry.CID == obj.Pid {
+				matched := entry
+				return &matched
+			}
+		}
+		if entry.FileName == obj.GetName() && entry.CID == obj.Pid && entry.FileSize == size {
+			matched := entry
+			return &matched
+		}
 	}
 	return nil
 }
