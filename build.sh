@@ -18,6 +18,8 @@ if [[ "$*" == *"lite"* ]]; then
   useLite=true
 fi
 
+skipFrontendFetch="${SKIP_FRONTEND_FETCH:-false}"
+
 if [ "$1" = "dev" ]; then
   version="dev"
   webVersion="rolling"
@@ -66,6 +68,11 @@ GetBuildTagsForTarget() {
 }
 
 FetchWebRolling() {
+  if [ "$skipFrontendFetch" = "true" ] && [ -n "$(find public/dist -mindepth 1 -print -quit 2>/dev/null)" ]; then
+    echo "using cached frontend dist from public/dist"
+    return 0
+  fi
+
   pre_release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/tags/rolling\"")
   pre_release_assets=$(echo "$pre_release_json" | jq -r '.assets[].browser_download_url')
   
@@ -79,6 +86,11 @@ FetchWebRolling() {
 }
 
 FetchWebRelease() {
+  if [ "$skipFrontendFetch" = "true" ] && [ -n "$(find public/dist -mindepth 1 -print -quit 2>/dev/null)" ]; then
+    echo "using cached frontend dist from public/dist"
+    return 0
+  fi
+
   release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/latest\"")
   release_assets=$(echo "$release_json" | jq -r '.assets[].browser_download_url')
   
