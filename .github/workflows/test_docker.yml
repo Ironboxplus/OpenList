@@ -14,10 +14,13 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   GHCR_ORG_NAME: ${{ vars.GHCR_ORG_NAME || 'ironboxplus' }} # 👈 最好改成你的用户名，防止推错地方
+  FRONTEND_REPO: ${{ vars.FRONTEND_REPO || 'OpenListTeam/OpenList-Frontend' }}
   IMAGE_NAME: openlist
   REGISTRY: ghcr.io
   ARTIFACT_NAME: 'binaries_docker_release'
+  WEB_VERSION: latest
   # 👇 关键修改：只保留 linux/amd64，删掉后面一长串
   RELEASE_PLATFORMS: 'linux/amd64'
   # 👇 关键修改：强制允许推送，不用管是不是 push 事件
@@ -43,32 +46,39 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
 
-      # 获取前端仓库的最新commit SHA
-      - name: Get Frontend Commit SHA
-        id: frontend-sha
+      - name: Get Frontend Cache Version
+        id: frontend-cache
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          FRONTEND_REPO="${{ env.FRONTEND_REPO }}"
-          # 如果未设置FRONTEND_REPO，使用默认值
-          if [ -z "$FRONTEND_REPO" ]; then
-            FRONTEND_REPO="OpenListTeam/OpenList-Frontend"
-          fi
-          FRONTEND_SHA=$(curl -s https://api.github.com/repos/$FRONTEND_REPO/commits/main | jq -r '.sha')
-          echo "sha=$FRONTEND_SHA" >> $GITHUB_OUTPUT
-          echo "repo=$FRONTEND_REPO" >> $GITHUB_OUTPUT
-          echo "Frontend repo: $FRONTEND_REPO"
-          echo "Frontend repo latest commit: $FRONTEND_SHA"
+          frontend_repo="${{ env.FRONTEND_REPO }}"
+          web_version="${{ env.WEB_VERSION }}"
+          github_auth_args=()
 
-      # 缓存前端下载 - key包含前端仓库的commit SHA
+          if [ -n "$GH_TOKEN" ]; then
+            github_auth_args=(-H "Authorization: Bearer $GH_TOKEN")
+          fi
+
+          if [ "$web_version" = "latest" ]; then
+            frontend_version=$(curl -fsSL "${github_auth_args[@]}" "https://api.github.com/repos/$frontend_repo/releases/latest" | jq -r '.tag_name')
+          else
+            frontend_version="$web_version"
+          fi
+
+          echo "repo=$frontend_repo" >> "$GITHUB_OUTPUT"
+          echo "version=$frontend_version" >> "$GITHUB_OUTPUT"
+          echo "Frontend repo: $frontend_repo"
+          echo "Frontend cache version: $frontend_version"
+
       - name: Cache Frontend
         id: cache-frontend
         uses: actions/cache@v4
         with:
           path: public/dist
-          key: frontend-${{ steps.frontend-sha.outputs.repo }}-${{ steps.frontend-sha.outputs.sha }}
+          key: frontend-${{ steps.frontend-cache.outputs.repo }}-${{ steps.frontend-cache.outputs.version }}
           restore-keys: |
-            frontend-${{ steps.frontend-sha.outputs.repo }}-
+            frontend-${{ steps.frontend-cache.outputs.repo }}-
 
-      # 即使只构建 x64，我们也需要 musl 工具链（因为 BuildDockerMultiplatform 默认会检查它）
       - name: Cache Musl
         id: cache-musl
         uses: actions/cache@v4
@@ -78,27 +88,24 @@ jobs:
 
       - name: Download Musl Library
         if: steps.cache-musl.outputs.cache-hit != 'true'
-        run: bash build.sh prepare docker-multiplatform
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash build.sh prepare docker-multiplatform
 
       - name: Build go binary
-        # 这里还是跑 docker-multiplatform，虽然会多编译一些架构，但这是兼容 Dockerfile 路径最稳妥的方法
         run: bash build.sh beta docker-multiplatform
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          WEB_VERSION: latest
-          # FRONTEND_REPO 使用 build.sh 默认值 (OpenListTeam/OpenList-Frontend)
+          WEB_VERSION: ${{ env.WEB_VERSION }}
+          FRONTEND_REPO: ${{ env.FRONTEND_REPO }}
+          SKIP_FRONTEND_FETCH: ${{ steps.cache-frontend.outputs.cache-hit == 'true' && 'true' || 'false' }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
           overwrite: true
-          path: |
-            build/
-            !build/*.tgz
-            !build/musl-libs/**
+          path: build/linux/amd64/openlist
 
   release_docker:
     needs: build_binary
@@ -135,7 +142,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: ${{ env.ARTIFACT_NAME }}
-          path: 'build/'
+          path: 'build/linux/amd64'
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
