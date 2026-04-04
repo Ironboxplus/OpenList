@@ -20,7 +20,7 @@ env:
   IMAGE_NAME: openlist
   REGISTRY: ghcr.io
   ARTIFACT_NAME: 'binaries_docker_release'
-  WEB_VERSION: latest
+  WEB_VERSION: rolling
   # 👇 关键修改：只保留 linux/amd64，删掉后面一长串
   RELEASE_PLATFORMS: 'linux/amd64'
   # 👇 关键修改：强制允许推送，不用管是不是 push 事件
