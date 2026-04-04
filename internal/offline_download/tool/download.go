@@ -32,6 +32,8 @@ type DownloadTask struct {
 	callStatusRetried int
 }
 
+var completedOfflineTaskCleanupDelay = time.Second
+
 func (t *DownloadTask) Run() error {
 	t.ClearEndTime()
 	t.SetStartTime(time.Now())
@@ -97,16 +99,12 @@ outer:
 	if t.tool.Name() == "ThunderX" {
 		return nil
 	}
-	if t.tool.Name() == "115 Cloud" {
-		// hack for 115
-		<-time.After(time.Second * 1)
+	if t.tool.Name() == "115 Cloud" || t.tool.Name() == "115 Open" {
+		<-time.After(completedOfflineTaskCleanupDelay)
 		err := t.tool.Remove(t)
 		if err != nil {
 			log.Errorln(err.Error())
 		}
-		return nil
-	}
-	if t.tool.Name() == "115 Open" {
 		return nil
 	}
 	if t.tool.Name() == "123 Open" {
@@ -147,10 +145,10 @@ func (t *DownloadTask) Update() (bool, error) {
 	if err != nil {
 		t.callStatusRetried++
 		log.Errorf("failed to get status of %s, retried %d times", t.ID, t.callStatusRetried)
+		if t.callStatusRetried > 10 {
+			return true, errors.Errorf("failed to get status of %s, retried %d times", t.ID, t.callStatusRetried)
+		}
 		return false, nil
-	}
-	if t.callStatusRetried > 5 {
-		return true, errors.Errorf("failed to get status of %s, retried %d times", t.ID, t.callStatusRetried)
 	}
 	t.callStatusRetried = 0
 	t.SetProgress(info.Progress)

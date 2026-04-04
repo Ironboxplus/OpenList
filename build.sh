@@ -18,6 +18,8 @@ if [[ "$*" == *"lite"* ]]; then
   useLite=true
 fi
 
+skipFrontendFetch="${SKIP_FRONTEND_FETCH:-false}"
+
 if [ "$1" = "dev" ]; then
   version="dev"
   webVersion="rolling"
@@ -29,6 +31,10 @@ else
   # Always true if there's no tag
   version=$(git describe --abbrev=0 --tags 2>/dev/null || echo "v0.0.0")
   webVersion=$(eval "curl -fsSL --max-time 2 $githubAuthArgs \"https://api.github.com/repos/$frontendRepo/releases/latest\"" | grep "tag_name" | head -n 1 | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')
+fi
+
+if [ -n "$WEB_VERSION" ]; then
+  webVersion="$WEB_VERSION"
 fi
 
 echo "backend version: $version"
@@ -48,7 +54,25 @@ ldflags="\
 -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=$webVersion' \
 "
 
+# Keep sqlite driver tag selection centralized to avoid target drift.
+GetBuildTagsForTarget() {
+  local target="$1"
+  case "$target" in
+    linux-loong64|linux-mips|linux-mips64|linux-mips64le|linux-mipsle|linux-musl-loong64|linux-musl-mips|linux-musl-mips64|linux-musl-mips64le|linux-musl-mipsle|windows-386|windows7-386|windows7-amd64)
+      echo "jsoniter,sqlite_cgo_compat"
+      ;;
+    *)
+      echo "jsoniter"
+      ;;
+  esac
+}
+
 FetchWebRolling() {
+  if [ "$skipFrontendFetch" = "true" ] && [ -n "$(find public/dist -mindepth 1 -print -quit 2>/dev/null)" ]; then
+    echo "using cached frontend dist from public/dist"
+    return 0
+  fi
+
   pre_release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/tags/rolling\"")
   pre_release_assets=$(echo "$pre_release_json" | jq -r '.assets[].browser_download_url')
   
@@ -62,6 +86,11 @@ FetchWebRolling() {
 }
 
 FetchWebRelease() {
+  if [ "$skipFrontendFetch" = "true" ] && [ -n "$(find public/dist -mindepth 1 -print -quit 2>/dev/null)" ]; then
+    echo "using cached frontend dist from public/dist"
+    return 0
+  fi
+
   release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/latest\"")
   release_assets=$(echo "$release_json" | jq -r '.assets[].browser_download_url')
   
@@ -110,6 +139,7 @@ BuildWin7() {
   # Build for both 386 and amd64 architectures
   for arch in "386" "amd64"; do
     echo "building for windows7-${arch}"
+    build_tags=$(GetBuildTagsForTarget "windows7-${arch}")
     export GOOS=windows
     export GOARCH=${arch}
     export CGO_ENABLED=1
@@ -124,7 +154,7 @@ BuildWin7() {
     fi
     
     # Use the patched Go compiler for Win7 compatibility
-    $(pwd)/go-win7/bin/go build -o "${1}-${arch}.exe" -ldflags="$ldflags" -tags=jsoniter .
+    $(pwd)/go-win7/bin/go build -o "${1}-${arch}.exe" -ldflags="$ldflags" -tags="$build_tags" .
   done
 }
 
@@ -186,18 +216,19 @@ BuildDockerMultiplatform() {
   docker_lflags="--extldflags '-static -fpic' $ldflags"
   export CGO_ENABLED=1
 
-  OS_ARCHES=(linux-amd64 linux-arm64 linux-386 linux-riscv64 linux-ppc64le linux-loong64) ## Disable linux-s390x builds
-  CGO_ARGS=(x86_64-linux-musl-gcc aarch64-linux-musl-gcc i486-linux-musl-gcc riscv64-linux-musl-gcc powerpc64le-linux-musl-gcc loongarch64-linux-musl-gcc) ## Disable s390x-linux-musl-gcc builds
+  OS_ARCHES=(linux-amd64) ## Disable linux-s390x builds
+  CGO_ARGS=(x86_64-linux-musl-gcc) ## Disable s390x-linux-musl-gcc builds
   for i in "${!OS_ARCHES[@]}"; do
     os_arch=${OS_ARCHES[$i]}
     cgo_cc=${CGO_ARGS[$i]}
     os=${os_arch%%-*}
     arch=${os_arch##*-}
+    build_tags=$(GetBuildTagsForTarget "$os_arch")
     export GOOS=$os
     export GOARCH=$arch
     export CC=${cgo_cc}
     echo "building for $os_arch"
-    go build -o build/$os/$arch/"$appName" -ldflags="$docker_lflags" -tags=jsoniter .
+    go build -o build/$os/$arch/"$appName" -ldflags="$docker_lflags" -tags="$build_tags" .
   done
 
   DOCKER_ARM_ARCHES=(linux-arm/v6 linux-arm/v7)
@@ -205,14 +236,14 @@ BuildDockerMultiplatform() {
   GO_ARM=(6 7)
   export GOOS=linux
   export GOARCH=arm
-  for i in "${!DOCKER_ARM_ARCHES[@]}"; do
-    docker_arch=${DOCKER_ARM_ARCHES[$i]}
-    cgo_cc=${CGO_ARGS[$i]}
-    export GOARM=${GO_ARM[$i]}
-    export CC=${cgo_cc}
-    echo "building for $docker_arch"
-    go build -o build/${docker_arch%%-*}/${docker_arch##*-}/"$appName" -ldflags="$docker_lflags" -tags=jsoniter .
-  done
+  # for i in "${!DOCKER_ARM_ARCHES[@]}"; do
+  #   docker_arch=${DOCKER_ARM_ARCHES[$i]}
+  #   cgo_cc=${CGO_ARGS[$i]}
+  #   export GOARM=${GO_ARM[$i]}
+  #   export CC=${cgo_cc}
+  #   echo "building for $docker_arch"
+  #   go build -o build/${docker_arch%%-*}/${docker_arch##*-}/"$appName" -ldflags="$docker_lflags" -tags=jsoniter .
+  # done
 }
 
 BuildRelease() {
@@ -237,6 +268,8 @@ BuildLoongGLIBC() {
   local target_abi="$2"
   local output_file="$1"
   local oldWorldGoVersion="1.25.0"
+  local loong_tags
+  loong_tags=$(GetBuildTagsForTarget "linux-loong64")
   
   if [ "$target_abi" = "abi1.0" ]; then
     echo building for linux-loong64-abi1.0
@@ -311,7 +344,7 @@ BuildLoongGLIBC() {
         CXX="$(pwd)/gcc8-loong64-abi1.0/bin/loongarch64-linux-gnu-g++" \
         CGO_ENABLED=1 \
         GOCACHE="$abi1_cache_dir" \
-        $(pwd)/go-loong64-abi1.0/bin/go build -a -o "$output_file" -ldflags="$ldflags" -tags=jsoniter .; then
+        $(pwd)/go-loong64-abi1.0/bin/go build -a -o "$output_file" -ldflags="$ldflags" -tags="$loong_tags" .; then
       echo "Error: Build failed with patched Go compiler"
       echo "Attempting retry with cache cleanup..."
       env GOCACHE="$abi1_cache_dir" $(pwd)/go-loong64-abi1.0/bin/go clean -cache
@@ -320,7 +353,7 @@ BuildLoongGLIBC() {
           CXX="$(pwd)/gcc8-loong64-abi1.0/bin/loongarch64-linux-gnu-g++" \
           CGO_ENABLED=1 \
           GOCACHE="$abi1_cache_dir" \
-          $(pwd)/go-loong64-abi1.0/bin/go build -a -o "$output_file" -ldflags="$ldflags" -tags=jsoniter .; then
+          $(pwd)/go-loong64-abi1.0/bin/go build -a -o "$output_file" -ldflags="$ldflags" -tags="$loong_tags" .; then
         echo "Error: Build failed again after cache cleanup"
         echo "Build environment details:"
         echo "GOOS=linux"
@@ -366,11 +399,11 @@ BuildLoongGLIBC() {
     
     # Use standard Go compiler for new-world build
     echo "Building with standard Go compiler for new-world ABI2.0..."
-    if ! go build -a -o "$output_file" -ldflags="$ldflags" -tags=jsoniter .; then
+    if ! go build -a -o "$output_file" -ldflags="$ldflags" -tags="$loong_tags" .; then
       echo "Error: Build failed with standard Go compiler"
       echo "Attempting retry with cache cleanup..."
       go clean -cache
-      if ! go build -a -o "$output_file" -ldflags="$ldflags" -tags=jsoniter .; then
+      if ! go build -a -o "$output_file" -ldflags="$ldflags" -tags="$loong_tags" .; then
         echo "Error: Build failed again after cache cleanup"
         echo "Build environment details:"
         echo "GOOS=$GOOS"
@@ -391,6 +424,7 @@ BuildReleaseLinuxMusl() {
   mkdir -p "build"
   muslflags="--extldflags '-static -fpic' $ldflags"
   BASE="https://github.com/OpenListTeam/musl-compilers/releases/latest/download/"
+  # Keep mips-family targets enabled; sqlite driver selection is handled by Go build tags.
   FILES=(x86_64-linux-musl-cross aarch64-linux-musl-cross mips-linux-musl-cross mips64-linux-musl-cross mips64el-linux-musl-cross mipsel-linux-musl-cross powerpc64le-linux-musl-cross s390x-linux-musl-cross loongarch64-linux-musl-cross)
   for i in "${FILES[@]}"; do
     url="${BASE}${i}.tgz"
@@ -403,12 +437,13 @@ BuildReleaseLinuxMusl() {
   for i in "${!OS_ARCHES[@]}"; do
     os_arch=${OS_ARCHES[$i]}
     cgo_cc=${CGO_ARGS[$i]}
+    build_tags=$(GetBuildTagsForTarget "$os_arch")
     echo building for ${os_arch}
     export GOOS=${os_arch%%-*}
     export GOARCH=${os_arch##*-}
     export CC=${cgo_cc}
     export CGO_ENABLED=1
-    go build -o ./build/$appName-$os_arch -ldflags="$muslflags" -tags=jsoniter .
+    go build -o ./build/$appName-$os_arch -ldflags="$muslflags" -tags="$build_tags" .
   done
 }
 
@@ -596,7 +631,11 @@ if [ "$buildType" = "dev" ]; then
   fi
 elif [ "$buildType" = "release" -o "$buildType" = "beta" ]; then
   if [ "$buildType" = "beta" ]; then
-    FetchWebRolling
+    if [ "$WEB_VERSION" = "latest" ]; then
+      FetchWebRelease
+    else
+      FetchWebRolling
+    fi
   else
     FetchWebRelease
   fi
