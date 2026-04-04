@@ -19,22 +19,21 @@ env:
   FRONTEND_REPO: ${{ vars.FRONTEND_REPO || 'OpenListTeam/OpenList-Frontend' }}
   IMAGE_NAME: openlist
   REGISTRY: ghcr.io
-  ARTIFACT_NAME: 'binaries_docker_release'
-  WEB_VERSION: rolling
+  ARTIFACT_NAME_PREFIX: 'binaries_docker_release'
   # 👇 关键修改：只保留 linux/amd64，删掉后面一长串
   RELEASE_PLATFORMS: 'linux/amd64'
   # 👇 关键修改：强制允许推送，不用管是不是 push 事件
   IMAGE_PUSH: 'true'
   # 👇 使用默认的前端仓库 (OpenListTeam/OpenList-Frontend)
   # FRONTEND_REPO: 'Ironboxplus/OpenList-Frontend'
-  IMAGE_TAGS_BETA: |
-    type=ref,event=pr
-    type=raw,value=beta-retry
 
 jobs:
   build_binary:
-    name: Build Binaries (x64 Only)
+    name: Build Binaries (x64, front-${{ matrix.frontend_channel }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        frontend_channel: ["latest", "rolling"]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,9 +49,10 @@ jobs:
         id: frontend-cache
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WEB_VERSION: ${{ matrix.frontend_channel }}
         run: |
           frontend_repo="${{ env.FRONTEND_REPO }}"
-          web_version="${{ env.WEB_VERSION }}"
+          web_version="$WEB_VERSION"
           github_auth_args=()
 
           if [ -n "$GH_TOKEN" ]; then
@@ -96,52 +96,53 @@ jobs:
         run: bash build.sh beta docker-multiplatform
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          WEB_VERSION: ${{ env.WEB_VERSION }}
+          WEB_VERSION: ${{ matrix.frontend_channel }}
           FRONTEND_REPO: ${{ env.FRONTEND_REPO }}
           SKIP_FRONTEND_FETCH: ${{ steps.cache-frontend.outputs.cache-hit == 'true' && 'true' || 'false' }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_NAME }}
+          name: ${{ env.ARTIFACT_NAME_PREFIX }}-${{ matrix.frontend_channel }}
           overwrite: true
           path: build/linux/amd64/openlist
 
   release_docker:
     needs: build_binary
-    name: Release Docker (x64)
+    name: Release Docker (x64, front-${{ matrix.frontend_channel }})
     runs-on: ubuntu-latest
     permissions:
       packages: write
     strategy:
       matrix:
+        frontend_channel: ["latest", "rolling"]
         # 构建所有变体
         image: ["latest", "ffmpeg", "aria2", "aio"]
         include:
           - image: "latest"
             base_image_tag: "base"
             build_arg: ""
-            tag_favor: ""
+            image_tag_suffix: ""
           - image: "ffmpeg"
             base_image_tag: "ffmpeg"
             build_arg: INSTALL_FFMPEG=true
-            tag_favor: "suffix=-ffmpeg,onlatest=true"
+            image_tag_suffix: "-ffmpeg"
           - image: "aria2"
             base_image_tag: "aria2"
             build_arg: INSTALL_ARIA2=true
-            tag_favor: "suffix=-aria2,onlatest=true"
+            image_tag_suffix: "-aria2"
           - image: "aio"
             base_image_tag: "aio"
             build_arg: |
               INSTALL_FFMPEG=true
               INSTALL_ARIA2=true
-            tag_favor: "suffix=-aio,onlatest=true"
+            image_tag_suffix: "-aio"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_NAME }}
+          name: ${{ env.ARTIFACT_NAME_PREFIX }}-${{ matrix.frontend_channel }}
           path: 'build/linux/amd64'
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -160,8 +161,9 @@ jobs:
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.GHCR_ORG_NAME }}/${{ env.IMAGE_NAME }}
-          tags: ${{ env.IMAGE_TAGS_BETA }}
-          flavor: ${{ matrix.tag_favor }}
+          tags: |
+            type=raw,value=front-${{ matrix.frontend_channel }}${{ matrix.image_tag_suffix }}
+            type=raw,value=latest,enable=${{ matrix.frontend_channel == 'latest' && matrix.image == 'latest' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -175,5 +177,5 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           platforms: ${{ env.RELEASE_PLATFORMS }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.GHCR_ORG_NAME }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.image }}
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.GHCR_ORG_NAME }}/${{ env.IMAGE_NAME }}:buildcache-${{ matrix.image }},mode=max
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.GHCR_ORG_NAME }}/${{ env.IMAGE_NAME }}:buildcache-front-${{ matrix.frontend_channel }}-${{ matrix.image }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.GHCR_ORG_NAME }}/${{ env.IMAGE_NAME }}:buildcache-front-${{ matrix.frontend_channel }}-${{ matrix.image }},mode=max
