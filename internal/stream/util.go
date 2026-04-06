@@ -477,6 +477,9 @@ func ReadFullWithRangeRead(file model.FileStreamer, buf []byte, off int64) (int,
 	for retry := 0; retry < MAX_RANGE_READ_RETRY_COUNT; retry++ {
 		reader, err := file.RangeRead(http_range.Range{Start: off, Length: length})
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return 0, err
+			}
 			lastErr = fmt.Errorf("RangeRead failed at offset %d: %w", off, err)
 			log.Debugf("RangeRead retry %d failed: %v", retry+1, lastErr)
 			// 快速重试：1秒、2秒、3秒、4秒、5秒（连接失败快速重试）
@@ -491,6 +494,10 @@ func ReadFullWithRangeRead(file model.FileStreamer, buf []byte, off int64) (int,
 
 		if err == nil {
 			return n, nil
+		}
+
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return n, err
 		}
 
 		lastErr = fmt.Errorf("failed to read all data via RangeRead at offset %d: (expect=%d, actual=%d) %w", off, length, n, err)
@@ -610,6 +617,7 @@ func NewStreamSectionReader(file model.FileStreamer, maxBufferSize int, up *mode
 	}
 
 	file.Add(utils.CloseFunc(func() error {
+		ss.clearPrefetch()
 		ss.bufPool.Reset()
 		return nil
 	}))
@@ -686,6 +694,116 @@ type directSectionReader struct {
 	file       model.FileStreamer
 	fileOffset int64
 	bufPool    *pool.Pool[[]byte]
+	prefetchMu sync.Mutex
+	prefetch   *sectionPrefetchTask
+}
+
+type sectionPrefetchTask struct {
+	off    int64
+	length int64
+	buf    []byte
+	n      int
+	err    error
+	ready  chan struct{}
+}
+
+func (ss *directSectionReader) recyclePrefetchTask(task *sectionPrefetchTask) {
+	if task == nil || task.buf == nil {
+		return
+	}
+	ss.bufPool.Put(task.buf[0:cap(task.buf)])
+	task.buf = nil
+}
+
+func (ss *directSectionReader) clearPrefetch() {
+	ss.prefetchMu.Lock()
+	task := ss.prefetch
+	ss.prefetch = nil
+	ss.prefetchMu.Unlock()
+	if task == nil {
+		return
+	}
+	go func(t *sectionPrefetchTask) {
+		<-t.ready
+		ss.recyclePrefetchTask(t)
+	}(task)
+}
+
+func (ss *directSectionReader) takeMatchingPrefetch(off, length int64) *sectionPrefetchTask {
+	ss.prefetchMu.Lock()
+	task := ss.prefetch
+	if task != nil && task.off == off && task.length == length {
+		ss.prefetch = nil
+		ss.prefetchMu.Unlock()
+		return task
+	}
+	ss.prefetch = nil
+	ss.prefetchMu.Unlock()
+	if task != nil {
+		go func(t *sectionPrefetchTask) {
+			<-t.ready
+			ss.recyclePrefetchTask(t)
+		}(task)
+	}
+	return nil
+}
+
+func (ss *directSectionReader) launchPrefetch(off, length int64) {
+	if length <= 0 {
+		return
+	}
+	tempBuf := ss.bufPool.Get()
+	if int64(cap(tempBuf)) < length {
+		tempBuf = make([]byte, length)
+	}
+	task := &sectionPrefetchTask{
+		off:    off,
+		length: length,
+		buf:    tempBuf,
+		ready:  make(chan struct{}),
+	}
+
+	ss.prefetchMu.Lock()
+	old := ss.prefetch
+	ss.prefetch = task
+	ss.prefetchMu.Unlock()
+
+	if old != nil {
+		go func(t *sectionPrefetchTask) {
+			<-t.ready
+			ss.recyclePrefetchTask(t)
+		}(old)
+	}
+
+	go func(t *sectionPrefetchTask) {
+		buf := t.buf[:int(t.length)]
+		n, err := ReadFullWithRangeRead(ss.file, buf, t.off)
+		if err != nil {
+			t.err = fmt.Errorf("RangeRead failed at offset %d: (expect=%d, actual=%d) %w", t.off, t.length, n, err)
+		} else if int64(n) != t.length {
+			t.err = fmt.Errorf("RangeRead failed at offset %d: (expect=%d, actual=%d)", t.off, t.length, n)
+		} else {
+			t.n = n
+		}
+		close(t.ready)
+	}(task)
+}
+
+func (ss *directSectionReader) scheduleNextPrefetch(curOff, curLen int64) {
+	if _, ok := ss.file.(*SeekableStream); !ok {
+		return
+	}
+	nextOff := curOff + curLen
+	if nextOff >= ss.file.GetSize() {
+		ss.clearPrefetch()
+		return
+	}
+	nextLen := min(curLen, ss.file.GetSize()-nextOff)
+	if nextLen <= 0 {
+		ss.clearPrefetch()
+		return
+	}
+	ss.launchPrefetch(nextOff, nextLen)
 }
 
 // 线程不安全（依赖调用方保证串行调用）
@@ -694,6 +812,7 @@ type directSectionReader struct {
 func (ss *directSectionReader) DiscardSection(off int64, length int64) error {
 	// 对于 SeekableStream，直接跳过（RangeRead 支持随机访问，不需要实际读取）
 	if _, ok := ss.file.(*SeekableStream); ok {
+		ss.clearPrefetch()
 		return nil
 	}
 
@@ -719,27 +838,43 @@ type bufferSectionReader struct {
 // 对于 FileStream：必须顺序读取
 func (ss *directSectionReader) GetSectionReader(off, length int64) (io.ReadSeeker, error) {
 	tempBuf := ss.bufPool.Get()
-	buf := tempBuf[:length]
+	if int64(cap(tempBuf)) < length {
+		tempBuf = make([]byte, length)
+	}
+	buf := tempBuf[:int(length)]
 
 	// 对于 SeekableStream，直接使用 RangeRead（支持随机访问，适用于续传场景）
 	if _, ok := ss.file.(*SeekableStream); ok {
+		if task := ss.takeMatchingPrefetch(off, length); task != nil {
+			<-task.ready
+			if task.err != nil {
+				ss.recyclePrefetchTask(task)
+				ss.recyclePrefetchTask(&sectionPrefetchTask{buf: tempBuf})
+				return nil, task.err
+			}
+			ss.recyclePrefetchTask(&sectionPrefetchTask{buf: tempBuf})
+			ss.scheduleNextPrefetch(off, length)
+			return &bufferSectionReader{bytes.NewReader(task.buf[:int(length)]), task.buf}, nil
+		}
+
 		n, err := ReadFullWithRangeRead(ss.file, buf, off)
 		if err != nil {
-			ss.bufPool.Put(tempBuf)
+			ss.recyclePrefetchTask(&sectionPrefetchTask{buf: tempBuf})
 			return nil, fmt.Errorf("RangeRead failed at offset %d: (expect=%d, actual=%d) %w", off, length, n, err)
 		}
+		ss.scheduleNextPrefetch(off, length)
 		return &bufferSectionReader{bytes.NewReader(buf), tempBuf}, nil
 	}
 
 	// 对于 FileStream，必须顺序读取
 	if off != ss.fileOffset {
-		ss.bufPool.Put(tempBuf)
+		ss.recyclePrefetchTask(&sectionPrefetchTask{buf: tempBuf})
 		return nil, fmt.Errorf("stream not cached: request offset %d != current offset %d", off, ss.fileOffset)
 	}
 
 	n, err := io.ReadFull(ss.file, buf)
 	if err != nil {
-		ss.bufPool.Put(tempBuf)
+		ss.recyclePrefetchTask(&sectionPrefetchTask{buf: tempBuf})
 		return nil, fmt.Errorf("sequential read failed at offset %d: (expect=%d, actual=%d) %w", off, length, n, err)
 	}
 
