@@ -343,20 +343,21 @@ func matchRecycleBinEntry(obj *Obj, files map[string]sdk.RbListResp_FileInfo) *s
 			matched := entry
 			return &matched
 		}
+		cid := string(entry.CID)
 		if obj.IsDir() {
-			if entry.FileName == obj.GetName() && entry.CID == obj.Pid {
+			if entry.FileName == obj.GetName() && cid == obj.Pid {
 				matched := entry
 				return &matched
 			}
 			continue
 		}
 		if obj.Sha1 != "" && entry.SHA1 != "" && strings.EqualFold(entry.SHA1, obj.Sha1) {
-			if entry.FileName == obj.GetName() || entry.CID == obj.Pid {
+			if entry.FileName == obj.GetName() || cid == obj.Pid {
 				matched := entry
 				return &matched
 			}
 		}
-		if entry.FileName == obj.GetName() && entry.CID == obj.Pid && entry.FileSize == size {
+		if entry.FileName == obj.GetName() && cid == obj.Pid && entry.FileSize == size {
 			matched := entry
 			return &matched
 		}
