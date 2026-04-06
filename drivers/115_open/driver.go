@@ -29,6 +29,12 @@ type Open115 struct {
 	limiter *rate.Limiter
 }
 
+var (
+	// 回收站列表存在短暂最终一致性延迟，永久删除 fallback 查找增加短重试。
+	recycleBinLookupMaxAttempts = 4
+	recycleBinLookupRetryDelay  = 300 * time.Millisecond
+)
+
 func (d *Open115) Config() driver.Config {
 	return config
 }
@@ -270,7 +276,7 @@ func (d *Open115) removePermanently(ctx context.Context, obj *Obj, deleteResp []
 		}
 	}
 
-	recycleEntry, err := d.findRecycleBinEntry(ctx, obj)
+	recycleEntry, err := d.findRecycleBinEntryWithRetry(ctx, obj)
 	if err != nil {
 		if directDeleteErr != nil {
 			return fmt.Errorf("failed to permanently delete recycle-bin candidate: %w; fallback lookup failed: %v", directDeleteErr, err)
@@ -326,6 +332,45 @@ func (d *Open115) findRecycleBinEntry(ctx context.Context, obj *Obj) (*sdk.RbLis
 	}
 
 	return nil, fmt.Errorf("recycle bin entry not found for object id=%s name=%s parent=%s", obj.GetID(), obj.GetName(), obj.Pid)
+}
+
+func isRecycleBinEntryNotFoundErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "recycle bin entry not found")
+}
+
+func (d *Open115) findRecycleBinEntryWithRetry(ctx context.Context, obj *Obj) (*sdk.RbListResp_FileInfo, error) {
+	attempts := recycleBinLookupMaxAttempts
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		entry, err := d.findRecycleBinEntry(ctx, obj)
+		if err == nil {
+			return entry, nil
+		}
+
+		lastErr = err
+		if !isRecycleBinEntryNotFoundErr(err) || i == attempts-1 {
+			break
+		}
+
+		wait := recycleBinLookupRetryDelay * time.Duration(i+1)
+		if wait <= 0 {
+			continue
+		}
+
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+
+	return nil, lastErr
 }
 
 func matchRecycleBinEntry(obj *Obj, files map[string]sdk.RbListResp_FileInfo) *sdk.RbListResp_FileInfo {

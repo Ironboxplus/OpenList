@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	sdk "github.com/OpenListTeam/115-sdk-go"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
@@ -534,4 +535,105 @@ func TestOpen115RemoveDeleteWithStringCIDStillWorks(t *testing.T) {
 
 	assertRequestPaths(t, requests(), "/open/ufile/delete", "/open/rb/del", "/open/rb/list", "/open/rb/del")
 	assertFormValue(t, requests()[3].Form, "tid", "rb-123")
+}
+
+func TestOpen115RemoveDeleteRetriesRecycleBinLookupUntilVisible(t *testing.T) {
+	oldAttempts, oldDelay := recycleBinLookupMaxAttempts, recycleBinLookupRetryDelay
+	recycleBinLookupMaxAttempts = 3
+	recycleBinLookupRetryDelay = time.Millisecond
+	t.Cleanup(func() {
+		recycleBinLookupMaxAttempts = oldAttempts
+		recycleBinLookupRetryDelay = oldDelay
+	})
+
+	rbListCalls := 0
+	driver, requests := newTestOpen115(t, "delete", func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open/ufile/delete":
+			writeSDKSuccess(t, w, []string{"file-1"})
+		case "/open/rb/del":
+			if r.FormValue("tid") == "file-1" {
+				writeSDKError(t, w, 404, "not found")
+				return
+			}
+			writeSDKSuccess(t, w, []string{"rb-123"})
+		case "/open/rb/list":
+			rbListCalls++
+			if rbListCalls < 3 {
+				writeSDKSuccess(t, w, map[string]any{
+					"offset":  0,
+					"limit":   1,
+					"count":   "0",
+					"rb_pass": 0,
+				})
+				return
+			}
+			writeSDKSuccess(t, w, map[string]any{
+				"offset":  0,
+				"limit":   1,
+				"count":   "1",
+				"rb_pass": 0,
+				"rb-123": map[string]any{
+					"id":        "rb-123",
+					"file_name": "demo.txt",
+					"cid":       "dir-1",
+					"sha1":      "sha-demo",
+					"file_size": "123",
+				},
+			})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	})
+
+	obj := &Obj{Fid: "file-1", Pid: "dir-1", Fn: "demo.txt", Fc: "1", FS: 123, Sha1: "sha-demo"}
+	if err := driver.Remove(context.Background(), obj); err != nil {
+		t.Fatalf("Remove returned error: %v", err)
+	}
+
+	if rbListCalls != 3 {
+		t.Fatalf("rbListCalls = %d, want 3", rbListCalls)
+	}
+	assertRequestPaths(t, requests(), "/open/ufile/delete", "/open/rb/del", "/open/rb/list", "/open/rb/list", "/open/rb/list", "/open/rb/del")
+	assertFormValue(t, requests()[5].Form, "tid", "rb-123")
+}
+
+func TestOpen115RemoveDeleteStopsRetryWhenContextCancelled(t *testing.T) {
+	oldAttempts, oldDelay := recycleBinLookupMaxAttempts, recycleBinLookupRetryDelay
+	recycleBinLookupMaxAttempts = 5
+	recycleBinLookupRetryDelay = 50 * time.Millisecond
+	t.Cleanup(func() {
+		recycleBinLookupMaxAttempts = oldAttempts
+		recycleBinLookupRetryDelay = oldDelay
+	})
+
+	driver, _ := newTestOpen115(t, "delete", func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open/ufile/delete":
+			writeSDKSuccess(t, w, []string{"file-1"})
+		case "/open/rb/del":
+			writeSDKError(t, w, 404, "not found")
+		case "/open/rb/list":
+			writeSDKSuccess(t, w, map[string]any{
+				"offset":  0,
+				"limit":   1,
+				"count":   "0",
+				"rb_pass": 0,
+			})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+
+	obj := &Obj{Fid: "file-1", Pid: "dir-1", Fn: "demo.txt", Fc: "1", FS: 123, Sha1: "sha-demo"}
+	err := driver.Remove(ctx, obj)
+	if err == nil {
+		t.Fatalf("expected Remove to fail due to context cancellation")
+	}
+	if !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+		t.Fatalf("expected context deadline exceeded, got: %v", err)
+	}
 }
