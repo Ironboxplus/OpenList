@@ -2,7 +2,7 @@
 .DS_Store
 output/
 /dist/
-
+.omx
 # Binaries for programs and plugins
 *.exe
 *.exe~
