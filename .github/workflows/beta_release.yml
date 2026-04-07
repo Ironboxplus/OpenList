@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -48,7 +48,7 @@ jobs:
           tag_name: beta
 
       - name: Upload assets to github artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: beta changelog
           path: ${{ github.workspace }}/CHANGELOG.md
@@ -105,12 +105,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: "1.25.0"
 
@@ -182,7 +182,7 @@ jobs:
           echo "cleaned_target=$CLEANED_TARGET" >> $GITHUB_ENV
 
       - name: Upload assets to github artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: beta builds for ${{ env.cleaned_target }}
           path: ${{ github.workspace }}/build/compress/*
