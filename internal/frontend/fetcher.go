@@ -84,6 +84,117 @@ type githubRelease struct {
 	PublishedAt string `json:"published_at"`
 }
 
+type githubRef struct {
+	Object struct {
+		Type string `json:"type"`
+		SHA  string `json:"sha"`
+	} `json:"object"`
+}
+
+type githubAnnotatedTag struct {
+	Object struct {
+		Type string `json:"type"`
+		SHA  string `json:"sha"`
+	} `json:"object"`
+}
+
+func shortHash(sha string) string {
+	const shortLen = 12
+	if len(sha) > shortLen {
+		return sha[:shortLen]
+	}
+	return sha
+}
+
+func versionIdentifier(tag, commitSHA, fallback string) string {
+	if strings.TrimSpace(commitSHA) != "" {
+		return fmt.Sprintf("%s@%s", tag, shortHash(commitSHA))
+	}
+	if strings.TrimSpace(fallback) != "" {
+		return fallback
+	}
+	return tag
+}
+
+func resolveTagCommitSHA(ctx context.Context, client *http.Client, baseURL, tag string) (string, error) {
+	if strings.TrimSpace(tag) == "" {
+		return "", fmt.Errorf("empty tag")
+	}
+
+	apiBase := "https://api.github.com"
+	if baseURL != "" {
+		apiBase = strings.TrimRight(baseURL, "/")
+	}
+
+	refURL := fmt.Sprintf("%s/repos/%s/git/ref/tags/%s", apiBase, frontendRepo, url.PathEscape(tag))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, refURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("create ref request: %w", err)
+	}
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	req.Header.Set("User-Agent", "OpenList")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("fetch tag ref: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("tag ref API returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var ref githubRef
+	if err := json.NewDecoder(resp.Body).Decode(&ref); err != nil {
+		return "", fmt.Errorf("decode ref JSON: %w", err)
+	}
+
+	switch ref.Object.Type {
+	case "commit":
+		if ref.Object.SHA == "" {
+			return "", fmt.Errorf("empty commit sha in ref response")
+		}
+		return ref.Object.SHA, nil
+	case "tag":
+		if ref.Object.SHA == "" {
+			return "", fmt.Errorf("empty tag sha in ref response")
+		}
+		tagObjURL := fmt.Sprintf("%s/repos/%s/git/tags/%s", apiBase, frontendRepo, ref.Object.SHA)
+		tagReq, err := http.NewRequestWithContext(ctx, http.MethodGet, tagObjURL, nil)
+		if err != nil {
+			return "", fmt.Errorf("create tag object request: %w", err)
+		}
+		tagReq.Header.Set("Accept", "application/vnd.github.v3+json")
+		tagReq.Header.Set("User-Agent", "OpenList")
+
+		tagResp, err := client.Do(tagReq)
+		if err != nil {
+			return "", fmt.Errorf("fetch tag object: %w", err)
+		}
+		defer tagResp.Body.Close()
+
+		if tagResp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(tagResp.Body)
+			return "", fmt.Errorf("tag object API returned %d: %s", tagResp.StatusCode, string(body))
+		}
+
+		var tagObj githubAnnotatedTag
+		if err := json.NewDecoder(tagResp.Body).Decode(&tagObj); err != nil {
+			return "", fmt.Errorf("decode tag object JSON: %w", err)
+		}
+		if tagObj.Object.SHA == "" {
+			return "", fmt.Errorf("empty object sha in tag object response")
+		}
+		return tagObj.Object.SHA, nil
+	default:
+		if ref.Object.SHA == "" {
+			return "", fmt.Errorf("unsupported ref object type %q with empty sha", ref.Object.Type)
+		}
+		return ref.Object.SHA, nil
+	}
+}
+
 // fetchFromTag downloads frontend dist from a GitHub release tag.
 // If baseURL is non-empty, it replaces api.github.com (used for testing).
 func fetchFromTag(ctx context.Context, tag string, baseURL string) (*FetchResult, error) {
@@ -140,30 +251,38 @@ func fetchFromTag(ctx context.Context, tag string, baseURL string) (*FetchResult
 		return nil, fmt.Errorf("no frontend dist tarball found in release %s", release.TagName)
 	}
 
-	// Use the asset URL as version identifier (includes build hash that changes per build).
-	// For rolling releases the tag name is always "rolling", so tag comparison never detects updates.
+	commitSHA, err := resolveTagCommitSHA(ctx, client, baseURL, release.TagName)
+	if err != nil {
+		utils.Log.Warnf("[frontend] failed to resolve tag %s hash: %v", release.TagName, err)
+	}
+
+	resolvedVersion := versionIdentifier(release.TagName, commitSHA, tarURL)
+
+	// Use tag+commit-hash as the primary version identifier.
+	// For rolling releases the tag itself is static, but its target commit moves.
+	// If hash resolve fails, fallback to tarball URL so updates can still be detected.
 	currentVersion := ReadCurrentVersion()
-	if currentVersion == tarURL && HasValidDist() {
-		utils.Log.Infof("[frontend] version %s already cached, skipping download", release.TagName)
+	if currentVersion == resolvedVersion && HasValidDist() {
+		utils.Log.Infof("[frontend] version %s already cached, skipping download", resolvedVersion)
 		return &FetchResult{
-			Version:    release.TagName,
+			Version:    resolvedVersion,
 			Downloaded: false,
 			DistPath:   filepath.Join(GetDistPath(), distDirName),
 		}, nil
 	}
 
-	utils.Log.Infof("[frontend] downloading version %s from %s", release.TagName, tarURL)
+	utils.Log.Infof("[frontend] downloading version %s from %s", resolvedVersion, tarURL)
 	if err := downloadAndExtract(ctx, client, tarURL); err != nil {
 		return nil, fmt.Errorf("download and extract: %w", err)
 	}
 
-	if err := writeVersion(tarURL); err != nil {
+	if err := writeVersion(resolvedVersion); err != nil {
 		utils.Log.Warnf("[frontend] failed to write version file: %v", err)
 	}
 
-	utils.Log.Infof("[frontend] successfully fetched version %s", release.TagName)
+	utils.Log.Infof("[frontend] successfully fetched version %s", resolvedVersion)
 	return &FetchResult{
-		Version:    release.TagName,
+		Version:    resolvedVersion,
 		Downloaded: true,
 		DistPath:   filepath.Join(GetDistPath(), distDirName),
 	}, nil

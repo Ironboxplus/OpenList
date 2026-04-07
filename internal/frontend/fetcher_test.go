@@ -6,10 +6,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -189,6 +191,15 @@ func TestFetchFromRollingIntegration(t *testing.T) {
 					"browser_download_url": "%s/download/frontend.tar.gz"
 				}]
 			}`, ts.URL)))
+		case "/repos/OpenListTeam/OpenList-Frontend/git/ref/tags/rolling-test":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			w.Write([]byte(`{
+				"object": {
+					"type": "commit",
+					"sha": "0123456789abcdef0123456789abcdef01234567"
+				}
+			}`))
 		case "/download/frontend.tar.gz":
 			w.Header().Set("Content-Type", "application/gzip")
 			w.WriteHeader(200)
@@ -211,8 +222,8 @@ func TestFetchFromRollingIntegration(t *testing.T) {
 		t.Fatalf("fetchFromTag: %v", err)
 	}
 
-	if result.Version != "rolling-test" {
-		t.Errorf("version: got %q, want %q", result.Version, "rolling-test")
+	if result.Version != "rolling-test@0123456789ab" {
+		t.Errorf("version: got %q, want %q", result.Version, "rolling-test@0123456789ab")
 	}
 	if !result.Downloaded {
 		t.Error("expected Downloaded=true")
@@ -227,9 +238,117 @@ func TestFetchFromRollingIntegration(t *testing.T) {
 	}
 
 	ver := ReadCurrentVersion()
-	expectedVer := ts.URL + "/download/frontend.tar.gz"
+	expectedVer := "rolling-test@0123456789ab"
 	if ver != expectedVer {
 		t.Errorf("version file: got %q, want %q", ver, expectedVer)
+	}
+}
+
+func TestResolveTagCommitSHA_AnnotatedTag(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/OpenListTeam/OpenList-Frontend/git/ref/tags/rolling":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{
+				"object": {
+					"type": "tag",
+					"sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+				}
+			}`))
+		case "/repos/OpenListTeam/OpenList-Frontend/git/tags/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{
+				"object": {
+					"type": "commit",
+					"sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+				}
+			}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	sha, err := resolveTagCommitSHA(context.Background(), ts.Client(), ts.URL, "rolling")
+	if err != nil {
+		t.Fatalf("resolveTagCommitSHA: %v", err)
+	}
+	if sha != "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
+		t.Fatalf("sha: got %q, want %q", sha, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+	}
+}
+
+func TestVersionIdentifierFallback(t *testing.T) {
+	tests := []struct {
+		name     string
+		tag      string
+		sha      string
+		fallback string
+		want     string
+	}{
+		{name: "hash preferred", tag: "rolling", sha: "0123456789abcdef", fallback: "fallback", want: "rolling@0123456789ab"},
+		{name: "fallback url", tag: "rolling", sha: "", fallback: "http://example.com/dist.tar.gz", want: "http://example.com/dist.tar.gz"},
+		{name: "tag only", tag: "rolling", sha: "", fallback: "", want: "rolling"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := versionIdentifier(tt.tag, tt.sha, tt.fallback)
+			if got != tt.want {
+				t.Fatalf("versionIdentifier() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveTagCommitSHA_RealGitHubWithProxy10808(t *testing.T) {
+	if os.Getenv("OPENLIST_REAL_GITHUB_TEST") != "1" {
+		t.Skip("set OPENLIST_REAL_GITHUB_TEST=1 to run real GitHub integration test (proxy 127.0.0.1:10808 recommended)")
+	}
+
+	if os.Getenv("HTTP_PROXY") == "" && os.Getenv("http_proxy") == "" {
+		_ = os.Setenv("HTTP_PROXY", "http://127.0.0.1:10808")
+	}
+	if os.Getenv("HTTPS_PROXY") == "" && os.Getenv("https_proxy") == "" {
+		_ = os.Setenv("HTTPS_PROXY", "http://127.0.0.1:10808")
+	}
+
+	client := newHTTPClient()
+	sha, err := resolveTagCommitSHA(context.Background(), client, "", "rolling")
+	if err != nil {
+		t.Fatalf("resolveTagCommitSHA(real): %v", err)
+	}
+
+	matched, _ := regexp.MatchString("^[0-9a-f]{40}$", sha)
+	if !matched {
+		t.Fatalf("sha format invalid: %q", sha)
+	}
+
+	// Optional sanity: ensure API can fetch release JSON in real scenario
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://api.github.com/repos/OpenListTeam/OpenList-Frontend/releases/tags/rolling", nil)
+	if err != nil {
+		t.Fatalf("create release request: %v", err)
+	}
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+	req.Header.Set("User-Agent", "OpenList")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("fetch release: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("release API status=%d body=%s", resp.StatusCode, string(body))
+	}
+
+	var release map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+		t.Fatalf("decode release: %v", err)
+	}
+	if release["tag_name"] == nil {
+		t.Fatalf("release tag_name missing")
 	}
 }
 
