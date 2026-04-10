@@ -2,6 +2,12 @@ name: Beta Release (Docker)
 
 on:
   workflow_dispatch:
+    inputs:
+      frontend_repo:
+        description: 'Frontend repo, e.g. Ironboxplus/OpenList-Frontend'
+        required: false
+        default: 'OpenListTeam/OpenList-Frontend'
+        type: string
   push:
     branches:
       - main
@@ -16,6 +22,7 @@ concurrency:
 env:
   DOCKERHUB_ORG_NAME: ${{ vars.DOCKERHUB_ORG_NAME || 'openlistteam' }}
   GHCR_ORG_NAME: ${{ vars.GHCR_ORG_NAME || 'openlistteam' }}
+  FRONTEND_REPO: ${{ github.event.inputs.frontend_repo || vars.FRONTEND_REPO || 'OpenListTeam/OpenList-Frontend' }}
   IMAGE_NAME: openlist-git
   IMAGE_NAME_DOCKERHUB: openlist
   REGISTRY: ghcr.io
@@ -55,7 +62,7 @@ jobs:
         run: bash build.sh beta docker-multiplatform
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          FRONTEND_REPO: ${{ vars.FRONTEND_REPO }}
+          FRONTEND_REPO: ${{ env.FRONTEND_REPO }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
