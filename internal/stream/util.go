@@ -9,6 +9,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
@@ -21,13 +24,298 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const (
+	// 链接刷新相关常量
+	MAX_LINK_REFRESH_COUNT = 50 // 下载链接最大刷新次数（支持长时间传输）
+
+	// RangeRead 重试相关常量
+	MAX_RANGE_READ_RETRY_COUNT = 5 // RangeRead 最大重试次数（从3增加到5）
+)
+
 type RangeReaderFunc func(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error)
 
 func (f RangeReaderFunc) RangeRead(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
 	return f(ctx, httpRange)
 }
 
+// IsLinkExpiredError checks if the error indicates an expired download link
+func IsLinkExpiredError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// Don't treat context cancellation as link expiration
+	// This happens when user pauses/seeks video or cancels download
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	errStr := strings.ToLower(err.Error())
+
+	// Common expired link error keywords
+	expiredKeywords := []string{
+		"expired", "invalid signature", "token expired",
+		"access denied", "forbidden", "unauthorized",
+		"link has expired", "url expired", "request has expired",
+		"signature expired", "accessdenied", "invalidtoken",
+	}
+	for _, keyword := range expiredKeywords {
+		if strings.Contains(errStr, keyword) {
+			return true
+		}
+	}
+
+	// Check for HTTP status codes that typically indicate expired links
+	if statusErr, ok := errs.UnwrapOrSelf(err).(net.HttpStatusCodeError); ok {
+		code := int(statusErr)
+		// All 4xx client errors may indicate expired/invalid links
+		// 400 Bad Request, 401 Unauthorized, 403 Forbidden, 404 Not Found, 410 Gone, etc.
+		if code >= 400 && code < 500 {
+			return true
+		}
+	}
+
+	return false
+}
+
+// RefreshableRangeReader wraps a RangeReader with link refresh capability
+type RefreshableRangeReader struct {
+	link         *model.Link
+	size         int64
+	innerReader  model.RangeReaderIF
+	mu           sync.Mutex
+	refreshCount int // track refresh count to avoid infinite loops
+}
+
+// NewRefreshableRangeReader creates a new RefreshableRangeReader
+func NewRefreshableRangeReader(link *model.Link, size int64) *RefreshableRangeReader {
+	return &RefreshableRangeReader{
+		link: link,
+		size: size,
+	}
+}
+
+func (r *RefreshableRangeReader) getInnerReader() (model.RangeReaderIF, error) {
+	if r.innerReader != nil {
+		return r.innerReader, nil
+	}
+
+	// Create inner reader without Refresher to avoid recursion
+	linkCopy := *r.link
+	linkCopy.Refresher = nil
+
+	reader, err := GetRangeReaderFromLink(r.size, &linkCopy)
+	if err != nil {
+		return nil, err
+	}
+	r.innerReader = reader
+	return reader, nil
+}
+
+func (r *RefreshableRangeReader) RangeRead(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
+	r.mu.Lock()
+	reader, err := r.getInnerReader()
+	r.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	rc, err := reader.RangeRead(ctx, httpRange)
+	if err != nil {
+		// Check if we should try to refresh on initial connection error
+		if IsLinkExpiredError(err) && r.link.Refresher != nil {
+			rc, err = r.refreshAndRetry(ctx, httpRange)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// Wrap the ReadCloser with self-healing capability to detect 0-byte reads
+	// This handles cases where cloud providers return 200 OK but empty body for expired links
+	return &selfHealingReadCloser{
+		ReadCloser: rc,
+		refresher:  r,
+		ctx:        ctx,
+		httpRange:  httpRange,
+		firstRead:  false,
+		closed:     false,
+	}, nil
+}
+
+func (r *RefreshableRangeReader) refreshAndRetry(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if err := r.doRefreshLocked(ctx); err != nil {
+		return nil, err
+	}
+
+	reader, err := r.getInnerReader()
+	if err != nil {
+		return nil, err
+	}
+	return reader.RangeRead(ctx, httpRange)
+}
+
+// doRefreshLocked 执行实际的刷新逻辑（需要持有锁）
+func (r *RefreshableRangeReader) doRefreshLocked(ctx context.Context) error {
+	if r.refreshCount >= MAX_LINK_REFRESH_COUNT {
+		return fmt.Errorf("max refresh attempts (%d) reached", MAX_LINK_REFRESH_COUNT)
+	}
+
+	log.Infof("Link expired, attempting to refresh...")
+	// Use independent context for refresh to prevent cancellation from affecting link refresh
+	refreshCtx := context.WithoutCancel(ctx)
+	newLink, _, refreshErr := r.link.Refresher(refreshCtx)
+	if refreshErr != nil {
+		return fmt.Errorf("failed to refresh link: %w", refreshErr)
+	}
+
+	newLink.Refresher = r.link.Refresher
+	r.link = newLink
+	r.innerReader = nil
+	r.refreshCount++
+
+	log.Infof("Link refreshed successfully")
+	return nil
+}
+
+// selfHealingReadCloser wraps an io.ReadCloser and automatically refreshes the link
+// if the upstream reader dies before the requested range is fully delivered.
+type selfHealingReadCloser struct {
+	io.ReadCloser
+	refresher *RefreshableRangeReader
+	ctx       context.Context
+	httpRange http_range.Range
+	firstRead bool
+	bytesRead int64
+	closed    bool
+	mu        sync.Mutex
+}
+
+func (s *selfHealingReadCloser) Read(p []byte) (n int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return 0, errors.New("read from closed reader")
+	}
+
+	n, err = s.ReadCloser.Read(p)
+	s.bytesRead += int64(n)
+	wasFirstRead := !s.firstRead
+	s.firstRead = true
+
+	// Detect 0-byte read on first attempt (indicates link may be expired but returned 200 OK)
+	if s.shouldReconnectAfterRead(wasFirstRead, n, err) {
+		if reconnectErr := s.reconnectFromCurrentOffsetLocked(); reconnectErr != nil {
+			log.Errorf("Failed to refresh link after interrupted read: %v", reconnectErr)
+			return n, err
+		}
+
+		if n > 0 {
+			return n, nil
+		}
+
+		n, err = s.ReadCloser.Read(p)
+		s.bytesRead += int64(n)
+		return n, err
+	}
+
+	return n, err
+}
+
+func (s *selfHealingReadCloser) shouldReconnectAfterRead(wasFirstRead bool, n int, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if s.remainingBytes() <= 0 {
+		return false
+	}
+
+	if wasFirstRead && n == 0 && (err == io.EOF || err == io.ErrUnexpectedEOF) {
+		log.Warnf("Detected 0-byte read on first attempt, attempting to refresh link...")
+		return true
+	}
+
+	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+		log.Warnf("Detected interrupted read after %d bytes, attempting to refresh link...", s.bytesRead)
+		return true
+	}
+
+	errStr := strings.ToLower(err.Error())
+	if strings.Contains(errStr, "connection reset by peer") {
+		log.Warnf("Detected upstream connection reset after %d bytes, attempting to refresh link...", s.bytesRead)
+		return true
+	}
+
+	return false
+}
+
+func (s *selfHealingReadCloser) reconnectFromCurrentOffsetLocked() error {
+	nextRange := s.httpRange
+	nextRange.Start += s.bytesRead
+	if nextRange.Length >= 0 {
+		nextRange.Length -= s.bytesRead
+	}
+
+	s.refresher.mu.Lock()
+	refreshErr := s.refresher.doRefreshLocked(s.ctx)
+	if refreshErr != nil {
+		s.refresher.mu.Unlock()
+		return refreshErr
+	}
+
+	reader, getErr := s.refresher.getInnerReader()
+	s.refresher.mu.Unlock()
+	if getErr != nil {
+		return getErr
+	}
+
+	newRc, rangeErr := reader.RangeRead(s.ctx, nextRange)
+	if rangeErr != nil {
+		return rangeErr
+	}
+
+	_ = s.ReadCloser.Close()
+	s.ReadCloser = newRc
+	log.Infof("Successfully refreshed link and reconnected from offset %d", nextRange.Start)
+	return nil
+}
+
+func (s *selfHealingReadCloser) remainingBytes() int64 {
+	length := s.httpRange.Length
+	if length < 0 || s.httpRange.Start+length > s.refresher.size {
+		length = s.refresher.size - s.httpRange.Start
+	}
+	remaining := length - s.bytesRead
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+func (s *selfHealingReadCloser) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	return s.ReadCloser.Close()
+}
+
 func GetRangeReaderFromLink(size int64, link *model.Link) (model.RangeReaderIF, error) {
+	// If link has a Refresher, wrap with RefreshableRangeReader for automatic refresh on expiry
+	if link.Refresher != nil {
+		return NewRefreshableRangeReader(link, size), nil
+	}
+
 	if link.RangeReader != nil {
 		if link.Concurrency < 1 && link.PartSize < 1 {
 			return link.RangeReader, nil
@@ -174,6 +462,120 @@ func CacheFullAndHash(stream model.FileStreamer, up *model.UpdateProgress, hashT
 	return tmpF, hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// ReadFullWithRangeRead 使用 RangeRead 从文件流中读取数据到 buf
+// file: 文件流
+// buf: 目标缓冲区
+// off: 读取的起始偏移量
+// 返回值: 实际读取的字节数和错误
+// 支持自动重试（最多5次），快速重试策略（1秒、2秒、3秒、4秒、5秒）
+// 注意：链接刷新现在由 RefreshableRangeReader 内部的 selfHealingReadCloser 自动处理
+func ReadFullWithRangeRead(file model.FileStreamer, buf []byte, off int64) (int, error) {
+	length := int64(len(buf))
+	var lastErr error
+
+	// 重试最多 MAX_RANGE_READ_RETRY_COUNT 次
+	for retry := 0; retry < MAX_RANGE_READ_RETRY_COUNT; retry++ {
+		reader, err := file.RangeRead(http_range.Range{Start: off, Length: length})
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return 0, err
+			}
+			lastErr = fmt.Errorf("RangeRead failed at offset %d: %w", off, err)
+			log.Debugf("RangeRead retry %d failed: %v", retry+1, lastErr)
+			// 快速重试：1秒、2秒、3秒、4秒、5秒（连接失败快速重试）
+			time.Sleep(time.Duration(retry+1) * time.Second)
+			continue
+		}
+
+		n, err := io.ReadFull(reader, buf)
+		if closer, ok := reader.(io.Closer); ok {
+			closer.Close()
+		}
+
+		if err == nil {
+			return n, nil
+		}
+
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return n, err
+		}
+
+		lastErr = fmt.Errorf("failed to read all data via RangeRead at offset %d: (expect=%d, actual=%d) %w", off, length, n, err)
+		log.Debugf("RangeRead retry %d read failed: %v", retry+1, lastErr)
+
+		// 快速重试：1秒、2秒、3秒、4秒、5秒（读取失败快速重试）
+		// 注意：0字节读取导致的链接过期现在由 selfHealingReadCloser 自动处理
+		time.Sleep(time.Duration(retry+1) * time.Second)
+	}
+
+	return 0, lastErr
+}
+
+// StreamHashFile 流式计算文件哈希值，避免将整个文件加载到内存
+// file: 文件流
+// hashType: 哈希算法类型
+// progressWeight: 进度权重（0-100），用于计算整体进度
+// up: 进度回调函数
+func StreamHashFile(file model.FileStreamer, hashType *utils.HashType, progressWeight float64, up *model.UpdateProgress) (string, error) {
+	// 如果已经有完整缓存文件，直接使用
+	if cache := file.GetFile(); cache != nil {
+		hashFunc := hashType.NewFunc()
+		cache.Seek(0, io.SeekStart)
+		_, err := io.Copy(hashFunc, cache)
+		if err != nil {
+			return "", err
+		}
+		if up != nil && progressWeight > 0 {
+			(*up)(progressWeight)
+		}
+		return hex.EncodeToString(hashFunc.Sum(nil)), nil
+	}
+
+	hashFunc := hashType.NewFunc()
+	size := file.GetSize()
+	chunkSize := int64(10 * 1024 * 1024) // 10MB per chunk
+	buf := make([]byte, chunkSize)
+	var offset int64 = 0
+
+	for offset < size {
+		readSize := chunkSize
+		if size-offset < chunkSize {
+			readSize = size - offset
+		}
+
+		var n int
+		var err error
+
+		// 对于 SeekableStream，优先使用 RangeRead 避免消耗 Reader
+		// 这样后续发送时 Reader 还能正常工作
+		if _, ok := file.(*SeekableStream); ok {
+			n, err = ReadFullWithRangeRead(file, buf[:readSize], offset)
+		} else {
+			// 对于 FileStream，首先尝试顺序流读取（不消耗额外资源，适用于所有流类型）
+			n, err = io.ReadFull(file, buf[:readSize])
+			if err != nil {
+				// 顺序流读取失败，尝试使用 RangeRead 重试（适用于 SeekableStream）
+				log.Warnf("StreamHashFile: sequential read failed at offset %d, retrying with RangeRead: %v", offset, err)
+				n, err = ReadFullWithRangeRead(file, buf[:readSize], offset)
+			}
+		}
+
+		if err != nil {
+			return "", fmt.Errorf("calculate hash failed at offset %d: %w", offset, err)
+		}
+
+		hashFunc.Write(buf[:n])
+		offset += int64(n)
+
+		if up != nil && progressWeight > 0 {
+			progress := progressWeight * float64(offset) / float64(size)
+			(*up)(progress)
+		}
+	}
+
+	return hex.EncodeToString(hashFunc.Sum(nil)), nil
+}
+
 type StreamSectionReaderIF interface {
 	// 线程不安全
 	GetSectionReader(off, length int64) (io.ReadSeeker, error)
@@ -188,37 +590,9 @@ func NewStreamSectionReader(file model.FileStreamer, maxBufferSize int, up *mode
 	}
 
 	maxBufferSize = min(maxBufferSize, int(file.GetSize()))
-	if maxBufferSize > conf.MaxBufferLimit {
-		f, err := os.CreateTemp(conf.Conf.TempDir, "file-*")
-		if err != nil {
-			return nil, err
-		}
 
-		if f.Truncate(file.GetSize()) != nil {
-			// fallback to full cache
-			_, _ = f.Close(), os.Remove(f.Name())
-			cache, err := file.CacheFullAndWriter(up, nil)
-			if err != nil {
-				return nil, err
-			}
-			return &cachedSectionReader{cache}, nil
-		}
-
-		ss := &fileSectionReader{file: file, temp: f}
-		ss.bufPool = &pool.Pool[*offsetWriterWithBase]{
-			New: func() *offsetWriterWithBase {
-				base := ss.tempOffset
-				ss.tempOffset += int64(maxBufferSize)
-				return &offsetWriterWithBase{io.NewOffsetWriter(ss.temp, base), base}
-			},
-		}
-		file.Add(utils.CloseFunc(func() error {
-			ss.bufPool.Reset()
-			return errors.Join(ss.temp.Close(), os.Remove(ss.temp.Name()))
-		}))
-		return ss, nil
-	}
-
+	// 始终使用 directSectionReader，只在内存中缓存当前分片
+	// 避免创建临时文件导致中间文件增长到整个文件大小
 	ss := &directSectionReader{file: file}
 	if conf.MmapThreshold > 0 && maxBufferSize >= conf.MmapThreshold {
 		ss.bufPool = &pool.Pool[[]byte]{
@@ -243,6 +617,7 @@ func NewStreamSectionReader(file model.FileStreamer, maxBufferSize int, up *mode
 	}
 
 	file.Add(utils.CloseFunc(func() error {
+		ss.clearPrefetch()
 		ss.bufPool.Reset()
 		return nil
 	}))
@@ -319,10 +694,129 @@ type directSectionReader struct {
 	file       model.FileStreamer
 	fileOffset int64
 	bufPool    *pool.Pool[[]byte]
+	prefetchMu sync.Mutex
+	prefetch   *sectionPrefetchTask
 }
 
-// 线程不安全
+type sectionPrefetchTask struct {
+	off    int64
+	length int64
+	buf    []byte
+	n      int
+	err    error
+	ready  chan struct{}
+}
+
+func (ss *directSectionReader) recyclePrefetchTask(task *sectionPrefetchTask) {
+	if task == nil || task.buf == nil {
+		return
+	}
+	ss.bufPool.Put(task.buf[0:cap(task.buf)])
+	task.buf = nil
+}
+
+func (ss *directSectionReader) clearPrefetch() {
+	ss.prefetchMu.Lock()
+	task := ss.prefetch
+	ss.prefetch = nil
+	ss.prefetchMu.Unlock()
+	if task == nil {
+		return
+	}
+	go func(t *sectionPrefetchTask) {
+		<-t.ready
+		ss.recyclePrefetchTask(t)
+	}(task)
+}
+
+func (ss *directSectionReader) takeMatchingPrefetch(off, length int64) *sectionPrefetchTask {
+	ss.prefetchMu.Lock()
+	task := ss.prefetch
+	if task != nil && task.off == off && task.length == length {
+		ss.prefetch = nil
+		ss.prefetchMu.Unlock()
+		return task
+	}
+	ss.prefetch = nil
+	ss.prefetchMu.Unlock()
+	if task != nil {
+		go func(t *sectionPrefetchTask) {
+			<-t.ready
+			ss.recyclePrefetchTask(t)
+		}(task)
+	}
+	return nil
+}
+
+func (ss *directSectionReader) launchPrefetch(off, length int64) {
+	if length <= 0 {
+		return
+	}
+	tempBuf := ss.bufPool.Get()
+	if int64(cap(tempBuf)) < length {
+		tempBuf = make([]byte, length)
+	}
+	task := &sectionPrefetchTask{
+		off:    off,
+		length: length,
+		buf:    tempBuf,
+		ready:  make(chan struct{}),
+	}
+
+	ss.prefetchMu.Lock()
+	old := ss.prefetch
+	ss.prefetch = task
+	ss.prefetchMu.Unlock()
+
+	if old != nil {
+		go func(t *sectionPrefetchTask) {
+			<-t.ready
+			ss.recyclePrefetchTask(t)
+		}(old)
+	}
+
+	go func(t *sectionPrefetchTask) {
+		buf := t.buf[:int(t.length)]
+		n, err := ReadFullWithRangeRead(ss.file, buf, t.off)
+		if err != nil {
+			t.err = fmt.Errorf("RangeRead failed at offset %d: (expect=%d, actual=%d) %w", t.off, t.length, n, err)
+		} else if int64(n) != t.length {
+			t.err = fmt.Errorf("RangeRead failed at offset %d: (expect=%d, actual=%d)", t.off, t.length, n)
+		} else {
+			t.n = n
+		}
+		close(t.ready)
+	}(task)
+}
+
+func (ss *directSectionReader) scheduleNextPrefetch(curOff, curLen int64) {
+	if _, ok := ss.file.(*SeekableStream); !ok {
+		return
+	}
+	nextOff := curOff + curLen
+	if nextOff >= ss.file.GetSize() {
+		ss.clearPrefetch()
+		return
+	}
+	nextLen := min(curLen, ss.file.GetSize()-nextOff)
+	if nextLen <= 0 {
+		ss.clearPrefetch()
+		return
+	}
+	ss.launchPrefetch(nextOff, nextLen)
+}
+
+// 线程不安全（依赖调用方保证串行调用）
+// 对于 SeekableStream：直接跳过（无需实际读取）
+// 对于 FileStream：必须顺序读取并丢弃
 func (ss *directSectionReader) DiscardSection(off int64, length int64) error {
+	// 对于 SeekableStream，直接跳过（RangeRead 支持随机访问，不需要实际读取）
+	if _, ok := ss.file.(*SeekableStream); ok {
+		ss.clearPrefetch()
+		return nil
+	}
+
+	// 对于 FileStream，必须顺序读取并丢弃
 	if off != ss.fileOffset {
 		return fmt.Errorf("stream not cached: request offset %d != current offset %d", off, ss.fileOffset)
 	}
@@ -339,19 +833,53 @@ type bufferSectionReader struct {
 	buf []byte
 }
 
-// 线程不安全
+// 线程不安全（依赖调用方保证串行调用）
+// 对于 SeekableStream：使用 RangeRead，支持随机访问（续传场景可跳过已上传分片）
+// 对于 FileStream：必须顺序读取
 func (ss *directSectionReader) GetSectionReader(off, length int64) (io.ReadSeeker, error) {
+	tempBuf := ss.bufPool.Get()
+	if int64(cap(tempBuf)) < length {
+		tempBuf = make([]byte, length)
+	}
+	buf := tempBuf[:int(length)]
+
+	// 对于 SeekableStream，直接使用 RangeRead（支持随机访问，适用于续传场景）
+	if _, ok := ss.file.(*SeekableStream); ok {
+		if task := ss.takeMatchingPrefetch(off, length); task != nil {
+			<-task.ready
+			if task.err != nil {
+				ss.recyclePrefetchTask(task)
+				ss.recyclePrefetchTask(&sectionPrefetchTask{buf: tempBuf})
+				return nil, task.err
+			}
+			ss.recyclePrefetchTask(&sectionPrefetchTask{buf: tempBuf})
+			ss.scheduleNextPrefetch(off, length)
+			return &bufferSectionReader{bytes.NewReader(task.buf[:int(length)]), task.buf}, nil
+		}
+
+		n, err := ReadFullWithRangeRead(ss.file, buf, off)
+		if err != nil {
+			ss.recyclePrefetchTask(&sectionPrefetchTask{buf: tempBuf})
+			return nil, fmt.Errorf("RangeRead failed at offset %d: (expect=%d, actual=%d) %w", off, length, n, err)
+		}
+		ss.scheduleNextPrefetch(off, length)
+		return &bufferSectionReader{bytes.NewReader(buf), tempBuf}, nil
+	}
+
+	// 对于 FileStream，必须顺序读取
 	if off != ss.fileOffset {
+		ss.recyclePrefetchTask(&sectionPrefetchTask{buf: tempBuf})
 		return nil, fmt.Errorf("stream not cached: request offset %d != current offset %d", off, ss.fileOffset)
 	}
-	tempBuf := ss.bufPool.Get()
-	buf := tempBuf[:length]
+
 	n, err := io.ReadFull(ss.file, buf)
-	ss.fileOffset += int64(n)
-	if int64(n) != length {
-		return nil, fmt.Errorf("failed to read all data: (expect =%d, actual =%d) %w", length, n, err)
+	if err != nil {
+		ss.recyclePrefetchTask(&sectionPrefetchTask{buf: tempBuf})
+		return nil, fmt.Errorf("sequential read failed at offset %d: (expect=%d, actual=%d) %w", off, length, n, err)
 	}
-	return &bufferSectionReader{bytes.NewReader(buf), buf}, nil
+
+	ss.fileOffset = off + int64(n)
+	return &bufferSectionReader{bytes.NewReader(buf), tempBuf}, nil
 }
 func (ss *directSectionReader) FreeSectionReader(rs io.ReadSeeker) {
 	if sr, ok := rs.(*bufferSectionReader); ok {

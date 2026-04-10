@@ -90,6 +90,12 @@ var (
 
 	// SHA256 indicates SHA-256 support
 	SHA256 = RegisterHash("sha256", "SHA-256", 64, sha256.New)
+
+	// SHA1_128K is SHA1 of first 128KB, used by 115 driver for rapid upload
+	SHA1_128K = RegisterHash("sha1_128k", "SHA1-128K", 40, sha1.New)
+
+	// PRE_HASH is SHA1 of first 1024 bytes, used by Aliyundrive for rapid upload
+	PRE_HASH = RegisterHash("pre_hash", "PRE-HASH", 40, sha1.New)
 )
 
 // HashData get hash of one hashType
