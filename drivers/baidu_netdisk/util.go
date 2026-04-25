@@ -207,7 +207,24 @@ func (d *BaiduNetdisk) linkOfficial(file model.Obj, _ model.LinkArgs) (*model.Li
 		return nil, err
 	}
 	u := fmt.Sprintf("%s&access_token=%s", resp.List[0].Dlink, d.AccessToken)
-	res, err := base.NoRedirectClient.R().SetHeader("User-Agent", "pan.baidu.com").Head(u)
+
+	// Retry HEAD request with longer timeout to avoid client-side errors
+	// Create a client with longer timeout (base.NoRedirectClient doesn't have timeout set)
+	client := base.NoRedirectClient.SetTimeout(60 * time.Second)
+	var res *resty.Response
+	maxRetries := 5
+	for i := 0; i < maxRetries; i++ {
+		res, err = client.R().
+			SetHeader("User-Agent", "pan.baidu.com").
+			Head(u)
+		if err == nil {
+			break
+		}
+		if i < maxRetries-1 {
+			log.Warnf("HEAD request failed (attempt %d/%d): %v, retrying...", i+1, maxRetries, err)
+			time.Sleep(time.Duration(i+1) * 2 * time.Second) // Exponential backoff: 2s, 4s, 6s, 8s
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
