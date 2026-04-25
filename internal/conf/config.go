@@ -118,6 +118,7 @@ type Config struct {
 	TempDir               string      `json:"temp_dir" env:"TEMP_DIR"`
 	BleveDir              string      `json:"bleve_dir" env:"BLEVE_DIR"`
 	DistDir               string      `json:"dist_dir"`
+	FrontendRepo          string      `json:"frontend_repo" env:"FRONTEND_REPO"`
 	Log                   LogConfig   `json:"log" envPrefix:"LOG_"`
 	DelayedStart          int         `json:"delayed_start" env:"DELAYED_START"`
 	MaxBufferLimit        int         `json:"max_buffer_limitMB" env:"MAX_BUFFER_LIMIT_MB"`
@@ -162,7 +163,8 @@ func DefaultConfig(dataDir string) *Config {
 			Host:  "http://localhost:7700",
 			Index: "openlist",
 		},
-		BleveDir: indexDir,
+		BleveDir:     indexDir,
+		FrontendRepo: FrontendRepoDefault,
 		Log: LogConfig{
 			Enable:     true,
 			Name:       logPath,
