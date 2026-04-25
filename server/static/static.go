@@ -1,6 +1,7 @@
 package static
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -8,10 +9,14 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/frontend"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/public"
@@ -32,21 +37,60 @@ type Manifest struct {
 	Icons    []ManifestIcon `json:"icons"`
 }
 
-var static fs.FS
+// reloadableFS wraps fs.FS with thread-safe swapping.
+// This allows gin StaticFS routes (which capture the fs.FS at registration time)
+// to serve updated files after a watcher-triggered reload.
+type reloadableFS struct {
+	mu      sync.RWMutex
+	current fs.FS
+}
+
+func (r *reloadableFS) Open(name string) (fs.File, error) {
+	r.mu.RLock()
+	current := r.current
+	r.mu.RUnlock()
+	return current.Open(name)
+}
+
+func (r *reloadableFS) swap(f fs.FS) {
+	r.mu.Lock()
+	r.current = f
+	r.mu.Unlock()
+}
+
+var staticFS = &reloadableFS{}
 
 func initStatic() {
 	utils.Log.Debug("Initializing static file system...")
-	if conf.Conf.DistDir == "" {
-		dist, err := fs.Sub(public.Public, "dist")
-		if err != nil {
-			utils.Log.Fatalf("failed to read dist dir: %v", err)
-		}
-		static = dist
-		utils.Log.Debug("Using embedded dist directory")
+	// 1. User explicitly configured dist_dir
+	if conf.Conf.DistDir != "" {
+		staticFS.swap(os.DirFS(conf.Conf.DistDir))
+		utils.Log.Infof("Using custom dist directory: %s", conf.Conf.DistDir)
 		return
 	}
-	static = os.DirFS(conf.Conf.DistDir)
-	utils.Log.Infof("Using custom dist directory: %s", conf.Conf.DistDir)
+	// 2. Try dynamic dist (fetched from rolling release)
+	if frontend.HasValidDist() {
+		distPath := filepath.Join(frontend.GetDistPath(), "dist")
+		staticFS.swap(os.DirFS(distPath))
+		utils.Log.Infof("Using dynamically fetched dist: %s", distPath)
+		return
+	}
+	// 3. Try auto-fetching from rolling (short timeout to avoid blocking startup)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	distPath := frontend.EnsureDistOnce(ctx)
+	cancel()
+	if distPath != "" {
+		staticFS.swap(os.DirFS(distPath))
+		utils.Log.Infof("Using auto-fetched dist: %s", distPath)
+		return
+	}
+	// 4. Final fallback to embedded dist
+	dist, err := fs.Sub(public.Public, "dist")
+	if err != nil {
+		utils.Log.Fatalf("failed to read dist dir: %v", err)
+	}
+	staticFS.swap(dist)
+	utils.Log.Debug("Using embedded dist directory")
 }
 
 func replaceStrings(content string, replacements map[string]string) string {
@@ -74,7 +118,7 @@ func initIndex(siteConfig SiteConfig) {
 		utils.Log.Info("Successfully fetched index.html from CDN")
 	} else {
 		utils.Log.Debug("Reading index.html from static files system...")
-		indexFile, err := static.Open("index.html")
+		indexFile, err := staticFS.Open("index.html")
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				utils.Log.Fatalf("index.html not exist, you may forget to put dist of frontend to public/dist")
@@ -131,13 +175,21 @@ func UpdateIndex() {
 	utils.Log.Debug("Index.html update completed")
 }
 
+// ReloadStatic reloads the static files from disk (called by the watcher after an update)
+func ReloadStatic() {
+	utils.Log.Info("[static] reloading static files after frontend update...")
+	siteConfig := getSiteConfig()
+	initStatic()
+	initIndex(siteConfig)
+}
+
 func ManifestJSON(c *gin.Context) {
 	// Get site configuration to ensure consistent base path handling
 	siteConfig := getSiteConfig()
-	
+
 	// Get site title from settings
 	siteTitle := setting.GetStr(conf.SiteTitle)
-	
+
 	// Get logo from settings, use the first line (light theme logo)
 	logoSetting := setting.GetStr(conf.Logo)
 	logoUrl := strings.Split(logoSetting, "\n")[0]
@@ -167,7 +219,7 @@ func ManifestJSON(c *gin.Context) {
 
 	c.Header("Content-Type", "application/json")
 	c.Header("Cache-Control", "public, max-age=3600") // cache for 1 hour
-	
+
 	if err := json.NewEncoder(c.Writer).Encode(manifest); err != nil {
 		utils.Log.Errorf("Failed to encode manifest.json: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate manifest"})
@@ -180,8 +232,12 @@ func Static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc)) {
 	siteConfig := getSiteConfig()
 	initStatic()
 	initIndex(siteConfig)
+
+	// Start the frontend watcher for periodic updates
+	frontend.StartWatcher(ReloadStatic)
+
 	folders := []string{"assets", "images", "streamer", "static"}
-	
+
 	if conf.Conf.Cdn == "" {
 		utils.Log.Debug("Setting up static file serving...")
 		r.Use(func(c *gin.Context) {
@@ -192,7 +248,7 @@ func Static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc)) {
 			}
 		})
 		for _, folder := range folders {
-			sub, err := fs.Sub(static, folder)
+			sub, err := fs.Sub(staticFS, folder)
 			if err != nil {
 				utils.Log.Fatalf("can't find folder: %s", folder)
 			}

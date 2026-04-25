@@ -18,6 +18,8 @@ if [[ "$*" == *"lite"* ]]; then
   useLite=true
 fi
 
+skipFrontendFetch="${SKIP_FRONTEND_FETCH:-false}"
+
 if [ "$1" = "dev" ]; then
   version="dev"
   webVersion="rolling"
@@ -29,6 +31,10 @@ else
   # Always true if there's no tag
   version=$(git describe --abbrev=0 --tags 2>/dev/null || echo "v0.0.0")
   webVersion=$(eval "curl -fsSL --max-time 2 $githubAuthArgs \"https://api.github.com/repos/$frontendRepo/releases/latest\"" | grep "tag_name" | head -n 1 | awk -F ":" '{print $2}' | sed 's/\"//g;s/,//g;s/ //g')
+fi
+
+if [ -n "$WEB_VERSION" ]; then
+  webVersion="$WEB_VERSION"
 fi
 
 echo "backend version: $version"
@@ -46,6 +52,7 @@ ldflags="\
 -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.GitCommit=$gitCommit' \
 -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.Version=$version' \
 -X 'github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=$webVersion' \
+-X 'github.com/OpenListTeam/OpenList/v4/internal/conf.FrontendRepoDefault=$frontendRepo' \
 "
 
 # Keep sqlite driver tag selection centralized to avoid target drift.
@@ -97,6 +104,11 @@ AssertStaticBinary() {
 }
 
 FetchWebRolling() {
+  if [ "$skipFrontendFetch" = "true" ] && [ -n "$(find public/dist -mindepth 1 -print -quit 2>/dev/null)" ]; then
+    echo "using cached frontend dist from public/dist"
+    return 0
+  fi
+
   pre_release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/tags/rolling\"")
   pre_release_assets=$(echo "$pre_release_json" | jq -r '.assets[].browser_download_url')
   
@@ -110,6 +122,11 @@ FetchWebRolling() {
 }
 
 FetchWebRelease() {
+  if [ "$skipFrontendFetch" = "true" ] && [ -n "$(find public/dist -mindepth 1 -print -quit 2>/dev/null)" ]; then
+    echo "using cached frontend dist from public/dist"
+    return 0
+  fi
+
   release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/latest\"")
   release_assets=$(echo "$release_json" | jq -r '.assets[].browser_download_url')
   
@@ -236,8 +253,8 @@ BuildDockerMultiplatform() {
   docker_lflags="$(GetMuslStaticLdflags)"
   export CGO_ENABLED=1
 
-  OS_ARCHES=(linux-amd64 linux-arm64 linux-386 linux-riscv64 linux-ppc64le linux-loong64) ## Disable linux-s390x builds
-  CGO_ARGS=(x86_64-linux-musl-gcc aarch64-linux-musl-gcc i486-linux-musl-gcc riscv64-linux-musl-gcc powerpc64le-linux-musl-gcc loongarch64-linux-musl-gcc) ## Disable s390x-linux-musl-gcc builds
+  OS_ARCHES=(linux-amd64) ## Disable linux-s390x builds
+  CGO_ARGS=(x86_64-linux-musl-gcc) ## Disable s390x-linux-musl-gcc builds
   for i in "${!OS_ARCHES[@]}"; do
     os_arch=${OS_ARCHES[$i]}
     cgo_cc=${CGO_ARGS[$i]}
@@ -257,15 +274,17 @@ BuildDockerMultiplatform() {
   GO_ARM=(6 7)
   export GOOS=linux
   export GOARCH=arm
-  for i in "${!DOCKER_ARM_ARCHES[@]}"; do
-    docker_arch=${DOCKER_ARM_ARCHES[$i]}
-    cgo_cc=${CGO_ARGS[$i]}
-    export GOARM=${GO_ARM[$i]}
-    export CC=${cgo_cc}
-    echo "building for $docker_arch"
-    CGO_LDFLAGS="-static" go build -o build/${docker_arch%%-*}/${docker_arch##*-}/"$appName" -ldflags="$docker_lflags" -tags=jsoniter .
-    AssertStaticBinary "build/${docker_arch%%-*}/${docker_arch##*-}/$appName"
-  done
+  # ARM docker variants stay disabled on this branch to keep the workflow x64-only.
+  # If they are re-enabled later, they should follow the same static-link pattern.
+  # for i in "${!DOCKER_ARM_ARCHES[@]}"; do
+  #   docker_arch=${DOCKER_ARM_ARCHES[$i]}
+  #   cgo_cc=${CGO_ARGS[$i]}
+  #   export GOARM=${GO_ARM[$i]}
+  #   export CC=${cgo_cc}
+  #   echo "building for $docker_arch"
+  #   CGO_LDFLAGS="-static" go build -o build/${docker_arch%%-*}/${docker_arch##*-}/"$appName" -ldflags="$docker_lflags" -tags=jsoniter .
+  #   AssertStaticBinary "build/${docker_arch%%-*}/${docker_arch##*-}/$appName"
+  # done
 }
 
 BuildRelease() {
@@ -655,7 +674,11 @@ if [ "$buildType" = "dev" ]; then
   fi
 elif [ "$buildType" = "release" -o "$buildType" = "beta" ]; then
   if [ "$buildType" = "beta" ]; then
-    FetchWebRolling
+    if [ "$WEB_VERSION" = "latest" ]; then
+      FetchWebRelease
+    else
+      FetchWebRolling
+    fi
   else
     FetchWebRelease
   fi

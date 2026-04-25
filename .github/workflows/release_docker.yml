@@ -51,7 +51,7 @@ jobs:
 
       - name: Cache Musl
         id: cache-musl
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: build/musl-libs
           key: docker-musl-libs-v2
@@ -91,7 +91,7 @@ jobs:
 
       - name: Cache Musl
         id: cache-musl
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: build/musl-libs
           key: docker-musl-libs-v2
@@ -147,7 +147,7 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: ${{ env.ARTIFACT_NAME }}
           path: 'build/'
@@ -231,7 +231,7 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: ${{ env.ARTIFACT_NAME_LITE }}
           path: 'build/'
