@@ -40,7 +40,7 @@ func (d *Alias) listRoot(ctx context.Context, withDetails, refresh bool) []model
 		if !withDetails || len(v) != 1 {
 			continue
 		}
-		remoteDriver, err := op.GetStorageByMountPath(v[0])
+		remoteDriver, err := fs.GetStorage(v[0], &fs.GetStoragesArgs{})
 		if err != nil {
 			continue
 		}

@@ -17,6 +17,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/OpenListTeam/tache"
 	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
 )
 
 type taskType uint8
@@ -192,6 +193,20 @@ func (t *FileTransferTask) RunWithNextTaskCallback(f func(nextTask *FileTransfer
 		dstActualPath := stdpath.Join(t.DstActualPath, srcObj.GetName())
 		task_group.TransferCoordinator.AppendPayload(t.groupID, task_group.DstPathToHook(dstActualPath))
 
+		// Pre-create the destination directory first
+		t.Status = "ensuring destination directory exists"
+		if err := op.MakeDir(t.Ctx(), t.DstStorage, dstActualPath); err != nil {
+			log.Warnf("[copy_move] failed to ensure destination dir [%s]: %v, will continue", dstActualPath, err)
+			// Continue anyway - the directory might exist but Get failed due to cache issues
+		}
+
+		// Pre-create subdirectories (up to 1 level deep) to avoid deep recursion issues
+		// Balances between reducing API calls and maintaining fault tolerance
+		t.Status = "pre-creating subdirectories"
+		if err := t.preCreateDirectoryTree(objs, t.SrcActualPath, dstActualPath, 1); err != nil {
+			log.Warnf("[copy_move] failed to pre-create directory tree: %v, will continue", err)
+			// Continue anyway - individual directories will be created on-demand
+		}
 		existedObjs := make(map[string]bool)
 		if t.TaskType == merge {
 			dstObjs, err := op.List(t.Ctx(), t.DstStorage, dstActualPath, model.ListArgs{})
@@ -261,6 +276,88 @@ func (t *FileTransferTask) RunWithNextTaskCallback(f func(nextTask *FileTransfer
 	t.SetTotalBytes(ss.GetSize())
 	t.Status = "uploading"
 	return op.Put(context.WithValue(t.Ctx(), conf.SkipHookKey, struct{}{}), t.DstStorage, t.DstActualPath, ss, t.SetProgress)
+}
+
+// preCreateDirectoryTree is a thin method wrapper that resolves the storage-bound
+// makeDir / listSrc functions and delegates to the pure preCreateDirTreeFn helper.
+func (t *FileTransferTask) preCreateDirectoryTree(objs []model.Obj, srcBasePath, dstBasePath string, maxDepth int) error {
+	makeDir := func(ctx context.Context, path string) error {
+		return op.MakeDir(ctx, t.DstStorage, path)
+	}
+	listSrc := func(ctx context.Context, path string) ([]model.Obj, error) {
+		return op.List(ctx, t.SrcStorage, path, model.ListArgs{})
+	}
+	return preCreateDirTreeFn(t.Ctx(), objs, srcBasePath, dstBasePath, maxDepth, makeDir, listSrc)
+}
+
+// preCreateDirTreeFn recursively scans source directory tree and pre-creates
+// directories on destination up to maxDepth levels to avoid deep MakeDir recursion issues.
+//
+//   - maxDepth=0 – only create dirs in the current objs list (no recursion)
+//   - maxDepth=1 – also recurse one level deeper, etc.
+//   - srcBasePath – current source directory path; passed explicitly through all
+//     recursion levels so that subdirSrcPath is always correct (do NOT use
+//     t.SrcActualPath, which is fixed at the top-level path).
+//
+// makeDir and listSrc are injected to enable testing without a real storage driver.
+func preCreateDirTreeFn(
+	ctx context.Context,
+	objs []model.Obj,
+	srcBasePath, dstBasePath string,
+	maxDepth int,
+	makeDir func(context.Context, string) error,
+	listSrc func(context.Context, string) ([]model.Obj, error),
+) error {
+	// First pass: create immediate subdirectories
+	var subdirs []model.Obj
+	for _, obj := range objs {
+		// Check for cancellation
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		if obj.IsDir() {
+			subdirPath := stdpath.Join(dstBasePath, obj.GetName())
+			if err := makeDir(ctx, subdirPath); err != nil {
+				log.Debugf("[copy_move] failed to pre-create dir [%s]: %v", subdirPath, err)
+				// Continue with other directories
+			}
+			subdirs = append(subdirs, obj)
+			// No explicit sleep here: drivers that have QPS limits (e.g. 115, BaiduNetDisk)
+			// implement WaitLimit via a token-bucket rate.Limiter and call it inside their
+			// MakeDir, so op.MakeDir already blocks at the correct per-driver rate.
+		}
+	}
+
+	// Stop recursion if max depth reached
+	if maxDepth <= 0 {
+		return nil
+	}
+
+	// Second pass: recursively scan and create nested subdirectories
+	for _, subdir := range subdirs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
+		// Build paths relative to srcBasePath (NOT t.SrcActualPath) so that
+		// deeper recursion levels resolve to the correct source paths.
+		subdirSrcPath := stdpath.Join(srcBasePath, subdir.GetName())
+		subdirDstPath := stdpath.Join(dstBasePath, subdir.GetName())
+
+		subObjs, err := listSrc(ctx, subdirSrcPath)
+		if err != nil {
+			log.Debugf("[copy_move] failed to list subdir [%s] for pre-creation: %v", subdirSrcPath, err)
+			continue // Skip this subdirectory, will handle when processing
+		}
+
+		// Recursively create subdirectories with decreased depth
+		if err := preCreateDirTreeFn(ctx, subObjs, subdirSrcPath, subdirDstPath, maxDepth-1, makeDir, listSrc); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 var (
