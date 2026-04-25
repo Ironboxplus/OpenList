@@ -25,6 +25,10 @@ type LinkArgs struct {
 	Redirect bool
 }
 
+// LinkRefresher is a callback function type for refreshing download links
+// It returns a new Link and the associated object, or an error
+type LinkRefresher func(ctx context.Context) (*Link, Obj, error)
+
 type Link struct {
 	URL         string        `json:"url"`    // most common way
 	Header      http.Header   `json:"header"` // needed header (for url)
@@ -36,6 +40,10 @@ type Link struct {
 	Concurrency   int   `json:"concurrency"`
 	PartSize      int   `json:"part_size"`
 	ContentLength int64 `json:"content_length"` // 转码视频、缩略图
+
+	// Refresher is a callback to refresh the link when it expires during long downloads
+	// This field is not serialized and is optional - if nil, no refresh will be attempted
+	Refresher LinkRefresher `json:"-"`
 
 	utils.SyncClosers `json:"-"`
 	// 如果SyncClosers中的资源被关闭后Link将不可用，则此值应为 true
