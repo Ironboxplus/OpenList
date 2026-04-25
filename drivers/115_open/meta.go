@@ -11,6 +11,7 @@ type Addition struct {
 	// define other
 	OrderBy        string  `json:"order_by" type:"select" options:"file_name,file_size,user_utime,file_type"`
 	OrderDirection string  `json:"order_direction" type:"select" options:"asc,desc"`
+	RemoveWay      string  `json:"remove_way" required:"true" type:"select" options:"trash,delete" default:"trash"`
 	LimitRate      float64 `json:"limit_rate" type:"float" default:"1" help:"limit all api request rate ([limit]r/1s)"`
 	PageSize       int64   `json:"page_size" type:"number" default:"200" help:"list api per page size of 115open driver"`
 	AccessToken    string  `json:"access_token" required:"true"`
@@ -18,9 +19,10 @@ type Addition struct {
 }
 
 var config = driver.Config{
-	Name:          "115 Open",
-	DefaultRoot:   "0",
-	LinkCacheMode: driver.LinkCacheUA,
+	Name:             "115 Open",
+	DefaultRoot:      "0",
+	ProxyRangeOption: true,
+	LinkCacheMode:    driver.LinkCacheUA,
 }
 
 func init() {
