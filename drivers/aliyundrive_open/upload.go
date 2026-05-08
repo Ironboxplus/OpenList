@@ -201,7 +201,7 @@ func (d *AliyundriveOpen) upload(ctx context.Context, dstDir model.Obj, stream m
 		if len(hash) != utils.SHA1.Width {
 			if isSeekable {
 				// 可重复读取的流，使用 StreamHashFile（RangeRead），不缓存
-				hash, err = streamPkg.StreamHashFile(stream, utils.SHA1, 50, &up)
+				hash, err = streamPkg.StreamHashFile(stream, utils.SHA1, 100, &up)
 				if err != nil {
 					return nil, err
 				}

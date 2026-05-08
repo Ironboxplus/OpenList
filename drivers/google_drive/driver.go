@@ -195,7 +195,7 @@ func (d *GoogleDrive) Put(ctx context.Context, dstDir model.Obj, file model.File
 		// 可重复读取的流，使用 RangeRead 计算 hash，不缓存
 		if len(md5Hash) != utils.MD5.Width {
 			var err error
-			md5Hash, err = stream.StreamHashFile(file, utils.MD5, 10, &up)
+			md5Hash, err = stream.StreamHashFile(file, utils.MD5, 100, &up)
 			if err != nil {
 				return err
 			}

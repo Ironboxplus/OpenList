@@ -1,6 +1,21 @@
 name: Beta Release (Docker)
 on:
   workflow_dispatch:
+    inputs:
+      frontend_repo:
+        description: 'Frontend repo, e.g. Ironboxplus/OpenList-Frontend'
+        required: false
+        default: 'OpenListTeam/OpenList-Frontend'
+        type: string
+      frontend_channel:
+        description: 'Frontend release channel to build'
+        required: false
+        default: rolling
+        type: choice
+        options:
+          - rolling
+          - latest
+          - both
   push:
     branches:
       - main
@@ -16,7 +31,7 @@ concurrency:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   GHCR_ORG_NAME: ${{ vars.GHCR_ORG_NAME || 'ironboxplus' }} # 👈 最好改成你的用户名，防止推错地方
-  FRONTEND_REPO: ${{ vars.FRONTEND_REPO || 'OpenListTeam/OpenList-Frontend' }}
+  FRONTEND_REPO: ${{ github.event.inputs.frontend_repo || vars.FRONTEND_REPO || 'OpenListTeam/OpenList-Frontend' }}
   IMAGE_NAME: openlist
   REGISTRY: ghcr.io
   ARTIFACT_NAME_PREFIX: 'binaries_docker_release'
@@ -33,13 +48,13 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        frontend_channel: ["latest", "rolling"]
+        frontend_channel: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.frontend_channel == 'both' && fromJSON('["rolling","latest"]') || fromJSON(format('["{0}"]', github.event.inputs.frontend_channel))) || fromJSON('["latest","rolling"]') }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: '1.25.0'
           cache: true
@@ -72,7 +87,7 @@ jobs:
 
       - name: Cache Frontend
         id: cache-frontend
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: public/dist
           key: frontend-${{ steps.frontend-cache.outputs.repo }}-${{ steps.frontend-cache.outputs.version }}
@@ -81,7 +96,7 @@ jobs:
 
       - name: Cache Musl
         id: cache-musl
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: build/musl-libs
           key: docker-musl-libs-v2
@@ -101,7 +116,7 @@ jobs:
           SKIP_FRONTEND_FETCH: ${{ steps.cache-frontend.outputs.cache-hit == 'true' && 'true' || 'false' }}
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ env.ARTIFACT_NAME_PREFIX }}-${{ matrix.frontend_channel }}
           overwrite: true
@@ -115,7 +130,7 @@ jobs:
       packages: write
     strategy:
       matrix:
-        frontend_channel: ["latest", "rolling"]
+        frontend_channel: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.frontend_channel == 'both' && fromJSON('["rolling","latest"]') || fromJSON(format('["{0}"]', github.event.inputs.frontend_channel))) || fromJSON('["latest","rolling"]') }}
         # 构建所有变体
         image: ["latest", "ffmpeg", "aria2", "aio"]
         include:
@@ -139,8 +154,8 @@ jobs:
             image_tag_suffix: "-aio"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+        uses: actions/checkout@v6
+      - uses: actions/download-artifact@v7
         with:
           name: ${{ env.ARTIFACT_NAME_PREFIX }}-${{ matrix.frontend_channel }}
           path: 'build/linux/amd64'

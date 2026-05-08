@@ -225,7 +225,7 @@ func (d *Open123) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 	if isSeekable {
 		// 可重复读取的流，使用 RangeRead 计算 hash，不缓存
 		if len(etag) < utils.MD5.Width {
-			etag, err = stream.StreamHashFile(file, utils.MD5, 40, &up)
+			etag, err = stream.StreamHashFile(file, utils.MD5, 100, &up)
 			if err != nil {
 				return nil, err
 			}
