@@ -116,6 +116,79 @@ func TestRefreshableRangeReader_ReconnectsAfterMidStreamReset_UnboundedRange(t *
 	}
 }
 
+// TestSelfHealingReadCloser_NormalEOFDoesNotTriggerReconnect verifies that a
+// legitimate io.EOF (all data delivered) does NOT trigger a link refresh.
+func TestSelfHealingReadCloser_NormalEOFDoesNotTriggerReconnect(t *testing.T) {
+	data := []byte("hello world")
+	refreshes := 0
+
+	inner := RangeReaderFunc(func(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(sliceForRange(data, httpRange))), nil
+	})
+
+	link := &model.Link{RangeReader: inner}
+	link.Refresher = func(ctx context.Context) (*model.Link, model.Obj, error) {
+		refreshes++
+		return &model.Link{RangeReader: inner}, nil, nil
+	}
+
+	rrr := NewRefreshableRangeReader(link, int64(len(data)))
+	rc, err := rrr.RangeRead(context.Background(), http_range.Range{Start: 0, Length: int64(len(data))})
+	if err != nil {
+		t.Fatalf("RangeRead error: %v", err)
+	}
+	defer rc.Close()
+
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("got %q, want %q", got, data)
+	}
+	if refreshes != 0 {
+		t.Fatalf("refreshes = %d, want 0 (normal EOF should not trigger refresh)", refreshes)
+	}
+}
+
+// TestSelfHealingReadCloser_UnexpectedEOFTriggersReconnect verifies that
+// io.ErrUnexpectedEOF (stream interrupted) DOES trigger reconnect.
+func TestSelfHealingReadCloser_UnexpectedEOFTriggersReconnect(t *testing.T) {
+	data := []byte("0123456789")
+	refreshes := 0
+
+	initial := RangeReaderFunc(func(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
+		return newFlakyReadCloser(sliceForRange(data, httpRange), 4, io.ErrUnexpectedEOF), nil
+	})
+	resumed := RangeReaderFunc(func(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(sliceForRange(data, httpRange))), nil
+	})
+
+	link := &model.Link{RangeReader: initial}
+	link.Refresher = func(ctx context.Context) (*model.Link, model.Obj, error) {
+		refreshes++
+		return &model.Link{RangeReader: resumed}, nil, nil
+	}
+
+	rrr := NewRefreshableRangeReader(link, int64(len(data)))
+	rc, err := rrr.RangeRead(context.Background(), http_range.Range{Start: 0, Length: int64(len(data))})
+	if err != nil {
+		t.Fatalf("RangeRead error: %v", err)
+	}
+	defer rc.Close()
+
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("got %q, want %q", got, data)
+	}
+	if refreshes != 1 {
+		t.Fatalf("refreshes = %d, want 1", refreshes)
+	}
+}
+
 type flakyReadCloser struct {
 	data      []byte
 	failAfter int

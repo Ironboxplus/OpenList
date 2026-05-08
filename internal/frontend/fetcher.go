@@ -24,6 +24,7 @@ const (
 	defaultFrontendRepo = "OpenListTeam/OpenList-Frontend"
 	versionFile         = ".frontend_version"
 	distDirName         = "dist"
+	maxExtractFileSize  = 500 * 1024 * 1024 // 500MB per file
 )
 
 // FetchResult contains the result of a fetch operation
@@ -333,20 +334,20 @@ func downloadAndExtract(ctx context.Context, client *http.Client, url string) er
 		srcDir = filepath.Join(tmpDir, distDirName)
 	}
 
-	// Atomic swap: rename source to final
+	// Atomic swap: hold lock to minimize the window where dist is absent
 	finalDir := filepath.Join(destDir, distDirName)
 	oldDir := filepath.Join(destDir, distDirName+".old")
-	// Remove previous backup if exists
+
+	distSwapMu.Lock()
 	os.RemoveAll(oldDir)
-	// Move current dist out of the way if it exists
 	os.Rename(finalDir, oldDir)
-	// Move new dist into place
 	if err := os.Rename(srcDir, finalDir); err != nil {
-		// Rollback
 		os.RemoveAll(finalDir)
 		os.Rename(oldDir, finalDir)
+		distSwapMu.Unlock()
 		return fmt.Errorf("rename new dist: %w", err)
 	}
+	distSwapMu.Unlock()
 	os.RemoveAll(oldDir)
 
 	return nil
@@ -388,6 +389,9 @@ func extractTarGz(r io.Reader, dest string) error {
 				return err
 			}
 		case tar.TypeReg:
+			if hdr.Size > maxExtractFileSize {
+				return fmt.Errorf("file too large: %s (%d bytes)", hdr.Name, hdr.Size)
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 				return err
 			}
@@ -395,7 +399,7 @@ func extractTarGz(r io.Reader, dest string) error {
 			if err != nil {
 				return err
 			}
-			if _, err := io.Copy(f, tr); err != nil {
+			if _, err := io.Copy(f, io.LimitReader(tr, maxExtractFileSize)); err != nil {
 				f.Close()
 				return err
 			}
@@ -468,6 +472,8 @@ func shouldAutoFetch() bool {
 func init() {
 	_ = os.MkdirAll(GetDistPath(), 0755)
 }
+
+var distSwapMu sync.Mutex
 
 // Ensure that the sync.Once pattern is used for the fetcher
 var (

@@ -110,6 +110,13 @@ func (r *RefreshableRangeReader) getInnerReader() (model.RangeReaderIF, error) {
 	return reader, nil
 }
 
+// RangeRead obtains a reader reference under lock, then issues the range
+// request outside the lock. The local copy of `reader` remains valid even
+// if a concurrent refresh nils r.innerReader and replaces r.link, because
+// doRefreshLocked only clears the pointer — it does not close or invalidate
+// the old reader object. Each reader is an independent RangeReaderFunc
+// (closure over a URL), so stale readers simply use the old URL; if it has
+// expired, selfHealingReadCloser handles the retry transparently.
 func (r *RefreshableRangeReader) RangeRead(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
 	r.mu.Lock()
 	reader, err := r.getInnerReader()
@@ -240,7 +247,7 @@ func (s *selfHealingReadCloser) shouldReconnectAfterRead(wasFirstRead bool, n in
 		return true
 	}
 
-	if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+	if errors.Is(err, io.ErrUnexpectedEOF) {
 		log.Warnf("Detected interrupted read after %d bytes, attempting to refresh link...", s.bytesRead)
 		return true
 	}

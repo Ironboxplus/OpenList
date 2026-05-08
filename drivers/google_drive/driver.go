@@ -85,7 +85,10 @@ func (d *GoogleDrive) MakeDir(ctx context.Context, parentDir model.Obj, dirName 
 	lockVal, _ := mkdirLocks.LoadOrStore(lockKey, &sync.Mutex{})
 	lock := lockVal.(*sync.Mutex)
 	lock.Lock()
-	defer lock.Unlock()
+	defer func() {
+		lock.Unlock()
+		mkdirLocks.Delete(lockKey)
+	}()
 
 	// Check if folder already exists with retry to handle API eventual consistency
 	escapedDirName := strings.ReplaceAll(dirName, "'", "\\'")
@@ -184,7 +187,13 @@ func (d *GoogleDrive) Remove(ctx context.Context, obj model.Obj) error {
 	return err
 }
 
+const maxPutAuthRetries = 2
+
 func (d *GoogleDrive) Put(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress) error {
+	return d.putWithRetry(ctx, dstDir, file, up, 0)
+}
+
+func (d *GoogleDrive) putWithRetry(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress, authRetries int) error {
 	// 1. 准备MD5（用于完整性校验）
 	md5Hash := file.GetHash().GetHash(utils.MD5)
 
@@ -255,12 +264,12 @@ func (d *GoogleDrive) Put(ctx context.Context, dstDir model.Obj, file model.File
 		return err
 	}
 	if e.Error.Code != 0 {
-		if e.Error.Code == 401 {
+		if e.Error.Code == 401 && authRetries < maxPutAuthRetries {
 			err = d.refreshToken()
 			if err != nil {
 				return err
 			}
-			return d.Put(ctx, dstDir, file, up)
+			return d.putWithRetry(ctx, dstDir, file, up, authRetries+1)
 		}
 		return fmt.Errorf("%s: %v", e.Error.Message, e.Error.Errors)
 	}

@@ -115,6 +115,40 @@ func TestExtractTarGzPathTraversal(t *testing.T) {
 	}
 }
 
+func TestExtractTarGzRejectsOversizedFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Create a tar.gz with a file whose header claims a size exceeding the limit
+	pr, pw := io.Pipe()
+	go func() {
+		defer pw.Close()
+		gw := gzip.NewWriter(pw)
+		defer gw.Close()
+		tw := tar.NewWriter(gw)
+		defer tw.Close()
+		hdr := &tar.Header{
+			Name: "dist/huge.bin",
+			Mode: 0644,
+			Size: maxExtractFileSize + 1,
+		}
+		_ = tw.WriteHeader(hdr)
+		// Write just enough to pass; the size check should reject before reading
+		buf := make([]byte, 1024)
+		for written := int64(0); written < hdr.Size; written += int64(len(buf)) {
+			n := min(int64(len(buf)), hdr.Size-written)
+			_, _ = tw.Write(buf[:n])
+		}
+	}()
+	data, _ := io.ReadAll(pr)
+
+	err := extractTarGz(strings.NewReader(string(data)), tmpDir)
+	if err == nil {
+		t.Fatal("expected error for oversized file, got nil")
+	}
+	if !strings.Contains(err.Error(), "too large") {
+		t.Errorf("expected 'too large' error, got: %v", err)
+	}
+}
+
 func TestHasValidDist(t *testing.T) {
 	if HasValidDist() {
 		t.Log("HasValidDist returned true (may have existing dist from previous runs)")
