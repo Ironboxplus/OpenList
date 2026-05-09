@@ -3,6 +3,7 @@ package _115_open
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -26,6 +27,14 @@ func isTokenExpiredError(err error) bool {
 	errStr := err.Error()
 	return strings.Contains(errStr, "SecurityTokenExpired") ||
 		strings.Contains(errStr, "InvalidAccessKeyId")
+}
+
+// isPartAlreadyExistError 检测是否为分片已存在错误（超时后重试时 OSS 返回 409）
+func isPartAlreadyExistError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "PartAlreadyExist")
 }
 
 func calPartSize(fileSize int64) int64 {
@@ -129,6 +138,21 @@ func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer,
 			rd.Seek(0, io.SeekStart)
 			part, err := bucket.UploadPart(imur, driver.NewLimitedUploadStream(ctx, rd), partSize, int(i))
 			if err != nil {
+				if isPartAlreadyExistError(err) {
+					log.Infof("115 OSS part %d already exists, retrieving from ListUploadedParts", i)
+					lpr, listErr := bucket.ListUploadedParts(imur)
+					if listErr != nil {
+						return fmt.Errorf("part %d already exists but ListUploadedParts failed: %w", i, listErr)
+					}
+					for _, p := range lpr.UploadedParts {
+						if p.PartNumber == int(i) {
+							parts[i-1] = oss.UploadPart{PartNumber: p.PartNumber, ETag: p.ETag}
+							log.Infof("115 OSS part %d recovered: ETag=%s", i, p.ETag)
+							return nil
+						}
+					}
+					return fmt.Errorf("part %d reported as existing but not found in ListUploadedParts", i)
+				}
 				return err
 			}
 			parts[i-1] = part
@@ -139,7 +163,6 @@ func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer,
 			retry.DelayType(retry.BackOffDelay),
 			retry.Delay(time.Second),
 			retry.OnRetry(func(n uint, err error) {
-				// 如果是凭证过期错误，在重试前刷新凭证并重建bucket
 				if isTokenExpiredError(err) {
 					log.Warnf("115 OSS token expired, refreshing token...")
 					if newToken, refreshErr := d.client.UploadGetToken(ctx); refreshErr == nil {

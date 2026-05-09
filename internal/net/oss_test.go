@@ -8,6 +8,21 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 )
 
+func TestNewOSSUploadHttpClientHasLongerTimeout(t *testing.T) {
+	oldConf := conf.Conf
+	conf.Conf = conf.DefaultConfig("data")
+	defer func() { conf.Conf = oldConf }()
+
+	client := NewOSSUploadHttpClient()
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("expected *http.Transport, got %T", client.Transport)
+	}
+	if transport.ResponseHeaderTimeout < 120_000_000_000 { // 2 minutes minimum
+		t.Fatalf("ResponseHeaderTimeout=%v, want >= 2m for upload", transport.ResponseHeaderTimeout)
+	}
+}
+
 func TestNewOSSClientUsesEnvironmentHTTPSProxy(t *testing.T) {
 	oldConf := conf.Conf
 	conf.Conf = conf.DefaultConfig("data")
