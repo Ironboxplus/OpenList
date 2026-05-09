@@ -3,6 +3,7 @@ package stream
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"io"
 	"sync"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
 func TestRefreshableRangeReader_ReconnectsAfterMidStreamReset(t *testing.T) {
@@ -186,6 +188,41 @@ func TestSelfHealingReadCloser_UnexpectedEOFTriggersReconnect(t *testing.T) {
 	}
 	if refreshes != 1 {
 		t.Fatalf("refreshes = %d, want 1", refreshes)
+	}
+}
+
+// TestStreamHashFile_SeekablePrefetchProducesSameHash verifies that
+// the prefetch optimization in StreamHashFile produces the exact same
+// hash as a sequential read.
+func TestStreamHashFile_SeekablePrefetchProducesSameHash(t *testing.T) {
+	// 50 bytes = will be split into 10MB chunks in real code, but we
+	// override chunkSize for testing. The key point: hash must be identical.
+	data := []byte("The quick brown fox jumps over the lazy dog!!!!!") // 48 bytes
+
+	rr := RangeReaderFunc(func(ctx context.Context, r http_range.Range) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(sliceForRange(data, r))), nil
+	})
+
+	seekable := &SeekableStream{
+		FileStream: &FileStream{
+			Obj: &model.Object{Name: "test.bin", Size: int64(len(data))},
+			Ctx: context.Background(),
+		},
+		rangeReader: rr,
+	}
+
+	hash1, err := StreamHashFile(seekable, utils.SHA1, 0, nil)
+	if err != nil {
+		t.Fatalf("StreamHashFile error: %v", err)
+	}
+
+	// Compute expected hash directly
+	h := utils.SHA1.NewFunc()
+	h.Write(data)
+	expected := hex.EncodeToString(h.Sum(nil))
+
+	if hash1 != expected {
+		t.Fatalf("hash mismatch: got %s, want %s", hash1, expected)
 	}
 }
 

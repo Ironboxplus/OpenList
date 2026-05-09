@@ -539,46 +539,99 @@ func StreamHashFile(file model.FileStreamer, hashType *utils.HashType, progressW
 	hashFunc := hashType.NewFunc()
 	size := file.GetSize()
 	chunkSize := int64(10 * 1024 * 1024) // 10MB per chunk
+
+	if _, ok := file.(*SeekableStream); ok {
+		return streamHashSeekableWithPrefetch(file, hashFunc, size, chunkSize, progressWeight, up)
+	}
+
 	buf := make([]byte, chunkSize)
 	var offset int64 = 0
-
 	for offset < size {
 		readSize := chunkSize
 		if size-offset < chunkSize {
 			readSize = size - offset
 		}
-
-		var n int
-		var err error
-
-		// 对于 SeekableStream，优先使用 RangeRead 避免消耗 Reader
-		// 这样后续发送时 Reader 还能正常工作
-		if _, ok := file.(*SeekableStream); ok {
+		n, err := io.ReadFull(file, buf[:readSize])
+		if err != nil {
+			log.Warnf("StreamHashFile: sequential read failed at offset %d, retrying with RangeRead: %v", offset, err)
 			n, err = ReadFullWithRangeRead(file, buf[:readSize], offset)
-		} else {
-			// 对于 FileStream，首先尝试顺序流读取（不消耗额外资源，适用于所有流类型）
-			n, err = io.ReadFull(file, buf[:readSize])
-			if err != nil {
-				// 顺序流读取失败，尝试使用 RangeRead 重试（适用于 SeekableStream）
-				log.Warnf("StreamHashFile: sequential read failed at offset %d, retrying with RangeRead: %v", offset, err)
-				n, err = ReadFullWithRangeRead(file, buf[:readSize], offset)
-			}
 		}
-
 		if err != nil {
 			return "", fmt.Errorf("calculate hash failed at offset %d: %w", offset, err)
 		}
-
 		hashFunc.Write(buf[:n])
 		offset += int64(n)
-
 		if up != nil && progressWeight > 0 {
-			progress := progressWeight * float64(offset) / float64(size)
-			(*up)(progress)
+			(*up)(progressWeight * float64(offset) / float64(size))
 		}
 	}
-
 	return hex.EncodeToString(hashFunc.Sum(nil)), nil
+}
+
+type hashPrefetchResult struct {
+	buf []byte
+	n   int
+	err error
+}
+
+func streamHashSeekableWithPrefetch(file model.FileStreamer, hashFunc io.Writer, size, chunkSize int64, progressWeight float64, up *model.UpdateProgress) (string, error) {
+	readChunkSize := func(off int64) int64 {
+		if size-off < chunkSize {
+			return size - off
+		}
+		return chunkSize
+	}
+
+	var offset int64
+
+	// Read first chunk synchronously
+	firstSize := readChunkSize(0)
+	curBuf := make([]byte, chunkSize)
+	curN, curErr := ReadFullWithRangeRead(file, curBuf[:firstSize], 0)
+	if curErr != nil {
+		return "", fmt.Errorf("calculate hash failed at offset 0: %w", curErr)
+	}
+
+	for {
+		nextOff := offset + int64(curN)
+
+		// Launch prefetch for next chunk while we hash current
+		var prefetchCh chan hashPrefetchResult
+		if nextOff < size {
+			prefetchCh = make(chan hashPrefetchResult, 1)
+			nextSize := readChunkSize(nextOff)
+			nextBuf := make([]byte, nextSize)
+			go func(buf []byte, off, sz int64) {
+				n, err := ReadFullWithRangeRead(file, buf[:sz], off)
+				prefetchCh <- hashPrefetchResult{buf: buf, n: n, err: err}
+			}(nextBuf, nextOff, nextSize)
+		}
+
+		// Hash current chunk
+		hashFunc.Write(curBuf[:curN])
+		offset += int64(curN)
+
+		if up != nil && progressWeight > 0 {
+			(*up)(progressWeight * float64(offset) / float64(size))
+		}
+
+		if prefetchCh == nil {
+			break
+		}
+
+		// Wait for prefetch
+		result := <-prefetchCh
+		if result.err != nil {
+			return "", fmt.Errorf("calculate hash failed at offset %d: %w", nextOff, result.err)
+		}
+		curBuf = result.buf
+		curN = result.n
+	}
+
+	if h, ok := hashFunc.(interface{ Sum([]byte) []byte }); ok {
+		return hex.EncodeToString(h.Sum(nil)), nil
+	}
+	return "", fmt.Errorf("hashFunc does not implement Sum")
 }
 
 type StreamSectionReader interface {
@@ -601,8 +654,16 @@ func NewStreamSectionReader(file model.FileStreamer, sectionSize int, up *model.
 		return nil, err
 	}
 	file.Add(hc)
-	return &hybridSectionReader{file: file, hc: hc}, nil
+	ss := &hybridSectionReader{file: file, hc: hc, fileSize: file.GetSize()}
+	// Wait for any pending prefetch when the file is closed so we don't
+	// race against ss.hc being freed.
+	file.Add(closerFunc(ss.waitPrefetch))
+	return ss, nil
 }
+
+type closerFunc func() error
+
+func (f closerFunc) Close() error { return f() }
 
 type cachedSectionReader struct {
 	cache io.ReaderAt
@@ -619,13 +680,49 @@ func (*cachedSectionReader) FreeSectionReader(sr io.ReadSeeker) {}
 type hybridSectionReader struct {
 	file       model.FileStreamer
 	fileOffset int64
+	fileSize   int64
 	hc         *hcache.HybridCache
 	mu         sync.Mutex
 	cache      []buffer.Block
+
+	// Pass 2 prefetch: while the caller uploads block N, we read block
+	// N+1 from the source in the background so download/upload overlap.
+	// Access is serialized through GetSectionReader/DiscardSection which
+	// are documented as 线程不安全; only the background prefetch goroutine
+	// touches `prefetch` concurrently with those methods, and waitPrefetch
+	// drains it before any of them touches ss.file again.
+	prefetch *prefetchTask
+}
+
+type prefetchTask struct {
+	off    int64        // file offset the prefetch started at
+	length int64        // bytes requested
+	actual int64        // bytes actually read into block (may be < length on EOF/error)
+	block  buffer.Block // nil if allocation/read failed before any bytes
+	err    error        // non-nil on prefetch error
+	done   chan struct{}
 }
 
 // 线程不安全
 func (ss *hybridSectionReader) DiscardSection(off int64, length int64) error {
+	// Drain any pending prefetch first so ss.file is quiescent. If the
+	// prefetched range exactly matches the discard request, we're done —
+	// the bytes have already been read from the source.
+	if p := ss.prefetch; p != nil {
+		<-p.done
+		ss.prefetch = nil
+		if p.err == nil && p.off == off && p.actual == length {
+			if p.block != nil {
+				ss.put(p.block)
+			}
+			ss.fileOffset = off + length
+			return nil
+		}
+		if p.block != nil {
+			ss.put(p.block)
+		}
+		ss.fileOffset = p.off + p.actual
+	}
 	if off != ss.fileOffset {
 		return fmt.Errorf("stream not cached: request offset %d != current offset %d", off, ss.fileOffset)
 	}
@@ -644,33 +741,134 @@ type blockRefReadSeeker struct {
 
 // 线程不安全
 func (ss *hybridSectionReader) GetSectionReader(off, length int64) (io.ReadSeeker, error) {
+	// Try prefetched block first.
+	if b, actual, err, ok := ss.takePrefetched(off, length); ok {
+		if err != nil {
+			if b != nil {
+				ss.put(b)
+			}
+			return nil, fmt.Errorf("prefetch failed at offset %d: %w", off, err)
+		}
+		if actual < length {
+			if b != nil {
+				ss.put(b)
+			}
+			return nil, fmt.Errorf("prefetch short read at offset %d: (expect=%d, actual=%d)", off, length, actual)
+		}
+		ss.fileOffset = off + length
+		ss.schedulePrefetch(off+length, length)
+		return makeBlockReadSeeker(b, length)
+	}
+
 	if off != ss.fileOffset {
 		return nil, fmt.Errorf("stream not cached: request offset %d != current offset %d", off, ss.fileOffset)
 	}
+	b, actual, err := ss.readBlock(length)
+	if err != nil || actual != length {
+		if b != nil {
+			ss.put(b)
+		}
+		return nil, fmt.Errorf("failed to read all data: (expect =%d, actual =%d) %w", length, actual, err)
+	}
+	ss.fileOffset += actual
+	ss.schedulePrefetch(off+length, length)
+	return makeBlockReadSeeker(b, length)
+}
+
+// readBlock reads `length` bytes from ss.file into a freshly populated
+// buffer.Block. The returned block may be nil if no bytes could be read.
+// Caller is responsible for returning the block to the pool on error.
+func (ss *hybridSectionReader) readBlock(length int64) (buffer.Block, int64, error) {
 	b := ss.get()
 	if b == nil {
 		offset := int64(ss.hc.Size())
 		written, err := ss.hc.CopyFromN(ss.file, length)
-		ss.fileOffset += written
-		if written != length {
-			return nil, fmt.Errorf("failed to read all data: (expect =%d, actual =%d) %w", length, written, err)
+		if written == 0 {
+			return nil, 0, err
 		}
 		b = buffer.NewBlockAdapter(
 			io.NewOffsetWriter(ss.hc, offset),
-			io.NewSectionReader(ss.hc, offset, length),
+			io.NewSectionReader(ss.hc, offset, written),
 		)
-	} else {
-		ws := buffer.WriteAtSeekerOf(b)
-		if _, err := ws.Seek(0, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("failed to reset cached block writer: %w", err)
+		return b, written, err
+	}
+	ws := buffer.WriteAtSeekerOf(b)
+	if _, err := ws.Seek(0, io.SeekStart); err != nil {
+		ss.put(b)
+		return nil, 0, fmt.Errorf("failed to reset cached block writer: %w", err)
+	}
+	written, err := utils.CopyWithBufferN(ws, ss.file, length)
+	return b, written, err
+}
+
+// schedulePrefetch starts a background read of `length` bytes at file
+// offset `off`. It is a no-op if there is nothing more to read or a
+// prefetch is already in flight.
+func (ss *hybridSectionReader) schedulePrefetch(off, length int64) {
+	if length <= 0 || off >= ss.fileSize {
+		return
+	}
+	if ss.prefetch != nil {
+		return
+	}
+	// Clamp to remaining file size so the last partial chunk doesn't
+	// produce a synthetic short-read error.
+	if remaining := ss.fileSize - off; remaining < length {
+		length = remaining
+	}
+	task := &prefetchTask{off: off, length: length, done: make(chan struct{})}
+	ss.prefetch = task
+	go func() {
+		defer close(task.done)
+		b, actual, err := ss.readBlock(length)
+		task.block = b
+		task.actual = actual
+		task.err = err
+	}()
+}
+
+// takePrefetched returns the prefetched block if it matches the caller's
+// requested offset. The ok return distinguishes "no prefetch present"
+// (false) from "prefetch was consumed" (true).
+func (ss *hybridSectionReader) takePrefetched(off, length int64) (buffer.Block, int64, error, bool) {
+	p := ss.prefetch
+	if p == nil {
+		return nil, 0, nil, false
+	}
+	<-p.done
+	ss.prefetch = nil
+	if p.off != off {
+		if p.block != nil {
+			ss.put(p.block)
 		}
-		written, err := utils.CopyWithBufferN(ws, ss.file, length)
-		ss.fileOffset += written
-		if written != length {
-			return nil, fmt.Errorf("failed to read all data: (expect =%d, actual =%d) %w", length, written, err)
+		// Source has already advanced by p.actual bytes past p.off.
+		// Reflect that so subsequent calls see a consistent fileOffset.
+		ss.fileOffset = p.off + p.actual
+		return nil, 0, nil, false
+	}
+	// Caller may ask for fewer bytes than we prefetched (e.g. final
+	// partial chunk after we over-prefetched). Allow that.
+	if length > p.actual && p.err == nil {
+		// Did not get as many bytes as caller wants and source didn't
+		// signal an error — surface a short-read for the caller to
+		// handle, but keep block so it can be returned.
+		return p.block, p.actual, fmt.Errorf("short read"), true
+	}
+	return p.block, p.actual, p.err, true
+}
+
+func (ss *hybridSectionReader) waitPrefetch() error {
+	if p := ss.prefetch; p != nil {
+		<-p.done
+		ss.prefetch = nil
+		if p.block != nil {
+			ss.put(p.block)
 		}
 	}
+	return nil
+}
 
+func makeBlockReadSeeker(b buffer.Block, length int64) (io.ReadSeeker, error) {
 	if length == b.Size() {
 		rs := buffer.ReadAtSeekerOf(b)
 		if _, err := rs.Seek(0, io.SeekStart); err != nil {
