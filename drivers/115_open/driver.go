@@ -459,11 +459,7 @@ func matchRecycleBinEntry(obj *Obj, files map[string]sdk.RbListResp_FileInfo) *s
 }
 
 func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress) error {
-	err := d.WaitLimit(ctx)
-	if err != nil {
-		return err
-	}
-
+	var err error
 	sha1 := file.GetHash().GetHash(utils.SHA1)
 	sha1128k := file.GetHash().GetHash(utils.SHA1_128K)
 
@@ -472,6 +468,9 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 
 	// 如果有预计算的 hash，先尝试秒传
 	if len(sha1) == utils.SHA1.Width && len(sha1128k) == utils.SHA1_128K.Width {
+		if err := d.WaitLimit(ctx); err != nil {
+			return err
+		}
 		resp, err := d.client.UploadInit(ctx, &sdk.UploadInitReq{
 			FileName: file.GetName(),
 			FileSize: file.GetSize(),
@@ -554,6 +553,9 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 	}
 
 	// 1. Init（SeekableStream 或已缓存的 FileStream）
+	if err := d.WaitLimit(ctx); err != nil {
+		return err
+	}
 	resp, err := d.client.UploadInit(ctx, &sdk.UploadInitReq{
 		FileName: file.GetName(),
 		FileSize: file.GetSize(),
@@ -587,6 +589,9 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		if err != nil {
 			return err
 		}
+		if err := d.WaitLimit(ctx); err != nil {
+			return err
+		}
 		resp, err = d.client.UploadInit(ctx, &sdk.UploadInitReq{
 			FileName: file.GetName(),
 			FileSize: file.GetSize(),
@@ -605,6 +610,9 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		}
 	}
 	// 3. get upload token
+	if err := d.WaitLimit(ctx); err != nil {
+		return err
+	}
 	tokenResp, err := d.client.UploadGetToken(ctx)
 	if err != nil {
 		return err

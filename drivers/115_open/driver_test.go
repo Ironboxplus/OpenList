@@ -3,6 +3,7 @@ package _115_open
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -13,12 +14,17 @@ import (
 	"time"
 
 	sdk "github.com/OpenListTeam/115-sdk-go"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+	"golang.org/x/time/rate"
 )
 
 type recordedRequest struct {
 	Path string
 	Form url.Values
+	Time time.Time
 }
 
 type rewriteTransport struct {
@@ -179,6 +185,7 @@ func newTestOpen115(t *testing.T, removeWay string, responder http.HandlerFunc) 
 		requests = append(requests, recordedRequest{
 			Path: r.URL.Path,
 			Form: cloneValues(r.Form),
+			Time: time.Now(),
 		})
 		mu.Unlock()
 		responder(w, r)
@@ -636,4 +643,149 @@ func TestOpen115RemoveDeleteStopsRetryWhenContextCancelled(t *testing.T) {
 	if !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
 		t.Fatalf("expected context deadline exceeded, got: %v", err)
 	}
+}
+
+// --- Put rate-limiting tests ---
+
+// mockFileStreamer satisfies model.FileStreamer with pre-computed hashes for testing.
+type mockFileStreamer struct {
+	name     string
+	size     int64
+	hashInfo utils.HashInfo
+	data     []byte
+}
+
+func (m *mockFileStreamer) Read(p []byte) (int, error)                    { return 0, io.EOF }
+func (m *mockFileStreamer) Close() error                                  { return nil }
+func (m *mockFileStreamer) Add(_ io.Closer)                               {}
+func (m *mockFileStreamer) AddIfCloser(_ any)                             {}
+func (m *mockFileStreamer) GetSize() int64                                { return m.size }
+func (m *mockFileStreamer) GetName() string                               { return m.name }
+func (m *mockFileStreamer) ModTime() time.Time                            { return time.Time{} }
+func (m *mockFileStreamer) CreateTime() time.Time                         { return time.Time{} }
+func (m *mockFileStreamer) IsDir() bool                                   { return false }
+func (m *mockFileStreamer) GetHash() utils.HashInfo                       { return m.hashInfo }
+func (m *mockFileStreamer) GetID() string                                 { return "" }
+func (m *mockFileStreamer) GetPath() string                               { return "" }
+func (m *mockFileStreamer) GetMimetype() string                           { return "application/octet-stream" }
+func (m *mockFileStreamer) NeedStore() bool                               { return false }
+func (m *mockFileStreamer) IsForceStreamUpload() bool                     { return false }
+func (m *mockFileStreamer) GetExist() model.Obj                           { return nil }
+func (m *mockFileStreamer) SetExist(_ model.Obj)                          {}
+func (m *mockFileStreamer) GetFile() model.File                           { return nil }
+func (m *mockFileStreamer) RangeRead(_ http_range.Range) (io.Reader, error) {
+	return strings.NewReader(string(m.data)), nil
+}
+func (m *mockFileStreamer) CacheFullAndWriter(_ *model.UpdateProgress, _ io.Writer) (model.File, error) {
+	return nil, nil
+}
+
+func newTestOpen115WithRateLimit(t *testing.T, limitRate float64, responder http.HandlerFunc) (*Open115, func() []recordedRequest) {
+	t.Helper()
+	driver, requests := newTestOpen115(t, "trash", responder)
+	driver.limiter = rate.NewLimiter(rate.Limit(limitRate), 1)
+	return driver, requests
+}
+
+func TestPutRateLimitsEverySDKCall(t *testing.T) {
+	// Rate limit: 10 req/s → each WaitLimit blocks ~100ms
+	const limitRate = 10.0
+
+	driver, requests := newTestOpen115WithRateLimit(t, limitRate, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open/upload/init":
+			// First call: status=1 (not rapid), second call: status=2 (rapid success)
+			if r.FormValue("sign_key") != "" {
+				writeSDKSuccess(t, w, map[string]any{"status": 2})
+			} else {
+				writeSDKSuccess(t, w, map[string]any{
+					"status":     7,
+					"sign_key":   "test-key",
+					"sign_check": "0-10",
+				})
+			}
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	})
+
+	stream := &mockFileStreamer{
+		name: "test.txt",
+		size: 100,
+		hashInfo: utils.NewHashInfoByMap(map[*utils.HashType]string{
+			utils.SHA1:      "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+			utils.SHA1_128K: "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+		}),
+		data: make([]byte, 100),
+	}
+	dstDir := &model.Object{ID: "0", Name: "root", IsFolder: true}
+	up := func(float64) {}
+
+	start := time.Now()
+	err := driver.Put(context.Background(), dstDir, stream, up)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("Put returned error: %v", err)
+	}
+
+	reqs := requests()
+	// Expect: pre-hash UploadInit + main UploadInit + sign-check UploadInit = 3 calls
+	if len(reqs) < 3 {
+		t.Fatalf("expected at least 3 requests, got %d", len(reqs))
+	}
+	assertRequestPaths(t, reqs, "/open/upload/init", "/open/upload/init", "/open/upload/init")
+
+	// With 2 SDK calls each preceded by WaitLimit(10/s), minimum elapsed is ~100ms.
+	// Without WaitLimit, both calls fire instantly (<10ms).
+	minExpected := time.Duration(float64(time.Second) / limitRate * float64(len(reqs)-1))
+	tolerance := minExpected * 7 / 10 // 70% to account for timing jitter
+	if elapsed < tolerance {
+		t.Fatalf("Put completed too fast (%v), expected at least %v — WaitLimit likely missing before some SDK calls", elapsed, tolerance)
+	}
+
+	// Also verify individual request spacing
+	for i := 1; i < len(reqs); i++ {
+		gap := reqs[i].Time.Sub(reqs[i-1].Time)
+		gapMin := time.Duration(float64(time.Second) / limitRate * 0.7)
+		if gap < gapMin {
+			t.Fatalf("gap between request %d and %d is %v, expected at least %v — WaitLimit missing", i-1, i, gap, gapMin)
+		}
+	}
+}
+
+func TestPutRateLimitsPreHashPath(t *testing.T) {
+	const limitRate = 10.0
+
+	driver, requests := newTestOpen115WithRateLimit(t, limitRate, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open/upload/init":
+			// Rapid upload success on first try
+			writeSDKSuccess(t, w, map[string]any{"status": 2})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	})
+
+	stream := &mockFileStreamer{
+		name: "test.txt",
+		size: 100,
+		hashInfo: utils.NewHashInfoByMap(map[*utils.HashType]string{
+			utils.SHA1:      "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+			utils.SHA1_128K: "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+		}),
+		data: make([]byte, 100),
+	}
+	dstDir := &model.Object{ID: "0", Name: "root", IsFolder: true}
+
+	err := driver.Put(context.Background(), dstDir, stream, func(float64) {})
+	if err != nil {
+		t.Fatalf("Put returned error: %v", err)
+	}
+
+	reqs := requests()
+	if len(reqs) != 1 {
+		t.Fatalf("expected 1 request, got %d: %v", len(reqs), reqs)
+	}
+	assertRequestPaths(t, reqs, "/open/upload/init")
 }
