@@ -3,6 +3,7 @@ package _115_open
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	sdk "github.com/OpenListTeam/115-sdk-go"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
@@ -788,4 +790,39 @@ func TestPutRateLimitsPreHashPath(t *testing.T) {
 		t.Fatalf("expected 1 request, got %d: %v", len(reqs), reqs)
 	}
 	assertRequestPaths(t, reqs, "/open/upload/init")
+}
+
+func TestGetReturnsObjectNotFoundForEmptyData(t *testing.T) {
+	driver, _ := newTestOpen115(t, "trash", func(w http.ResponseWriter, r *http.Request) {
+		// 115 returns empty array when path doesn't exist
+		writeSDKSuccess(t, w, []any{})
+	})
+	driver.parentPath = ""
+
+	_, err := driver.Get(context.Background(), "/nonexistent/path")
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, errs.ObjectNotFound) {
+		t.Fatalf("expected ObjectNotFound, got: %v", err)
+	}
+}
+
+func TestGetReturnsObjForExistingFolder(t *testing.T) {
+	driver, _ := newTestOpen115(t, "trash", func(w http.ResponseWriter, r *http.Request) {
+		writeSDKSuccess(t, w, map[string]any{
+			"file_id":   "99999",
+			"file_name": "my_folder",
+			"pick_code": "pc-123",
+		})
+	})
+	driver.parentPath = ""
+
+	obj, err := driver.Get(context.Background(), "/my_folder")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if obj.GetID() != "99999" || obj.GetName() != "my_folder" {
+		t.Fatalf("unexpected obj: id=%s name=%s", obj.GetID(), obj.GetName())
+	}
 }

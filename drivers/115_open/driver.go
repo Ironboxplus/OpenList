@@ -209,7 +209,7 @@ func (d *Open115) Get(ctx context.Context, path string) (model.Obj, error) {
 	path = stdpath.Join(d.parentPath, path)
 	resp, err := d.client.GetFolderInfoByPath(ctx, path)
 	if err != nil {
-		if errors.Is(err, sdk.ErrObjectNotFound) {
+		if errors.Is(err, sdk.ErrObjectNotFound) || errors.Is(err, sdk.ErrDataEmpty) {
 			return nil, errs.ObjectNotFound
 		}
 		return nil, err
