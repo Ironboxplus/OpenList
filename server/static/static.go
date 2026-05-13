@@ -1,7 +1,6 @@
 package static
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +11,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -75,16 +73,8 @@ func initStatic() {
 		utils.Log.Infof("Using dynamically fetched dist: %s", distPath)
 		return
 	}
-	// 3. Try auto-fetching from rolling (short timeout to avoid blocking startup)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	distPath := frontend.EnsureDistOnce(ctx)
-	cancel()
-	if distPath != "" {
-		staticFS.swap(os.DirFS(distPath))
-		utils.Log.Infof("Using auto-fetched dist: %s", distPath)
-		return
-	}
-	// 4. Final fallback to embedded dist
+	// 3. Fall back to embedded dist; the Watcher (started after initStatic)
+	// will fetch the rolling release in the background and hot-swap via ReloadStatic.
 	dist, err := fs.Sub(public.Public, "dist")
 	if err != nil {
 		utils.Log.Fatalf("failed to read dist dir: %v", err)

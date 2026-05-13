@@ -19,6 +19,9 @@ air                              # Hot reload during development (uses .air.toml
 
 # Testing
 go test ./...                    # Run all tests
+go test ./drivers/115_open/ -v   # Run tests for a specific driver
+go test ./drivers/115_open/ -run TestCheckUploadCallback -v  # Run a single test
+go build ./drivers/115_open/...  # Quick compile check for a package
 
 # Docker
 docker-compose up                # Run with docker-compose
@@ -31,7 +34,9 @@ docker build -f Dockerfile .     # Build docker image
 - Supports `dev`, `beta`, and release builds
 - Downloads prebuilt frontend distribution automatically
 
-**Go Version**: Requires Go 1.23.4+
+**Go Version**: Requires Go 1.24+ (CI uses 1.25.0)
+
+**Module Replacements** (`go.mod`): Some dependencies use `replace` directives pointing to forks (e.g., `115-sdk-go` → `Ironboxplus/115-sdk-go`). When modifying SDK behavior, check if there's a local fork to edit.
 
 ## Architecture Overview
 
@@ -271,6 +276,37 @@ if stream.IsLinkExpiredError(err) {
     // Refresh link
 }
 ```
+
+### Upload and OSS Callback Validation
+
+Drivers that upload via Aliyun OSS (e.g., `115`, `115_open`) use a callback mechanism: after OSS stores the file, it POSTs to the storage provider's callback URL. The provider returns a JSON response indicating whether the file was registered.
+
+**Critical**: Always capture and validate the callback response:
+```go
+var bodyBytes []byte
+_, err = bucket.CompleteMultipartUpload(imur, parts,
+    oss.Callback(base64.StdEncoding.EncodeToString([]byte(callback))),
+    oss.CallbackVar(base64.StdEncoding.EncodeToString([]byte(callbackVar))),
+    oss.CallbackResult(&bodyBytes),  // ← MUST capture this
+)
+// Check both OSS error AND callback response
+if err != nil { return err }
+// Parse bodyBytes to verify {"state": true}
+```
+
+Without `oss.CallbackResult`, the upload appears successful (OSS returns 200) but the file is never registered on the provider's side. The local cache shows the file temporarily, but it vanishes on refresh.
+
+**`Put` vs `PutResult`**: Drivers can implement either `driver.Put` (returns `error`) or `driver.PutResult` (returns `model.Obj, error`). When `Put` returns nil, `op.Put` creates a temporary object in the directory cache. When `PutResult` returns an actual object, that object is used in the cache instead.
+
+### `CacheFullAndHash` Truncation Pitfall
+
+⚠️ `CacheFullAndHash` → `CacheFullAndWriter` → `cache()` caps buffering at `MaxBufferLimit` (~48MB). For non-seekable streams (browser stream upload) larger than this limit, **SHA1 is only computed on the first ~48MB**, producing an incorrect hash. This causes providers like 115 to reject the upload with checksum errors.
+
+**Workaround** (used in `115_open`): Before calling `CacheFullAndHash`, cache the full stream to a temp file via `utils.CreateTempFile`, then set `fs.Reader = tmpF`. After that, `StreamHashFile` / `RangeRead` will read from the complete temp file.
+
+**Unaffected paths**:
+- `SeekableStream` (copy tasks): uses `RangeRead` directly, never goes through `cache()`
+- Form uploads: `c.FormFile()` already stores to a temp file, so `GetFile()` returns non-nil and `CacheFullAndWriter` reads the entire file
 
 ### Saving Driver State
 

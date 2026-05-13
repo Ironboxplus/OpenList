@@ -117,7 +117,7 @@ func (d *BaiduNetdisk) calculateHashesStream(
 // uploadChunksStream 流式上传所有分片
 func (d *BaiduNetdisk) uploadChunksStream(
 	ctx context.Context,
-	ss streamPkg.StreamSectionReaderIF,
+	ss streamPkg.StreamSectionReader,
 	stream model.FileStreamer,
 	precreateResp *PrecreateResp,
 	path string,

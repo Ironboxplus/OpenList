@@ -808,6 +808,44 @@ func TestGetReturnsObjectNotFoundForEmptyData(t *testing.T) {
 	}
 }
 
+func TestCheckUploadCallbackSuccess(t *testing.T) {
+	body := []byte(`{"state":true,"code":0,"message":"success","data":{"pick_code":"abc","file_name":"test.txt","file_size":100,"file_id":"123","sha1":"da39a3ee","cid":"456"}}`)
+	if err := checkUploadCallback(body); err != nil {
+		t.Fatalf("expected nil error, got: %v", err)
+	}
+}
+
+func TestCheckUploadCallbackStateFalse(t *testing.T) {
+	body := []byte(`{"state":false,"code":990009,"message":"upload failed"}`)
+	err := checkUploadCallback(body)
+	if err == nil {
+		t.Fatal("expected error for state=false, got nil")
+	}
+	if !strings.Contains(err.Error(), "990009") || !strings.Contains(err.Error(), "upload failed") {
+		t.Fatalf("error should contain code and message, got: %v", err)
+	}
+}
+
+func TestCheckUploadCallbackEmptyBody(t *testing.T) {
+	err := checkUploadCallback([]byte{})
+	if err == nil {
+		t.Fatal("expected error for empty body, got nil")
+	}
+	if !strings.Contains(err.Error(), "empty") {
+		t.Fatalf("error should mention empty, got: %v", err)
+	}
+}
+
+func TestCheckUploadCallbackInvalidJSON(t *testing.T) {
+	err := checkUploadCallback([]byte(`not json`))
+	if err == nil {
+		t.Fatal("expected error for invalid JSON, got nil")
+	}
+	if !strings.Contains(err.Error(), "parse error") {
+		t.Fatalf("error should mention parse error, got: %v", err)
+	}
+}
+
 func TestGetReturnsObjForExistingFolder(t *testing.T) {
 	driver, _ := newTestOpen115(t, "trash", func(w http.ResponseWriter, r *http.Request) {
 		writeSDKSuccess(t, w, map[string]any{

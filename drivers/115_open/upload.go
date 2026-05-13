@@ -3,6 +3,7 @@ package _115_open
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -18,6 +19,34 @@ import (
 	"github.com/avast/retry-go"
 	log "github.com/sirupsen/logrus"
 )
+
+type UploadCallbackResult struct {
+	State   bool   `json:"state"`
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    struct {
+		PickCode string `json:"pick_code"`
+		FileName string `json:"file_name"`
+		FileSize int64  `json:"file_size"`
+		FileID   string `json:"file_id"`
+		Sha1     string `json:"sha1"`
+		Cid      string `json:"cid"`
+	} `json:"data"`
+}
+
+func checkUploadCallback(bodyBytes []byte) error {
+	if len(bodyBytes) == 0 {
+		return fmt.Errorf("115 upload callback returned empty response")
+	}
+	var result UploadCallbackResult
+	if err := json.Unmarshal(bodyBytes, &result); err != nil {
+		return fmt.Errorf("115 upload callback response parse error: %w (body: %s)", err, string(bodyBytes))
+	}
+	if !result.State {
+		return fmt.Errorf("115 upload callback failed: code=%d, message=%s", result.Code, result.Message)
+	}
+	return nil
+}
 
 // isTokenExpiredError 检测是否为OSS凭证过期错误
 func isTokenExpiredError(err error) bool {
@@ -67,29 +96,17 @@ func (d *Open115) singleUpload(ctx context.Context, tempF model.File, tokenResp 
 		return err
 	}
 
+	var bodyBytes []byte
 	err = bucket.PutObject(initResp.Object, tempF,
 		oss.Callback(base64.StdEncoding.EncodeToString([]byte(initResp.Callback.Value.Callback))),
 		oss.CallbackVar(base64.StdEncoding.EncodeToString([]byte(initResp.Callback.Value.CallbackVar))),
+		oss.CallbackResult(&bodyBytes),
 	)
-
-	return err
+	if err != nil {
+		return err
+	}
+	return checkUploadCallback(bodyBytes)
 }
-
-// type CallbackResult struct {
-// 	State   bool   `json:"state"`
-// 	Code    int    `json:"code"`
-// 	Message string `json:"message"`
-// 	Data    struct {
-// 		PickCode string `json:"pick_code"`
-// 		FileName string `json:"file_name"`
-// 		FileSize int64  `json:"file_size"`
-// 		FileID   string `json:"file_id"`
-// 		ThumbURL string `json:"thumb_url"`
-// 		Sha1     string `json:"sha1"`
-// 		Aid      int    `json:"aid"`
-// 		Cid      string `json:"cid"`
-// 	} `json:"data"`
-// }
 
 func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer, up driver.UpdateProgress, tokenResp *sdk.UploadGetTokenResp, initResp *sdk.UploadInitResp) error {
 	// 创建OSS客户端的辅助函数
@@ -191,17 +208,16 @@ func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer,
 		up(float64(offset) * 100 / float64(fileSize))
 	}
 
-	// callbackRespBytes := make([]byte, 1024)
+	var bodyBytes []byte
 	_, err = bucket.CompleteMultipartUpload(
 		imur,
 		parts,
 		oss.Callback(base64.StdEncoding.EncodeToString([]byte(initResp.Callback.Value.Callback))),
 		oss.CallbackVar(base64.StdEncoding.EncodeToString([]byte(initResp.Callback.Value.CallbackVar))),
-		// oss.CallbackResult(&callbackRespBytes),
+		oss.CallbackResult(&bodyBytes),
 	)
 	if err != nil {
 		return err
 	}
-
-	return nil
+	return checkUploadCallback(bodyBytes)
 }

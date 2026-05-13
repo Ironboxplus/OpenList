@@ -198,6 +198,114 @@ P0：在上传入口增加"声明长度 vs 实际接收长度"日志；排查反
 
 ---
 
+## 2026-05-13 — 115 Open 上传静默失败修复（双 bug）
+
+### 问题现象
+
+前端上传文件显示成功（进度 100%，PUT `/api/fs/put` 返回 HTTP 200），但刷新页面后文件消失。日志无任何错误。
+
+### 日志分析
+
+从 330K 行日志中定位到两次上传（12:53:31 和 13:10:05），均耗时 ~2 分钟（实际数据传输），返回 200。上传前后 `arc` 目录文件数始终为 11，文件从未出现在 115 的文件列表中。
+
+对比历史上传：
+
+- **2026-04-06**：3 次上传（10s/22s/25s）全部成功，`PUB` 目录从 2 增至 5 文件
+- **2026-04-14**：第 1 次上传失败（5→5 文件），第 2 次成功（5→6 文件）
+- **2026-05-13**：两次上传均失败（11→11 文件）
+
+### Bug 1：OSS 回调未校验（静默失败）
+
+对比非 Open 版 115 驱动（`drivers/115/util.go`）与 Open 版（`drivers/115_open/upload.go`）：
+
+**非 Open 版**（正确）：
+
+```go
+var bodyBytes []byte
+bucket.CompleteMultipartUpload(imur, parts,
+    oss.Callback(...),
+    oss.CallbackResult(&bodyBytes),  // ← 捕获回调响应
+)
+var uploadResult UploadResult
+json.Unmarshal(bodyBytes, &uploadResult)
+return &uploadResult, uploadResult.Err(...)  // ← 校验 state 字段
+```
+
+**Open 版**（有 bug）：
+
+```go
+// callbackRespBytes := make([]byte, 1024)  ← 注释掉了！
+_, err = bucket.CompleteMultipartUpload(imur, parts,
+    oss.Callback(...),
+    // oss.CallbackResult(&callbackRespBytes),  ← 注释掉了！
+)
+if err != nil { return err }  // ← 只检查 OSS 层错误
+return nil  // ← 115 回调失败被忽略
+```
+
+OSS 上传流程：客户端上传分片到 OSS → `CompleteMultipartUpload` → OSS 调用 115 的回调 URL → 115 返回 `{"state": true/false}`。OSS 只要回调 URL 返回 HTTP 200 就认为成功（`err == nil`），但 115 可能在 body 中返回 `{"state": false}` 表示文件注册失败。Open 版驱动没有捕获回调 body，所以 115 拒绝注册文件时完全静默。
+
+`op.Put`（`internal/op/fs.go:714-731`）在 `err == nil` 时把文件临时加入目录缓存 → 前端显示成功 → 用户刷新后缓存过期，文件消失。
+
+**修复**：新增 `UploadCallbackResult` + `checkUploadCallback()`，`singleUpload` 和 `multpartUpload` 均添加 `oss.CallbackResult(&bodyBytes)` 捕获并校验回调。
+
+### Bug 2：Stream 模式大文件 SHA1 截断（根因）
+
+加了回调校验后看到真正的错误：`code=10002, message=校验文件失败，请重新上传。`
+
+关键线索：Form 模式（`PUT /api/fs/form`）和 Copy task 均成功，只有 Stream 模式（`PUT /api/fs/put`）失败。
+
+**根因**：`CacheFullAndHash` → `CacheFullAndWriter` → `cache()` 将缓存上限截断为 `MaxBufferLimit`（~48MB）：
+
+```go
+func (f *FileStream) cache(maxCacheSize int64) (model.File, error) {
+    if maxCacheSize > int64(conf.MaxBufferLimit) {
+        maxCacheSize = int64(conf.MaxBufferLimit)  // ← 截断！
+    }
+    // ...只读取前 48MB 到 peekBuff
+}
+```
+
+870MB 文件：SHA1 只算了前 48MB → `UploadInit` 带错误的 SHA1 → 完整 870MB 上传到 OSS → 115 校验：SHA1(870MB) ≠ SHA1(前 48MB) → 拒绝。
+
+**为什么 Form 模式不受影响**：`c.FormFile()` 已将文件存入 `*os.File` 临时文件，`GetFile()` 返回非 nil，`CacheFullAndWriter` 走第一个分支直接读整个文件算 hash。
+
+**为什么 Copy task 不受影响**：走 `SeekableStream` 路径（`isSeekable == true`），用 `StreamHashFile` → `RangeRead` 按需读取，不经过 `cache()`。
+
+**修复**：`drivers/115_open/driver.go` Put 方法，对非 seekable 的 `FileStream`，当 `GetFile() == nil` 时先用 `utils.CreateTempFile` 将完整流写入临时文件，设置 `fs.Reader = tmpF`，再用 `StreamHashFile` 从临时文件计算正确的 SHA1。
+
+### 上传数据流（修复后）
+
+```
+Stream 上传 (FileStream, !isSeekable):
+  HTTP Body → CreateTempFile(磁盘) → StreamHashFile(临时文件) → UploadInit → 分片上传(临时文件) → 清理
+
+Copy task (SeekableStream, isSeekable):  [不变]
+  Pass 1: RangeRead(源存储) → StreamHashFile → SHA1
+  Pass 2: RangeRead(源存储) → directSectionReader → 分片上传
+```
+
+### 附带修复：前端下载阻塞启动
+
+`server/static/static.go`：移除 `initStatic` 中 30 秒超时的同步前端下载（国内 GitHub 不通导致启动卡住），改为直接使用内嵌 dist，由 `Watcher` 后台异步下载 rolling 版本并热替换。
+
+### 测试
+
+新增 4 个回调校验测试，既有 30 个测试全部通过：
+
+- `TestCheckUploadCallbackSuccess` — state=true 正常通过
+- `TestCheckUploadCallbackStateFalse` — state=false 返回含 code/message 的错误
+- `TestCheckUploadCallbackEmptyBody` — 空响应返回错误
+- `TestCheckUploadCallbackInvalidJSON` — 非法 JSON 返回错误
+
+### `cache()` 截断是否影响其他驱动
+
+`cache()` 的 `MaxBufferLimit` 截断是刻意设计（避免流式缓存占用过多内存），但 `CacheFullAndWriter` 名为"CacheFull"却内部调 `cache()` 导致大文件只缓存部分。任何依赖 `CacheFullAndHash` 对大文件（> MaxBufferLimit）计算 hash 的非 seekable 流驱动都可能受影响。本次修复仅在 115_open 驱动层绕过，未改动核心 stream 包。
+
+- Files: `drivers/115_open/driver.go`, `drivers/115_open/driver_test.go`, `drivers/115_open/upload.go`, `server/static/static.go`
+
+---
+
 ## Architecture Notes
 
 ### Upload Data Flow (Current)
