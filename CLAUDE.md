@@ -298,15 +298,35 @@ Without `oss.CallbackResult`, the upload appears successful (OSS returns 200) bu
 
 **`Put` vs `PutResult`**: Drivers can implement either `driver.Put` (returns `error`) or `driver.PutResult` (returns `model.Obj, error`). When `Put` returns nil, `op.Put` creates a temporary object in the directory cache. When `PutResult` returns an actual object, that object is used in the cache instead.
 
-### `CacheFullAndHash` Truncation Pitfall
+### HybridCache replaces the old `MaxBufferLimit` truncation
 
-⚠️ `CacheFullAndHash` → `CacheFullAndWriter` → `cache()` caps buffering at `MaxBufferLimit` (~48MB). For non-seekable streams (browser stream upload) larger than this limit, **SHA1 is only computed on the first ~48MB**, producing an incorrect hash. This causes providers like 115 to reject the upload with checksum errors.
+Historically `CacheFullAndHash` → `CacheFullAndWriter` → `cache()` capped buffering at `MaxBufferLimit` (~48MB), so non-seekable streams larger than that produced a truncated SHA1 (only the first 48MB hashed) and providers like 115 rejected the upload. The 115_open driver carried a `utils.CreateTempFile` workaround.
 
-**Workaround** (used in `115_open`): Before calling `CacheFullAndHash`, cache the full stream to a temp file via `utils.CreateTempFile`, then set `fs.Reader = tmpF`. After that, `StreamHashFile` / `RangeRead` will read from the complete temp file.
+**Current (2026-05-17)**: upstream PR #2460 unified caching via `internal/mem.HybridCache` — three tiers (heap memory → `LinearMemory` → temp file fallback) with 16MB blocks (`MaxBlockLimit`). `CacheFullAndWriter` now writes the *entire* stream regardless of size, so the truncation bug is gone for **all drivers**, not just 115_open. The 115_open workaround was removed; the standard `stream.CacheFullAndHash` path is back.
 
 **Unaffected paths**:
 - `SeekableStream` (copy tasks): uses `RangeRead` directly, never goes through `cache()`
 - Form uploads: `c.FormFile()` already stores to a temp file, so `GetFile()` returns non-nil and `CacheFullAndWriter` reads the entire file
+
+### Pass 2 prefetch on `hybridSectionReader`
+
+For sequential multipart uploads (115_open, baidu_netdisk, aliyundrive_open, etc.), `hybridSectionReader.GetSectionReader` launches a background goroutine to pre-read the next chunk while the caller uploads the current one. The next call picks up the prefetched block; mismatched offsets fall back to synchronous read. Prefetch is clamped to remaining file size, drains on `DiscardSection`, and surfaces errors on the next `GetSectionReader`. Cleanup is registered via `file.Add` so the goroutine is drained before `HybridCache` is freed.
+
+Drivers that already use `errgroup.Lifecycle` (e.g. 123/upload.go) with `Before` (List/GetSectionReader) and `Do` (upload) get overlap from the lifecycle pattern itself; the section-reader prefetch helps drivers that loop sequentially without Before/Do split (e.g. 115_open, which requires `oss.Sequential()`).
+
+### Merge-task ObjectNotFound tolerance
+
+Merge-mode `FileTransferTask.RunWithNextTaskCallback` calls `op.List(dst)` to build the `existedObjs` skip set. A non-existent dst must be treated as "empty" rather than fatal (otherwise resuming an interrupted merge to a fresh dst fails immediately). The logic is extracted into `existingDstFilesFn` in `internal/fs/copy_move.go`:
+
+```go
+dstObjs, err := listDst(ctx, dstPath)
+if err != nil && !errors.Is(err, errs.ObjectNotFound) {
+    return nil, errors.WithMessagef(err, "failed list dst [%s] objs", dstPath)
+}
+// non-existent dst → empty map, merge proceeds and creates dst on demand
+```
+
+A previous BFS-style "precreate one level of subdirectories" optimization was removed (2026-05-17, commit `6b3ce577`); directory creation now happens on demand via `op.Put`'s internal `MakeDir(parent)` and `op.MakeDir`'s recursive parent walk. The top-level dst `MakeDir` at `copy_move.go:198` is kept for early failure detection. 12 unit tests on `existingDstFilesFn` (including raw + wrapped `ObjectNotFound`) lock in the contract.
 
 ### Saving Driver State
 

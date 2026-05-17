@@ -306,6 +306,84 @@ Copy task (SeekableStream, isSeekable):  [不变]
 
 ---
 
+## 2026-05-17 — Rebase onto upstream HybridCache + Pass 2 prefetch + BFS precreate 删除
+
+### 背景
+
+Upstream（OpenListTeam/OpenList）通过 PR #2460（`b6db83ed`）引入 `HybridCache`：三级缓存（普通堆内存 → `LinearMemory` → 文件落盘），用来统一 stream 缓存路径。这恰好替代了 2026-05-13 在 115_open 驱动层手写的 SHA1 截断绕过（`utils.CreateTempFile` workaround）。
+
+### 行动 1：Rebase 16 个提交到 upstream HybridCache
+
+用 `git rebase --onto upstream/main` 把本地分支挪到 HybridCache 之上。冲突解决原则：**保留双方功能**。
+
+关键冲突文件：
+
+- **`internal/stream/stream.go`** — 取 upstream HybridCache 版（`cache()` 内部三级分配），删掉本地原来的 `MaxBufferLimit` workaround
+- **`internal/stream/util.go`** — 保留本地全部新增：`RefreshableRangeReader`、`selfHealingReadCloser`、`IsLinkExpiredError`、`ReadFullWithRangeRead`、`streamHashSeekableWithPrefetch`；丢弃本地的 `directSectionReader` + prefetch（在新结构上重写）；upstream 的 `byteSectionReader` / `hybridSectionReader` 保留
+- **`drivers/115_open/driver.go`** Put 方法 — 删掉 `CreateTempFile` workaround，恢复标准 `CacheFullAndHash` 路径（HybridCache 已经保证完整缓存）
+- **`drivers/baidu_netdisk/upload.go`** — 接口重命名：`StreamSectionReaderIF` → `StreamSectionReader`（upstream 名称）
+- **`server/static/static.go`** — 保留本地动态前端 `reloadableFS`（rebase 期间一度被覆盖，已修正）
+
+Rebase 后 22 commits ahead of origin，force-pushed 至 `7995dbdb`。
+
+### HybridCache vs 旧 workaround
+
+| 维度 | 旧 workaround | HybridCache |
+|---|---|---|
+| 修复范围 | 仅 115_open | stream 层，全 driver 受益 |
+| 大文件存储 | 一律落盘 | 优先内存，紧张才落盘 |
+| 块策略 | 单 buffer | 16MB 分块（`MaxBlockLimit`） |
+| GC 友好度 | 一个大 `[]byte` | `LinearMemory` 避开 Go heap |
+| Section reader 适配 | 整 buffer 切片 | 每块独立，对 `hybridSectionReader` 天然友好 |
+
+### 行动 2：Pass 2 prefetch on `hybridSectionReader`（commit `7995dbdb`）
+
+旧 `directSectionReader` 已被 upstream 的 `hybridSectionReader` 替代，但失去了"上传当前分片时异步预读下一分片"的优化（影响 115_open 这种顺序上传的 driver）。
+
+TDD 红→绿→重构：
+
+- 在 `hybridSectionReader` 上加 `prefetchTask` 状态 + `schedulePrefetch` / `takePrefetched` / `waitPrefetch`
+- 每次 `GetSectionReader` 返回后启动 goroutine 预读下一块到一个 pending block
+- 下次 `GetSectionReader` 命中即拿、不命中走原路径
+- `DiscardSection` 排空 prefetch；prefetch 错误延迟到下次 `GetSectionReader` 暴露
+- `file.Add(closerFunc(waitPrefetch))` 注册清理，避免 `hc` 被释放时 prefetch 还在写
+
+8 个测试覆盖：overlap 时序、顺序正确性、最后分片小于 partSize、Discard 配合、prefetch 错误传播、不超 EOF、长度 clamp、非 hybrid 路径回退。
+
+- Files: `internal/stream/util.go`, `internal/stream/section_reader_prefetch_test.go`
+
+### 行动 3：删除 BFS precreate（commit `6b3ce577`）
+
+旧 `preCreateDirTreeFn` 提前 BFS 创建 dst 一层子目录。原始动机：避开"merge 任务 List 不存在的 dst 会致命"的 bug。
+
+排查后发现该 bug 已由三层独立修复覆盖：
+
+1. **`copy_move.go:213` 容错判断**（PR #1898，你最初提交、KirCute 优化、Tron 合入）：`if err != nil && !errors.Is(err, errs.ObjectNotFound)` 容忍 dst 不存在
+2. **`op.Put` 内置 MakeDir**（`internal/op/fs.go:682`）：上传前自动建父目录
+3. **`op.MakeDir` 递归 + 缓存同步重试**（`internal/op/fs.go:354-364`）：递归建父链 + 100ms 重试解决云盘缓存延迟
+
+BFS precreate 在功能上已变成纯性能优化（提前批建 + 缓存预热），不再是 bug 修复的关键依赖。
+
+**TDD 流程**：
+
+1. 抽出 `existingDstFilesFn(ctx, listDst, dstPath) → map[string]bool`，把 merge 模式构建 `existedObjs` 的逻辑独立为可注入纯函数
+2. 写 12 个单测：empty/files-only/dirs-only/mixed/raw-ObjectNotFound/wrapped-ObjectNotFound（#1898 回归保护）/其他 List 错误/ctx 取消前/ctx 取消中/重名/万级 dst 性能/单次 List 合理性
+3. 全绿后删除 `preCreateDirTreeFn`、`preCreateDirectoryTree` 方法、调用点、原有 11 个 `TestPreCreateDirTreeFn_*` 测试
+4. 保留顶层 dst MakeDir（`copy_move.go:198`）做早期失败检测
+
+净 -95 行代码。`existingDstFilesFn` 的 ObjectNotFound 容错测试（`TestExistingDstFilesFn_DstDoesNotExist_RawError` / `_WrappedError`）是 #1898 的回归护栏，确保未来重构不把那个老 bug 漏回去。
+
+- Files: `internal/fs/copy_move.go`, `internal/fs/copy_move_test.go`
+
+### 行动后状态
+
+- `go build ./...` 干净
+- `internal/fs`、`internal/stream`、`internal/op`、`drivers/115_open`、`drivers/baidu_netdisk` 全部测试通过
+- 不相关失败：`internal/net/oss_test.go` 的 HTTPS proxy 测试（rebase 前就失败）、`pkg/aria2/rpc` 测试（需要本地 aria2 服务）
+- Branch `feat/dynamic-frontend` HEAD 推至 `6b3ce577`
+
+---
+
 ## Architecture Notes
 
 ### Upload Data Flow (Current)
