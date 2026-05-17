@@ -3,11 +3,14 @@ package fs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	pkgerrors "github.com/pkg/errors"
 )
 
 // ---------- helpers ----------
@@ -20,298 +23,256 @@ func fileObj(name string) model.Obj {
 	return &model.Object{Name: name, IsFolder: false}
 }
 
-// callRecorder records every path passed to makeDir and listSrc.
-type callRecorder struct {
-	mu     sync.Mutex
-	mkdirs []string
-	lists  []string
-	// listReturns maps srcPath → objects to return (nil = empty)
-	listReturns map[string][]model.Obj
-	// mkdirErr maps dstPath → error to return
-	mkdirErr map[string]error
+// listRecorder records every call to listDst so tests can assert on
+// invocation patterns when needed.
+type listRecorder struct {
+	mu       sync.Mutex
+	calls    []string
+	respond  func(path string) ([]model.Obj, error)
 }
 
-func newRecorder() *callRecorder {
-	return &callRecorder{
-		listReturns: make(map[string][]model.Obj),
-		mkdirErr:    make(map[string]error),
-	}
+func newListRecorder(respond func(string) ([]model.Obj, error)) *listRecorder {
+	return &listRecorder{respond: respond}
 }
 
-func (r *callRecorder) makeDir(_ context.Context, path string) error {
+func (r *listRecorder) listDst(_ context.Context, path string) ([]model.Obj, error) {
 	r.mu.Lock()
-	r.mkdirs = append(r.mkdirs, path)
-	err := r.mkdirErr[path]
+	r.calls = append(r.calls, path)
 	r.mu.Unlock()
-	return err
+	return r.respond(path)
 }
 
-func (r *callRecorder) listSrc(_ context.Context, path string) ([]model.Obj, error) {
-	r.mu.Lock()
-	r.lists = append(r.lists, path)
-	objs := r.listReturns[path]
-	r.mu.Unlock()
-	return objs, nil
-}
+// ---------- tests: existingDstFilesFn ----------
+//
+// These tests pin down the contract of the merge-mode existedObjs builder
+// extracted from RunWithNextTaskCallback. They are the regression guard
+// for the deletion of the BFS precreate logic: the only invariant that
+// the BFS precreate quietly protected (and that #1898's ObjectNotFound
+// tolerance independently fixes) lives in this function.
 
-func (r *callRecorder) hasMkdir(path string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, p := range r.mkdirs {
-		if p == path {
-			return true
-		}
-	}
-	return false
-}
-
-func (r *callRecorder) hasList(path string) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, p := range r.lists {
-		if p == path {
-			return true
-		}
-	}
-	return false
-}
-
-// ---------- tests ----------
-
-// TestPreCreateDirTreeFn_EmptyObjs: no objects → no calls at all.
-func TestPreCreateDirTreeFn_EmptyObjs(t *testing.T) {
-	rec := newRecorder()
-	err := preCreateDirTreeFn(context.Background(), nil, "/src", "/dst", 1, rec.makeDir, rec.listSrc)
+// 1. dst exists but is empty → empty map, no error.
+func TestExistingDstFilesFn_EmptyDst(t *testing.T) {
+	rec := newListRecorder(func(string) ([]model.Obj, error) { return nil, nil })
+	got, err := existingDstFilesFn(context.Background(), rec.listDst, "/dst")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(rec.mkdirs) != 0 {
-		t.Errorf("expected 0 MakeDir calls, got %d: %v", len(rec.mkdirs), rec.mkdirs)
-	}
-	if len(rec.lists) != 0 {
-		t.Errorf("expected 0 List calls, got %d: %v", len(rec.lists), rec.lists)
+	if len(got) != 0 {
+		t.Fatalf("expected empty map, got %v", got)
 	}
 }
 
-// TestPreCreateDirTreeFn_OnlyFiles: file objects only → zero MakeDir calls.
-func TestPreCreateDirTreeFn_OnlyFiles(t *testing.T) {
-	objs := []model.Obj{fileObj("a.txt"), fileObj("b.txt")}
-	rec := newRecorder()
-	if err := preCreateDirTreeFn(context.Background(), objs, "/src", "/dst", 1, rec.makeDir, rec.listSrc); err != nil {
+// 2. dst contains only files → all included.
+func TestExistingDstFilesFn_OnlyFiles(t *testing.T) {
+	rec := newListRecorder(func(string) ([]model.Obj, error) {
+		return []model.Obj{fileObj("a.txt"), fileObj("b.txt"), fileObj("c.txt")}, nil
+	})
+	got, err := existingDstFilesFn(context.Background(), rec.listDst, "/dst")
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(rec.mkdirs) != 0 {
-		t.Errorf("expected 0 MakeDir calls, got %d", len(rec.mkdirs))
+	for _, name := range []string{"a.txt", "b.txt", "c.txt"} {
+		if !got[name] {
+			t.Errorf("expected %q in existed set, got %v", name, got)
+		}
+	}
+	if len(got) != 3 {
+		t.Errorf("expected 3 entries, got %d: %v", len(got), got)
 	}
 }
 
-// TestPreCreateDirTreeFn_FlatDirs_MaxDepth0: dirs present, maxDepth=0 → MakeDir
-// called for each dir with correct dstPath, NO listSrc calls.
-func TestPreCreateDirTreeFn_FlatDirs_MaxDepth0(t *testing.T) {
-	objs := []model.Obj{dirObj("subA"), fileObj("file.txt"), dirObj("subB")}
-	rec := newRecorder()
-	if err := preCreateDirTreeFn(context.Background(), objs, "/src", "/dst/parent", 0, rec.makeDir, rec.listSrc); err != nil {
+// 3. dst contains only directories → empty map (dirs don't count as
+//    "existed" because merge only skips already-uploaded *files*).
+func TestExistingDstFilesFn_OnlyDirs(t *testing.T) {
+	rec := newListRecorder(func(string) ([]model.Obj, error) {
+		return []model.Obj{dirObj("subA"), dirObj("subB")}, nil
+	})
+	got, err := existingDstFilesFn(context.Background(), rec.listDst, "/dst")
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
-	if !rec.hasMkdir("/dst/parent/subA") {
-		t.Error("expected MakeDir(/dst/parent/subA)")
-	}
-	if !rec.hasMkdir("/dst/parent/subB") {
-		t.Error("expected MakeDir(/dst/parent/subB)")
-	}
-	if rec.hasMkdir("/dst/parent/file.txt") {
-		t.Error("MakeDir must NOT be called for a file")
-	}
-	if len(rec.lists) != 0 {
-		t.Errorf("maxDepth=0 must not trigger any List calls, got: %v", rec.lists)
+	if len(got) != 0 {
+		t.Fatalf("dirs must not appear in existed-files map, got %v", got)
 	}
 }
 
-// TestPreCreateDirTreeFn_Recursion_CorrectSrcPath is the regression test for the
-// srcBasePath bug: with maxDepth=1 the recursive List must use the SUBDIR src path,
-// not the original top-level srcBasePath.
-func TestPreCreateDirTreeFn_Recursion_CorrectSrcPath(t *testing.T) {
-	// /src/parent contains [subA(dir), subB(dir)]
-	// /src/parent/subA contains [subA1(dir)]
-	// /src/parent/subB contains []
-	topObjs := []model.Obj{dirObj("subA"), dirObj("subB")}
-	rec := newRecorder()
-	rec.listReturns["/src/parent/subA"] = []model.Obj{dirObj("subA1")}
-	rec.listReturns["/src/parent/subB"] = []model.Obj{}
-
-	if err := preCreateDirTreeFn(context.Background(), topObjs, "/src/parent", "/dst/parent", 1, rec.makeDir, rec.listSrc); err != nil {
+// 4. dst contains mixed files and dirs → only files are recorded.
+func TestExistingDstFilesFn_MixedFilesAndDirs(t *testing.T) {
+	rec := newListRecorder(func(string) ([]model.Obj, error) {
+		return []model.Obj{
+			fileObj("readme.md"),
+			dirObj("assets"),
+			fileObj("main.go"),
+			dirObj("pkg"),
+			fileObj("go.mod"),
+		}, nil
+	})
+	got, err := existingDstFilesFn(context.Background(), rec.listDst, "/dst")
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
-	// ── first level dirs must be created
-	if !rec.hasMkdir("/dst/parent/subA") {
-		t.Error("expected MakeDir(/dst/parent/subA)")
+	if len(got) != 3 {
+		t.Errorf("expected 3 file entries, got %d: %v", len(got), got)
 	}
-	if !rec.hasMkdir("/dst/parent/subB") {
-		t.Error("expected MakeDir(/dst/parent/subB)")
+	for _, name := range []string{"readme.md", "main.go", "go.mod"} {
+		if !got[name] {
+			t.Errorf("expected %q in existed set, got %v", name, got)
+		}
 	}
-
-	// ── listSrc must use subdirSrcPath (NOT the whole /src/parent again)
-	if !rec.hasList("/src/parent/subA") {
-		t.Error("listSrc must be called with /src/parent/subA, got:", rec.lists)
-	}
-	if !rec.hasList("/src/parent/subB") {
-		t.Error("listSrc must be called with /src/parent/subB, got:", rec.lists)
-	}
-	// The original bug would have called listSrc("/src/parent/subA") as
-	// stdpath.Join(t.SrcActualPath, "subA") where t.SrcActualPath=="/src/parent",
-	// but in a deeper recursive call (e.g. maxDepth=2) it would have used
-	// the top-level path incorrectly; verify the nested mkdir used the right dst.
-	if !rec.hasMkdir("/dst/parent/subA/subA1") {
-		t.Error("expected MakeDir(/dst/parent/subA/subA1), got mkdirs:", rec.mkdirs)
-	}
-}
-
-// TestPreCreateDirTreeFn_MaxDepth1_NoFurtherRecursion: with maxDepth=1 recursion
-// goes exactly one level. The nested list returns another dir, but since maxDepth
-// reaches 0 that deeper dir must NOT be listed further.
-func TestPreCreateDirTreeFn_MaxDepth1_NoFurtherRecursion(t *testing.T) {
-	topObjs := []model.Obj{dirObj("sub")}
-	rec := newRecorder()
-	// sub contains deeper, deeper contains deepest
-	rec.listReturns["/src/sub"] = []model.Obj{dirObj("deeper")}
-	rec.listReturns["/src/sub/deeper"] = []model.Obj{dirObj("deepest")} // should NOT be listed
-
-	if err := preCreateDirTreeFn(context.Background(), topObjs, "/src", "/dst", 1, rec.makeDir, rec.listSrc); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if !rec.hasMkdir("/dst/sub") {
-		t.Error("expected /dst/sub to be created")
-	}
-	if !rec.hasMkdir("/dst/sub/deeper") {
-		t.Error("expected /dst/sub/deeper to be created (within maxDepth=1)")
-	}
-	// deepest must NOT be created (would require maxDepth=2)
-	if rec.hasMkdir("/dst/sub/deeper/deepest") {
-		t.Error("/dst/sub/deeper/deepest must NOT be created at maxDepth=1")
-	}
-	// /src/sub/deeper must NOT be listed (we've hit maxDepth=0 at that point)
-	if rec.hasList("/src/sub/deeper") {
-		t.Error("/src/sub/deeper must NOT be listed when maxDepth reaches 0")
-	}
-}
-
-// TestPreCreateDirTreeFn_ContextCancelled: context cancelled before processing →
-// returns ctx.Err, makes zero or partial calls.
-func TestPreCreateDirTreeFn_ContextCancelled(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // already cancelled
-
-	objs := []model.Obj{dirObj("sub")}
-	rec := newRecorder()
-	err := preCreateDirTreeFn(ctx, objs, "/src", "/dst", 1, rec.makeDir, rec.listSrc)
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("expected context.Canceled, got: %v", err)
-	}
-	if len(rec.mkdirs) != 0 {
-		t.Errorf("no MakeDir should be called after cancellation, got: %v", rec.mkdirs)
-	}
-}
-
-// TestPreCreateDirTreeFn_ContextCancelledDuringRecursion: context is cancelled
-// during the second-pass recursion loop.
-func TestPreCreateDirTreeFn_ContextCancelledDuringRecursion(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Two dirs; cancel after the first List in recursion
-	callCount := 0
-	listSrc := func(c context.Context, path string) ([]model.Obj, error) {
-		callCount++
-		cancel() // cancel on first list call
-		return nil, nil
-	}
-	objs := []model.Obj{dirObj("sub1"), dirObj("sub2")}
-	rec := newRecorder()
-	err := preCreateDirTreeFn(ctx, objs, "/src", "/dst", 1, rec.makeDir, listSrc)
-	if !errors.Is(err, context.Canceled) {
-		t.Errorf("expected context.Canceled after cancellation during recursion, got: %v", err)
-	}
-	if callCount > 1 {
-		t.Errorf("listSrc should have been called at most once before ctx.Err fired, got %d", callCount)
-	}
-}
-
-// TestPreCreateDirTreeFn_MakeDirErrorNonFatal: a MakeDir failure on one dir must
-// not stop processing of subsequent dirs.
-func TestPreCreateDirTreeFn_MakeDirErrorNonFatal(t *testing.T) {
-	objs := []model.Obj{dirObj("subA"), dirObj("subB"), dirObj("subC")}
-	rec := newRecorder()
-	rec.mkdirErr["/dst/subA"] = errors.New("quota exceeded")
-
-	if err := preCreateDirTreeFn(context.Background(), objs, "/src", "/dst", 0, rec.makeDir, rec.listSrc); err != nil {
-		t.Fatalf("error should not propagate from MakeDir failure: %v", err)
-	}
-	// All three must have been attempted despite the error on subA
-	for _, p := range []string{"/dst/subA", "/dst/subB", "/dst/subC"} {
-		if !rec.hasMkdir(p) {
-			t.Errorf("expected MakeDir(%s) to be called", p)
+	for _, name := range []string{"assets", "pkg"} {
+		if got[name] {
+			t.Errorf("dir %q must NOT be in existed set, got %v", name, got)
 		}
 	}
 }
 
-// TestPreCreateDirTreeFn_ListErrorNonFatal: a List error for one subdir during
-// recursion skips that subdir but continues with the rest.
-func TestPreCreateDirTreeFn_ListErrorNonFatal(t *testing.T) {
-	objs := []model.Obj{dirObj("subA"), dirObj("subB")}
-	listCallCount := 0
-	listSrc := func(_ context.Context, path string) ([]model.Obj, error) {
-		listCallCount++
-		if path == "/src/subA" {
-			return nil, errors.New("I/O error")
-		}
-		return []model.Obj{dirObj("nested")}, nil
+// 5. dst doesn't exist (raw errs.ObjectNotFound) → empty map, no error.
+//    THIS IS THE REGRESSION TEST FOR #1898.
+func TestExistingDstFilesFn_DstDoesNotExist_RawError(t *testing.T) {
+	rec := newListRecorder(func(string) ([]model.Obj, error) {
+		return nil, errs.ObjectNotFound
+	})
+	got, err := existingDstFilesFn(context.Background(), rec.listDst, "/dst/never-existed")
+	if err != nil {
+		t.Fatalf("ObjectNotFound on dst must be tolerated, got error: %v", err)
 	}
-	rec := newRecorder()
-	if err := preCreateDirTreeFn(context.Background(), objs, "/src", "/dst", 1, rec.makeDir, listSrc); err != nil {
-		t.Fatalf("List error must not be fatal: %v", err)
-	}
-	// subB's nested dir should still be processed despite subA's List failure
-	if !rec.hasMkdir("/dst/subB/nested") {
-		t.Error("expected /dst/subB/nested to be created despite subA list error, mkdirs:", rec.mkdirs)
-	}
-	if listCallCount != 2 {
-		t.Errorf("both subdirs must be attempted for listing, got %d calls", listCallCount)
+	if len(got) != 0 {
+		t.Fatalf("expected empty map on non-existent dst, got %v", got)
 	}
 }
 
-// TestPreCreateDirTreeFn_MixedObjs: mixed files and dirs; only dirs are processed.
-func TestPreCreateDirTreeFn_MixedObjs(t *testing.T) {
-	objs := []model.Obj{
-		fileObj("readme.md"),
-		dirObj("assets"),
-		fileObj("main.go"),
-		dirObj("pkg"),
+// 6. dst doesn't exist (wrapped via pkg/errors.WithMessage) → empty map.
+//    Guards the errors.Is unwrapping behavior that matters in practice:
+//    op.List wraps the underlying ObjectNotFound with context messages.
+func TestExistingDstFilesFn_DstDoesNotExist_WrappedError(t *testing.T) {
+	rec := newListRecorder(func(string) ([]model.Obj, error) {
+		// emulate the op.List wrapping path: GetUnwrap returns
+		// ObjectNotFound, list wraps with WithMessage twice.
+		return nil, pkgerrors.WithMessage(pkgerrors.WithMessage(errs.ObjectNotFound, "failed get dir"), "while listing")
+	})
+	got, err := existingDstFilesFn(context.Background(), rec.listDst, "/dst")
+	if err != nil {
+		t.Fatalf("wrapped ObjectNotFound must be tolerated, got error: %v", err)
 	}
-	rec := newRecorder()
-	if err := preCreateDirTreeFn(context.Background(), objs, "/src", "/dst", 0, rec.makeDir, rec.listSrc); err != nil {
+	if len(got) != 0 {
+		t.Fatalf("expected empty map, got %v", got)
+	}
+}
+
+// 7. List returns a non-ObjectNotFound error (e.g. permission denied,
+//    I/O failure) → error propagates so the task fails fast.
+func TestExistingDstFilesFn_OtherListError_Propagates(t *testing.T) {
+	sentinel := errors.New("permission denied")
+	rec := newListRecorder(func(string) ([]model.Obj, error) {
+		return nil, sentinel
+	})
+	_, err := existingDstFilesFn(context.Background(), rec.listDst, "/dst")
+	if err == nil {
+		t.Fatal("expected error to propagate, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected wrapped sentinel error, got: %v", err)
+	}
+}
+
+// 8. Context cancelled before list → ctx.Err returned (the contract for
+//    listDst is to honor ctx; the caller's loop also checks ctx.Err).
+func TestExistingDstFilesFn_CtxCancelledBeforeList(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	rec := newListRecorder(func(string) ([]model.Obj, error) {
+		// A real op.List would honor ctx and return ctx.Err.
+		return nil, ctx.Err()
+	})
+	_, err := existingDstFilesFn(ctx, rec.listDst, "/dst")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+}
+
+// 9. Context cancelled mid-iteration → loop bails with ctx.Err and the
+//    partial map is not returned.
+func TestExistingDstFilesFn_CtxCancelledDuringIteration(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Big enough list that cancelling after returning still gives the
+	// loop a chance to observe ctx.Err.
+	objs := make([]model.Obj, 1000)
+	for i := range objs {
+		objs[i] = fileObj(fmt.Sprintf("f-%d.txt", i))
+	}
+
+	rec := newListRecorder(func(string) ([]model.Obj, error) {
+		cancel() // cancel immediately after list returns
+		return objs, nil
+	})
+	_, err := existingDstFilesFn(ctx, rec.listDst, "/dst")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got: %v", err)
+	}
+}
+
+// 10. dst contains duplicate file names (pathological but possible if a
+//     driver returns duplicates) → map dedupes silently, no panic, no error.
+func TestExistingDstFilesFn_DuplicateNames(t *testing.T) {
+	rec := newListRecorder(func(string) ([]model.Obj, error) {
+		return []model.Obj{
+			fileObj("dup.txt"),
+			fileObj("dup.txt"),
+			fileObj("unique.txt"),
+		}, nil
+	})
+	got, err := existingDstFilesFn(context.Background(), rec.listDst, "/dst")
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(rec.mkdirs) != 2 {
-		t.Errorf("expected exactly 2 MakeDir calls, got %d: %v", len(rec.mkdirs), rec.mkdirs)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 dedup'd entries, got %d: %v", len(got), got)
 	}
-	if !rec.hasMkdir("/dst/assets") || !rec.hasMkdir("/dst/pkg") {
-		t.Errorf("unexpected mkdirs: %v", rec.mkdirs)
+	if !got["dup.txt"] || !got["unique.txt"] {
+		t.Fatalf("expected both names, got %v", got)
 	}
 }
 
-// TestPreCreateDirTreeFn_Timeout: context with a very short deadline cancels execution.
-func TestPreCreateDirTreeFn_Timeout(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Millisecond)
-	defer cancel()
+// 11. dst contains a large number of files → all included; the call
+//     completes within a reasonable budget (sanity, not strict perf).
+func TestExistingDstFilesFn_LargeDst(t *testing.T) {
+	const N = 10000
+	objs := make([]model.Obj, N)
+	for i := range objs {
+		objs[i] = fileObj(fmt.Sprintf("f-%05d.bin", i))
+	}
+	rec := newListRecorder(func(string) ([]model.Obj, error) { return objs, nil })
 
-	time.Sleep(5 * time.Millisecond) // ensure deadline has passed
+	start := time.Now()
+	got, err := existingDstFilesFn(context.Background(), rec.listDst, "/dst")
+	elapsed := time.Since(start)
 
-	objs := []model.Obj{dirObj("sub")}
-	rec := newRecorder()
-	err := preCreateDirTreeFn(ctx, objs, "/src", "/dst", 1, rec.makeDir, rec.listSrc)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("expected DeadlineExceeded, got: %v", err)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != N {
+		t.Fatalf("expected %d entries, got %d", N, len(got))
+	}
+	// Generous bound — only catches catastrophic regressions (e.g.
+	// accidental O(N²) inside the loop).
+	if elapsed > 2*time.Second {
+		t.Fatalf("processing %d entries took %v, too slow", N, elapsed)
+	}
+}
+
+// 12. Sanity: the helper invokes listDst exactly once with the given
+//     dstPath (no double-listing).
+func TestExistingDstFilesFn_CallsListOnce(t *testing.T) {
+	rec := newListRecorder(func(string) ([]model.Obj, error) {
+		return []model.Obj{fileObj("a.txt")}, nil
+	})
+	_, err := existingDstFilesFn(context.Background(), rec.listDst, "/dst/exact/path")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rec.calls) != 1 || rec.calls[0] != "/dst/exact/path" {
+		t.Fatalf("expected single call to /dst/exact/path, got %v", rec.calls)
 	}
 }
