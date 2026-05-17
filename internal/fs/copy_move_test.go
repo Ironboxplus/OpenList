@@ -262,6 +262,224 @@ func TestExistingDstFilesFn_LargeDst(t *testing.T) {
 	}
 }
 
+// shouldSkipForMerge mirrors the skip decision at copy_move.go:221 so the
+// test below pins both the helper (existingDstFilesFn) AND the call-site
+// guard as a single contract. Any future refactor that touches either
+// half of this contract will be caught.
+func shouldSkipForMerge(srcObj model.Obj, existedFiles map[string]bool) bool {
+	return !srcObj.IsDir() && existedFiles[srcObj.GetName()]
+}
+
+// TestMergeSkipDecision_DirsAreNeverSkipped is the explicit anti-regression
+// test for the worry "when a subdir exists in dst, the src subdir is
+// skipped and its contents are not merged". It walks every (src kind, dst
+// state) combination and asserts the skip decision.
+//
+// Why this matters: if existingDstFilesFn ever started including dirs, or
+// if the call-site guard dropped the `!obj.IsDir()` clause, src subdirs
+// matching dst subdirs would silently stop recursing — and every file
+// inside them would never get copied. That bug is invisible to a casual
+// "did the task complete?" check and only shows up as quietly missing
+// deep files. Lock it down.
+func TestMergeSkipDecision_DirsAreNeverSkipped(t *testing.T) {
+	// dst already contains a mix: one file, two dirs.
+	dstContents := []model.Obj{
+		fileObj("root_file.txt"),
+		dirObj("subA"),
+		dirObj("subB"),
+	}
+	rec := newListRecorder(func(string) ([]model.Obj, error) { return dstContents, nil })
+
+	existed, err := existingDstFilesFn(context.Background(), rec.listDst, "/dst")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Sanity: the dirs in dst must NOT be in existedObjs. If this fails,
+	// every src dir matching a dst dir name would be skipped.
+	if existed["subA"] || existed["subB"] {
+		t.Fatalf("CRITICAL: dirs in dst leaked into existed-files map — "+
+			"matching src subdirs would be skipped and lose their contents. "+
+			"got %v", existed)
+	}
+	if !existed["root_file.txt"] {
+		t.Fatalf("file in dst missing from existed map: %v", existed)
+	}
+
+	// Exhaustive skip-decision matrix for every src-object kind against
+	// the populated existedObjs.
+	cases := []struct {
+		name     string
+		srcObj   model.Obj
+		wantSkip bool
+		why      string
+	}{
+		{
+			name:     "src_file_matches_dst_file",
+			srcObj:   fileObj("root_file.txt"),
+			wantSkip: true,
+			why:      "resume semantics: already-uploaded file is skipped",
+		},
+		{
+			name:     "src_dir_matches_dst_dir",
+			srcObj:   dirObj("subA"),
+			wantSkip: false,
+			why:      "MUST recurse into matching subdir to merge its contents",
+		},
+		{
+			name:     "src_dir_matches_dst_dir_B",
+			srcObj:   dirObj("subB"),
+			wantSkip: false,
+			why:      "MUST recurse — every dst dir must trigger recursion regardless of name",
+		},
+		{
+			name:     "src_dir_no_match",
+			srcObj:   dirObj("brand_new_dir"),
+			wantSkip: false,
+			why:      "new dir → recurse and create",
+		},
+		{
+			name:     "src_file_no_match",
+			srcObj:   fileObj("brand_new_file.txt"),
+			wantSkip: false,
+			why:      "new file → upload",
+		},
+		{
+			name:     "src_dir_matches_dst_FILE_name",
+			srcObj:   dirObj("root_file.txt"),
+			wantSkip: false,
+			why:      "even with a name collision against a dst FILE, src dir must NOT be skipped " +
+				"(the conflict will surface later when MakeDir runs, not silently)",
+		},
+		{
+			name:     "src_file_matches_dst_DIR_name",
+			srcObj:   fileObj("subA"),
+			wantSkip: false,
+			why:      "src file colliding with a dst dir name must NOT be skipped " +
+				"(dirs are not in existed map, and op.Put will surface the conflict)",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := shouldSkipForMerge(c.srcObj, existed)
+			if got != c.wantSkip {
+				t.Fatalf("skip(src=%s,IsDir=%v) = %v, want %v — %s",
+					c.srcObj.GetName(), c.srcObj.IsDir(), got, c.wantSkip, c.why)
+			}
+		})
+	}
+}
+
+// TestMergeSkipDecision_EmptyDst: with no existedObjs, NOTHING is skipped
+// regardless of obj kind — every src item gets a sub-task.
+func TestMergeSkipDecision_EmptyDst(t *testing.T) {
+	existed := map[string]bool{}
+	for _, obj := range []model.Obj{
+		fileObj("a.txt"),
+		dirObj("d1"),
+		fileObj("b.bin"),
+		dirObj("d2"),
+	} {
+		if shouldSkipForMerge(obj, existed) {
+			t.Errorf("nothing should be skipped against empty dst, but %s was", obj.GetName())
+		}
+	}
+}
+
+// TestMergeSkipDecision_DeepTreeRecursionContract simulates a 3-level src
+// tree against a partial dst and asserts that the dir-recursion contract
+// holds at every level. This is the "deep dir files missing" regression
+// guard the user asked for.
+func TestMergeSkipDecision_DeepTreeRecursionContract(t *testing.T) {
+	// Three levels of nesting, with files at each level. Dst already has
+	// the dir skeleton from a previous interrupted run, plus one file at
+	// the deepest level (simulating partial completion).
+	level0Src := []model.Obj{fileObj("root.txt"), dirObj("L1")}
+	level1Src := []model.Obj{fileObj("a.txt"), dirObj("L2")}
+	level2Src := []model.Obj{fileObj("deep1.txt"), fileObj("deep2.txt")}
+
+	// Dst state per level
+	level0Dst := []model.Obj{fileObj("root.txt"), dirObj("L1")}     // root.txt already uploaded
+	level1Dst := []model.Obj{dirObj("L2")}                          // L1 exists, no files yet
+	level2Dst := []model.Obj{fileObj("deep1.txt")}                  // deep1 already uploaded
+
+	cases := []struct {
+		level     string
+		srcObjs   []model.Obj
+		dstObjs   []model.Obj
+		mustSkip  []string
+		mustSpawn []string
+	}{
+		{
+			level:     "L0",
+			srcObjs:   level0Src,
+			dstObjs:   level0Dst,
+			mustSkip:  []string{"root.txt"}, // file already there
+			mustSpawn: []string{"L1"},       // dir must recurse
+		},
+		{
+			level:     "L1",
+			srcObjs:   level1Src,
+			dstObjs:   level1Dst,
+			mustSkip:  []string{},                // a.txt not in dst
+			mustSpawn: []string{"a.txt", "L2"},   // upload file + recurse dir
+		},
+		{
+			level:     "L2",
+			srcObjs:   level2Src,
+			dstObjs:   level2Dst,
+			mustSkip:  []string{"deep1.txt"}, // already uploaded
+			mustSpawn: []string{"deep2.txt"}, // must still upload
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.level, func(t *testing.T) {
+			rec := newListRecorder(func(string) ([]model.Obj, error) { return c.dstObjs, nil })
+			existed, err := existingDstFilesFn(context.Background(), rec.listDst, "/dst/"+c.level)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			var spawned, skipped []string
+			for _, obj := range c.srcObjs {
+				if shouldSkipForMerge(obj, existed) {
+					skipped = append(skipped, obj.GetName())
+				} else {
+					spawned = append(spawned, obj.GetName())
+				}
+			}
+
+			if !sameStrings(skipped, c.mustSkip) {
+				t.Errorf("%s: skipped = %v, want %v", c.level, skipped, c.mustSkip)
+			}
+			if !sameStrings(spawned, c.mustSpawn) {
+				t.Errorf("%s: spawned = %v, want %v", c.level, spawned, c.mustSpawn)
+			}
+		})
+	}
+}
+
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	m := map[string]int{}
+	for _, s := range a {
+		m[s]++
+	}
+	for _, s := range b {
+		m[s]--
+	}
+	for _, v := range m {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // 12. Sanity: the helper invokes listDst exactly once with the given
 //     dstPath (no double-listing).
 func TestExistingDstFilesFn_CallsListOnce(t *testing.T) {
