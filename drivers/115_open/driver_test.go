@@ -849,9 +849,10 @@ func TestCheckUploadCallbackInvalidJSON(t *testing.T) {
 func TestGetReturnsObjForExistingFolder(t *testing.T) {
 	driver, _ := newTestOpen115(t, "trash", func(w http.ResponseWriter, r *http.Request) {
 		writeSDKSuccess(t, w, map[string]any{
-			"file_id":   "99999",
-			"file_name": "my_folder",
-			"pick_code": "pc-123",
+			"file_id":       "99999",
+			"file_name":     "my_folder",
+			"pick_code":     "pc-123",
+			"file_category": "0", // folder; Fix 4 rejects file responses with NotImplement
 		})
 	})
 	driver.parentPath = ""

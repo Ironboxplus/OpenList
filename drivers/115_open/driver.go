@@ -222,13 +222,9 @@ func (d *Open115) Get(ctx context.Context, path string) (model.Obj, error) {
 		}
 		return nil, err
 	}
-	return &Obj{
-		Fid:  resp.FileID,
-		Fn:   resp.FileName,
-		Fc:   resp.FileCategory,
-		Sha1: resp.Sha1,
-		Pc:   resp.PickCode,
-	}, nil
+	log.Debugf("[115] GetFolderInfoByPath(%s) => Size=%q FileCategory=%q FileID=%s",
+		path, resp.Size, resp.FileCategory, resp.FileID)
+	return fromFolderInfo(resp)
 }
 
 func (d *Open115) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) (model.Obj, error) {
