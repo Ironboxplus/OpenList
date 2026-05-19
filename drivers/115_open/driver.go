@@ -194,12 +194,20 @@ func (d *Open115) Link(ctx context.Context, file model.Obj, args model.LinkArgs)
 	totalDuration := time.Since(start)
 	log.Infof("[115] Link request completed in %v (API: %v)", totalDuration, apiDuration)
 
-	return &model.Link{
+	link := &model.Link{
 		URL: u.URL.URL,
 		Header: http.Header{
 			"User-Agent": []string{ua},
 		},
-	}, nil
+	}
+	// Tie the cache TTL to the CDN's own `t=` expiry so OP never serves a
+	// URL that 115's CDN has already invalidated. Without this, OP would
+	// hand out a dead URL and 115 responds with 200 + Content-Length: 0,
+	// which downstream clients see as a corrupt/empty stream.
+	if ttl, ok := parseCDNExpiry(u.URL.URL); ok {
+		link.Expiration = &ttl
+	}
+	return link, nil
 }
 
 func (d *Open115) Get(ctx context.Context, path string) (model.Obj, error) {
