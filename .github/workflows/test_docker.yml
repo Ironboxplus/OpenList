@@ -18,10 +18,7 @@ on:
           - both
   push:
     branches:
-      - main
-  pull_request:
-    branches:
-      - copy
+      - feat/dynamic-frontend
 
 
 concurrency:
@@ -32,7 +29,6 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   GHCR_ORG_NAME: ${{ vars.GHCR_ORG_NAME || 'ironboxplus' }} # 👈 最好改成你的用户名，防止推错地方
   FRONTEND_REPO: ${{ github.event.inputs.frontend_repo || vars.FRONTEND_REPO || 'OpenListTeam/OpenList-Frontend' }}
-  IMAGE_NAME: openlist
   REGISTRY: ghcr.io
   ARTIFACT_NAME_PREFIX: 'binaries_docker_release'
   # 👇 关键修改：只保留 linux/amd64，删掉后面一长串
@@ -131,27 +127,27 @@ jobs:
     strategy:
       matrix:
         frontend_channel: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.frontend_channel == 'both' && fromJSON('["rolling","latest"]') || fromJSON(format('["{0}"]', github.event.inputs.frontend_channel))) || fromJSON('["latest","rolling"]') }}
-        # 构建所有变体
+        # 四种变体，各自独立 image 名（推送到独立 GHCR repo）
         image: ["latest", "ffmpeg", "aria2", "aio"]
         include:
           - image: "latest"
             base_image_tag: "base"
             build_arg: ""
-            image_tag_suffix: ""
+            image_name: "openlist"
           - image: "ffmpeg"
             base_image_tag: "ffmpeg"
             build_arg: INSTALL_FFMPEG=true
-            image_tag_suffix: "-ffmpeg"
+            image_name: "openlist-ffmpeg"
           - image: "aria2"
             base_image_tag: "aria2"
             build_arg: INSTALL_ARIA2=true
-            image_tag_suffix: "-aria2"
+            image_name: "openlist-aria2"
           - image: "aio"
             base_image_tag: "aio"
             build_arg: |
               INSTALL_FFMPEG=true
               INSTALL_ARIA2=true
-            image_tag_suffix: "-aio"
+            image_name: "openlist-aio"
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -175,10 +171,10 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            ${{ env.REGISTRY }}/${{ env.GHCR_ORG_NAME }}/${{ env.IMAGE_NAME }}
+            ${{ env.REGISTRY }}/${{ env.GHCR_ORG_NAME }}/${{ matrix.image_name }}
           tags: |
-            type=raw,value=front-${{ matrix.frontend_channel }}${{ matrix.image_tag_suffix }}
-            type=raw,value=latest,enable=${{ matrix.frontend_channel == 'latest' && matrix.image == 'latest' }}
+            type=raw,value=front-${{ matrix.frontend_channel }}
+            type=raw,value=latest,enable=${{ matrix.frontend_channel == 'latest' }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -192,5 +188,5 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           platforms: ${{ env.RELEASE_PLATFORMS }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.GHCR_ORG_NAME }}/${{ env.IMAGE_NAME }}:buildcache-front-${{ matrix.frontend_channel }}-${{ matrix.image }}
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.GHCR_ORG_NAME }}/${{ env.IMAGE_NAME }}:buildcache-front-${{ matrix.frontend_channel }}-${{ matrix.image }},mode=max
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.GHCR_ORG_NAME }}/${{ matrix.image_name }}:buildcache-front-${{ matrix.frontend_channel }}
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.GHCR_ORG_NAME }}/${{ matrix.image_name }}:buildcache-front-${{ matrix.frontend_channel }},mode=max
