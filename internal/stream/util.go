@@ -391,6 +391,19 @@ func GetRangeReaderFromLink(size int64, link *model.Link) (model.RangeReaderIF, 
 			}
 			return nil, fmt.Errorf("http request failure, err:%w", err)
 		}
+		// "Soft 200" expired-link guard: when we asked for ≥1 byte but the
+		// server promised 0 (e.g. 115 CDN for a stale `?t=` URL — 200 OK +
+		// Content-Length: 0), the body would be empty and any downstream
+		// client would interpret it as a corrupt/empty file. Surface this
+		// as an explicit "expired" error so RefreshableRangeReader can
+		// trigger a refresh, and callers without a Refresher fail loudly
+		// instead of streaming silence. ContentLength == -1 means the
+		// server used chunked transfer encoding and is excluded.
+		if httpRange.Length > 0 && response.ContentLength == 0 {
+			response.Body.Close()
+			return nil, fmt.Errorf("link expired: server returned status %d with Content-Length: 0 (expected %d bytes from %s)",
+				response.StatusCode, httpRange.Length, link.URL)
+		}
 		if ServerDownloadLimit != nil {
 			response.Body = &RateLimitReader{
 				Ctx:     ctx,

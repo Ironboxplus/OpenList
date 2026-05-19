@@ -6,13 +6,27 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
+
+// ensureConfForHTTP makes sure conf.Conf is non-nil before any test reaches
+// net.HttpClient — that helper deferences conf.Conf.TlsInsecureSkipVerify
+// during a sync.Once init and panics on a nil pointer otherwise.
+func ensureConfForHTTP() {
+	if conf.Conf == nil {
+		conf.Conf = &conf.Config{}
+	}
+}
 
 func TestRefreshableRangeReader_ReconnectsAfterMidStreamReset(t *testing.T) {
 	data := []byte("0123456789abcdef")
@@ -258,6 +272,218 @@ func (f *flakyReadCloser) Read(p []byte) (int, error) {
 
 func (f *flakyReadCloser) Close() error {
 	return nil
+}
+
+// TestRangeReaderFromLink_SoftExpiredLink_TriggersRefresh covers the
+// 115 CDN "soft 200 + empty body" failure mode: when a signed URL has
+// expired, 115 still answers with HTTP 200 and Content-Length: 0 instead
+// of a 4xx. Without explicit detection, OP forwards an empty stream to
+// the client (mpv sees "Failed to recognize file format"). This test
+// pins the contract that GetRangeReaderFromLink-derived readers treat
+// "non-zero range requested → zero bytes promised" as an expired link
+// and let RefreshableRangeReader trigger a refresh + retry.
+func TestRangeReaderFromLink_SoftExpiredLink_TriggersRefresh(t *testing.T) {
+	ensureConfForHTTP()
+	data := []byte("The quick brown fox jumps over the lazy dog")
+	size := int64(len(data))
+
+	var expiredHits int32
+	expired := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&expiredHits, 1)
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer expired.Close()
+
+	var freshHits int32
+	fresh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&freshHits, 1)
+		rangeHeader := r.Header.Get("Range")
+		start := int64(0)
+		length := size
+		if rangeHeader != "" {
+			ranges, err := http_range.ParseRange(rangeHeader, size)
+			if err == nil && len(ranges) == 1 {
+				start = ranges[0].Start
+				length = ranges[0].Length
+				w.Header().Set("Content-Range", ranges[0].ContentRange(size))
+				w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(data[start : start+length])
+				return
+			}
+		}
+		w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data[start : start+length])
+	}))
+	defer fresh.Close()
+
+	link := &model.Link{URL: expired.URL}
+	var refreshes int32
+	link.Refresher = func(ctx context.Context) (*model.Link, model.Obj, error) {
+		atomic.AddInt32(&refreshes, 1)
+		return &model.Link{URL: fresh.URL}, nil, nil
+	}
+
+	rrr, err := GetRangeReaderFromLink(size, link)
+	if err != nil {
+		t.Fatalf("GetRangeReaderFromLink: %v", err)
+	}
+	rc, err := rrr.RangeRead(context.Background(), http_range.Range{Start: 0, Length: size})
+	if err != nil {
+		t.Fatalf("RangeRead: %v", err)
+	}
+	defer rc.Close()
+
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("body mismatch: got %q, want %q", got, data)
+	}
+	if atomic.LoadInt32(&refreshes) != 1 {
+		t.Fatalf("refreshes = %d, want 1", refreshes)
+	}
+	if atomic.LoadInt32(&expiredHits) < 1 {
+		t.Fatalf("expired server never hit (= %d), expected at least once", expiredHits)
+	}
+	if atomic.LoadInt32(&freshHits) < 1 {
+		t.Fatalf("fresh server never hit (= %d), expected at least once after refresh", freshHits)
+	}
+}
+
+// TestRangeReaderFromLink_NormalResponse_NoFalsePositive guards against the
+// soft-expired check ever firing on a healthy 206 response.
+func TestRangeReaderFromLink_NormalResponse_NoFalsePositive(t *testing.T) {
+	ensureConfForHTTP()
+	data := []byte("0123456789abcdef")
+	size := int64(len(data))
+
+	var refreshes int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ranges, _ := http_range.ParseRange(r.Header.Get("Range"), size)
+		if len(ranges) == 1 {
+			ra := ranges[0]
+			w.Header().Set("Content-Range", ra.ContentRange(size))
+			w.Header().Set("Content-Length", strconv.FormatInt(ra.Length, 10))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[ra.Start : ra.Start+ra.Length])
+			return
+		}
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		_, _ = w.Write(data)
+	}))
+	defer server.Close()
+
+	link := &model.Link{URL: server.URL}
+	link.Refresher = func(ctx context.Context) (*model.Link, model.Obj, error) {
+		atomic.AddInt32(&refreshes, 1)
+		return link, nil, nil
+	}
+
+	rrr, err := GetRangeReaderFromLink(size, link)
+	if err != nil {
+		t.Fatalf("GetRangeReaderFromLink: %v", err)
+	}
+	rc, err := rrr.RangeRead(context.Background(), http_range.Range{Start: 4, Length: 6})
+	if err != nil {
+		t.Fatalf("RangeRead: %v", err)
+	}
+	defer rc.Close()
+
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, data[4:10]) {
+		t.Fatalf("body mismatch: got %q, want %q", got, data[4:10])
+	}
+	if atomic.LoadInt32(&refreshes) != 0 {
+		t.Fatalf("refreshes = %d, want 0 (healthy response must not trigger refresh)", refreshes)
+	}
+}
+
+// TestRangeReaderFromLink_ChunkedResponse_NoFalsePositive guards against
+// false positives on responses without a Content-Length (chunked transfer).
+// Go's http.Response sets ContentLength = -1 for chunked, which must not
+// be treated as "0 bytes promised".
+func TestRangeReaderFromLink_ChunkedResponse_NoFalsePositive(t *testing.T) {
+	ensureConfForHTTP()
+	data := []byte("chunked-payload-bytes-here-yo!")
+	size := int64(len(data))
+
+	var refreshes int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Force chunked: do not set Content-Length, write headers then body
+		// in two flushes.
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = w.Write(data[:len(data)/2])
+		if flusher != nil {
+			flusher.Flush()
+		}
+		_, _ = w.Write(data[len(data)/2:])
+	}))
+	defer server.Close()
+
+	link := &model.Link{URL: server.URL}
+	link.Refresher = func(ctx context.Context) (*model.Link, model.Obj, error) {
+		atomic.AddInt32(&refreshes, 1)
+		return link, nil, nil
+	}
+
+	rrr, err := GetRangeReaderFromLink(size, link)
+	if err != nil {
+		t.Fatalf("GetRangeReaderFromLink: %v", err)
+	}
+	rc, err := rrr.RangeRead(context.Background(), http_range.Range{Start: 0, Length: size})
+	if err != nil {
+		t.Fatalf("RangeRead: %v", err)
+	}
+	defer rc.Close()
+
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("body mismatch: got %q, want %q", got, data)
+	}
+	if atomic.LoadInt32(&refreshes) != 0 {
+		t.Fatalf("refreshes = %d, want 0 (chunked response must not be treated as expired)", refreshes)
+	}
+}
+
+// TestRangeReaderFromLink_SoftExpiredLink_NoRefresher_ReturnsError verifies
+// that when a soft-expired link is encountered without a Refresher set,
+// the error surfaces cleanly to the caller instead of returning an empty
+// body that the client then misinterprets as a corrupt file.
+func TestRangeReaderFromLink_SoftExpiredLink_NoRefresher_ReturnsError(t *testing.T) {
+	ensureConfForHTTP()
+	size := int64(100)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	link := &model.Link{URL: server.URL} // no Refresher
+
+	rrr, err := GetRangeReaderFromLink(size, link)
+	if err != nil {
+		t.Fatalf("GetRangeReaderFromLink: %v", err)
+	}
+	_, err = rrr.RangeRead(context.Background(), http_range.Range{Start: 0, Length: size})
+	if err == nil {
+		t.Fatalf("RangeRead returned nil error; expected an 'expired link' error so callers see a real failure instead of an empty stream")
+	}
+	if !IsLinkExpiredError(err) {
+		t.Fatalf("error %q is not classified as expired by IsLinkExpiredError", err)
+	}
 }
 
 func sliceForRange(data []byte, httpRange http_range.Range) []byte {
