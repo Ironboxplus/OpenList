@@ -384,6 +384,87 @@ BFS precreate 在功能上已变成纯性能优化（提前批建 + 缓存预热
 
 ---
 
+## 2026-05-19 — Rebase onto `hybrid_cache` 包抽取 + prefetch 双 commit squash
+
+### 背景
+
+上游 PR #2477（commit `9eae6258`）做了一次破坏性重构：
+
+- 把 `internal/mem`（`HybridCache` / `LinearMemory`）抽到独立的 `internal/hybrid_cache` 包（别名 `hcache`）
+- 引入 `BackingStore` 抽象：`BufferStore`（内存）+ `FileStore`（磁盘），由 `HybridCache` 内部自动切换，外部代码不再分支
+- 配置字段重命名：`conf.CacheThreshold` → `conf.AutoMemoryLimit`（json `cache_threshold` → `auto_memory_limit`、env 同步）
+- 删除 `pkg/buffer/bytes.go` / `pkg/buffer/file.go`，`pkg/buffer/buffer.go` + `type.go` 重塑
+- `internal/stream/util.go` 从 ~960 行精简至 298 行——上游只保留 `GetRangeReaderFromLink` / `CacheFullAndHash` / `NewStreamSectionReader` / `hybridSectionReader` 等核心 helpers，所有本地扩展需要重新落上去
+
+同批次另有两个修复（`daad21ef` 139 driver `Connection` 头、`31b41f99` qBittorrent 5.2 204 登录修复），均不与本地冲突。
+
+### 行动 1：Rebase 20 个本地 commit 到 `op/main` @ `31b41f99`
+
+`git tag pre-rebase-2026-05-19 HEAD` 后 `git rebase op/main`，命中两处冲突：
+
+**冲突点 1 — `internal/stream/stream.go`（`fccab338`）**
+
+上游把 `cache(maxCacheSize int64)` 重命名为 `ensureCache(size int64)`，函数体已转为新 `hcache.HybridCache`。处理：直接取上游版，本地 fccab338 patch 的语义已被上游覆盖。
+
+**冲突点 2 — `internal/stream/util.go`（`fccab338`）**
+
+本地有独立的 `byteSectionReader` 分支（小文件走单独缓冲池）。上游新设计下 `BackingStore` 自动按文件大小选择 `BufferStore` / `FileStore`，`NewStreamSectionReader` 简化为：
+
+```go
+if file.GetFile() != nil { return &cachedSectionReader{...} }
+// 否则全部走
+return &hybridSectionReader{...}
+```
+
+处理：删除 `byteSectionReader` / `bytesRefReadSeeker` 类型，以及 `TestHybridSectionReader_NonPrefetchPath` 测试（断言"小文件不走 hybrid"已失效）。
+
+**冲突点 3 — `internal/stream/util.go`（`7995dbdb` Pass 2 prefetch）**
+
+`hybridSectionReader` 结构体内的 `hc` 字段：本地 `*mem.HybridCache` vs 上游 `*hcache.HybridCache`。处理：保留本地新增的 `fileSize int64` 字段（Pass 2 prefetch 用于 EOF clamp），类型切到 `*hcache.HybridCache`。
+
+**冲突点 4 — `internal/stream/section_reader_prefetch_test.go`**
+
+`conf.CacheThreshold` 三处引用全部改成 `conf.AutoMemoryLimit`。
+
+其余 16 个 commit 干净回放（包括 `163e5c81` 的 util.go selfHealingReadCloser EOF 调整、`07410ad3` 的 Pass 1 hash prefetch、`4e91d93a` 的 `NewOSSUploadHttpClient` 等），上游 patch 已覆盖大部分 `mem.` → `hcache.` 翻译工作。
+
+### 行动 2：Squash 两个 prefetch commit
+
+`588b7024 perf(stream): add double-buffer prefetch to StreamHashFile` 和 `a32544fa perf(stream): pass 2 prefetch on hybridSectionReader` 同属"上传 pipeline 重叠优化"主题但相隔 5 个 commit。用 `git rebase -i op/main` 加自定义 `GIT_SEQUENCE_EDITOR` / `GIT_EDITOR`（Python 脚本临时丢在 `.git/`）做 reorder + squash，得到 `01364250 perf(stream): two-pass prefetch on upload pipeline`，叙事完整。
+
+之间的 4 个非 stream commit（`8a2fb995` / `9389b219` / `610c3cf9` / `65c713a0`）reorder 时无冲突——它们碰的是 driver 和 `server/static`，不沾 util.go。
+
+未 squash 的 `902c8b82 feat(stream)` 是综合提交（selfHealing + link refresh + hash 工具 + 当时被丢弃的旧 prefetch），独立保留以维持叙事。
+
+### 测试结果
+
+| 包 | 结果 |
+|---|---|
+| `internal/stream` | ok（7 个 `TestHybridSectionReader_*` prefetch、2 个 `TestRefreshableRangeReader_*`、2 个 `TestSelfHealingReadCloser_*`、`TestStreamHashFile_SeekablePrefetchProducesSameHash` 全部通过） |
+| `internal/fs` | ok |
+| `internal/op` | ok |
+| `drivers/115_open` | ok（含 `TestNewOSSUploadHttpClientHasLongerTimeout`） |
+| `internal/hybrid_cache` | ok |
+| `internal/frontend` | ok |
+| `internal/net` | 唯一失败 `TestNewOSSClientUsesEnvironmentHTTPSProxy`（白名单，rebase 前就失败） |
+
+### 行动后状态
+
+- `feat/dynamic-frontend` HEAD `39c74672`，19 commits ahead of `op/main`（原 20，squash -1）
+- `git push --force-with-lease origin feat/dynamic-frontend` 成功（`7e140903...39c74672`）
+- 本地 tag `pre-rebase-2026-05-19` 保留作为回滚点
+- `env.md` 更新 "Current upstream base" 到 `31b41f99`
+
+### 设计要点：byteSectionReader 消失为何不损失功能
+
+旧 `byteSectionReader` 的优化逻辑：小文件用 `pool.Pool[[]byte]` 复用 buffer，避免每个 section 都分配新切片。
+
+上游 `BackingStore` 的等价机制：`BufferStore` 内部就是块池化（按 `blockSize` 分块，块从 `LinearMemory` 复用），且自动按 `AutoMemoryLimit`/文件大小决策。也就是说"小文件走纯内存"这个语义保留了，只是不再暴露为独立类型。
+
+代价：失去了"按文件大小选择 reader 实现"的显式分支，调试时需要看 `BackingStore` 内部状态。换取：调用方代码统一、Pass 2 prefetch 可以盲目挂在 `hybridSectionReader` 上不用考虑 byte 分支。
+
+---
+
 ## Architecture Notes
 
 ### Upload Data Flow (Current)
@@ -394,7 +475,7 @@ Pass 1: Hash Calculation (with prefetch)
     chunk N+1: async prefetch (network I/O)  ← overlapped
 
 Pass 2: Multipart Upload (with prefetch)
-  directSectionReader.GetSectionReader
+  hybridSectionReader.GetSectionReader
     chunk N: upload to cloud (network I/O)
     chunk N+1: async prefetch (network I/O)  ← overlapped
 ```
