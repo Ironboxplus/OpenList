@@ -5,7 +5,7 @@ on:
       frontend_repo:
         description: 'Frontend repo, e.g. Ironboxplus/OpenList-Frontend'
         required: false
-        default: 'OpenListTeam/OpenList-Frontend'
+        default: 'Ironboxplus/OpenList-Frontend'
         type: string
       frontend_channel:
         description: 'Frontend release channel to build'
@@ -28,14 +28,14 @@ concurrency:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   GHCR_ORG_NAME: ${{ vars.GHCR_ORG_NAME || 'ironboxplus' }} # 👈 最好改成你的用户名，防止推错地方
-  FRONTEND_REPO: ${{ github.event.inputs.frontend_repo || vars.FRONTEND_REPO || 'OpenListTeam/OpenList-Frontend' }}
+  FRONTEND_REPO: ${{ github.event.inputs.frontend_repo || vars.FRONTEND_REPO || 'Ironboxplus/OpenList-Frontend' }}
   REGISTRY: ghcr.io
   ARTIFACT_NAME_PREFIX: 'binaries_docker_release'
   # 👇 关键修改：只保留 linux/amd64，删掉后面一长串
   RELEASE_PLATFORMS: 'linux/amd64'
   # 👇 关键修改：强制允许推送，不用管是不是 push 事件
   IMAGE_PUSH: 'true'
-  # 👇 使用默认的前端仓库 (OpenListTeam/OpenList-Frontend)
+  # 👇 使用默认的前端仓库 (Ironboxplus/OpenList-Frontend)
   # FRONTEND_REPO: 'Ironboxplus/OpenList-Frontend'
 
 jobs:
@@ -73,7 +73,10 @@ jobs:
           if [ "$web_version" = "latest" ]; then
             frontend_version=$(curl -fsSL "${github_auth_args[@]}" "https://api.github.com/repos/$frontend_repo/releases/latest" | jq -r '.tag_name')
           else
-            frontend_version="$web_version"
+            # For rolling/dev channels, resolve the actual commit to bust stale caches
+            release_json=$(curl -fsSL "${github_auth_args[@]}" "https://api.github.com/repos/$frontend_repo/releases/tags/$web_version" 2>/dev/null || echo '{}')
+            asset_name=$(echo "$release_json" | jq -r '.assets[0].name // empty')
+            frontend_version="${web_version}-${asset_name:-unknown}"
           fi
 
           echo "repo=$frontend_repo" >> "$GITHUB_OUTPUT"
