@@ -29,7 +29,7 @@ docker build -f Dockerfile .     # Build docker image
 ```
 
 **Build Script Details** (`build.sh`):
-- Fetches frontend from OpenListTeam/OpenList-Frontend releases
+- Fetches frontend from `$FRONTEND_REPO` (default: `Ironboxplus/OpenList-Frontend`) releases and embeds into `public/dist/`
 - Injects version info via ldflags: `-X "github.com/OpenListTeam/OpenList/v4/internal/conf.BuiltAt=$(date +'%F %T %z')"`
 - Supports `dev`, `beta`, and release builds
 - Downloads prebuilt frontend distribution automatically
@@ -244,6 +244,34 @@ Handles multiple scenarios:
 2. Direct RangeReader (`link.RangeReader != nil`)
 3. Refreshable link (`link.Refresher != nil`) ← Wraps with RefreshableRangeReader
 4. Transparent proxy (forwards to `link.URL`)
+
+### Frontend Dist Serving
+
+**Location**: `server/static/static.go`, `internal/frontend/`
+
+The frontend dist has two sources, with a strict priority:
+
+1. **Embedded dist** (`public/dist/` via `go:embed`): Baked into the binary at build time. Always used on startup.
+2. **Dynamic dist** (fetched by watcher): The `frontend.Watcher` checks GitHub every 30 minutes for a newer rolling release. If found, it downloads to `data/frontend_dist/` and hot-swaps the serving FS via `ReloadStatic()`.
+
+**Key design rule**: `initStatic()` always starts with the embedded dist (or `dist_dir` if configured). The cached dynamic dist in the data volume is never read on startup — only the watcher can activate it after verifying a newer version exists on GitHub. This prevents stale cache from overriding a newer Docker image.
+
+**Configuration** (`config.json`):
+- `dist_dir`: Override with a custom local directory (highest priority, skips embedded)
+- `frontend_repo`: GitHub repo for the watcher to check (default: `Ironboxplus/OpenList-Frontend`)
+
+**Startup flow**:
+```
+initStatic()  →  embedded dist (or dist_dir)
+     ↓
+StartWatcher(ReloadStatic)  →  background goroutine
+     ↓  (every 30min)
+FetchFromRolling()  →  compare cache version vs GitHub rolling tag commit
+     ↓  (if newer)
+downloadAndExtract()  →  atomic swap in data/frontend_dist/dist/
+     ↓
+ReloadStatic()  →  swap staticFS to new dist, re-render index.html
+```
 
 ### Startup Sequence
 
