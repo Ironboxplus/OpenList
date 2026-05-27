@@ -59,28 +59,17 @@ func (r *reloadableFS) swap(f fs.FS) {
 var staticFS = &reloadableFS{}
 
 func initStatic() {
-	utils.Log.Debug("Initializing static file system...")
-	// 1. User explicitly configured dist_dir
 	if conf.Conf.DistDir != "" {
 		staticFS.swap(os.DirFS(conf.Conf.DistDir))
 		utils.Log.Infof("Using custom dist directory: %s", conf.Conf.DistDir)
 		return
 	}
-	// 2. Try dynamic dist (fetched from rolling release)
-	if frontend.HasValidDist() {
-		distPath := filepath.Join(frontend.GetDistPath(), "dist")
-		staticFS.swap(os.DirFS(distPath))
-		utils.Log.Infof("Using dynamically fetched dist: %s", distPath)
-		return
-	}
-	// 3. Fall back to embedded dist; the Watcher (started after initStatic)
-	// will fetch the rolling release in the background and hot-swap via ReloadStatic.
 	dist, err := fs.Sub(public.Public, "dist")
 	if err != nil {
-		utils.Log.Fatalf("failed to read dist dir: %v", err)
+		utils.Log.Fatalf("failed to read embedded dist dir: %v", err)
 	}
 	staticFS.swap(dist)
-	utils.Log.Debug("Using embedded dist directory")
+	utils.Log.Infof("Using embedded dist directory")
 }
 
 func replaceStrings(content string, replacements map[string]string) string {
@@ -168,8 +157,10 @@ func UpdateIndex() {
 // ReloadStatic reloads the static files from disk (called by the watcher after an update)
 func ReloadStatic() {
 	utils.Log.Info("[static] reloading static files after frontend update...")
+	distPath := filepath.Join(frontend.GetDistPath(), "dist")
+	staticFS.swap(os.DirFS(distPath))
+	utils.Log.Infof("Switched to dynamically fetched dist: %s", distPath)
 	siteConfig := getSiteConfig()
-	initStatic()
 	initIndex(siteConfig)
 }
 

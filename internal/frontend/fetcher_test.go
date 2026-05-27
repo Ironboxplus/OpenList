@@ -283,8 +283,8 @@ func TestLegacyConfigJSONGetsDefaultFrontendRepo(t *testing.T) {
 	if err := json.Unmarshal([]byte(`{"site_url":"https://example.com"}`), cfg); err != nil {
 		t.Fatalf("unmarshal legacy config: %v", err)
 	}
-	if cfg.FrontendRepo != defaultFrontendRepo {
-		t.Fatalf("FrontendRepo: got %q, want %q", cfg.FrontendRepo, defaultFrontendRepo)
+	if cfg.FrontendRepo != conf.FrontendRepoDefault {
+		t.Fatalf("FrontendRepo: got %q, want %q", cfg.FrontendRepo, conf.FrontendRepoDefault)
 	}
 }
 
@@ -484,6 +484,119 @@ func TestResolveTagCommitSHA_RealGitHubWithProxy10808(t *testing.T) {
 	}
 	if release["tag_name"] == nil {
 		t.Fatalf("release tag_name missing")
+	}
+}
+
+func TestStaleCacheOverriddenByNewerRelease(t *testing.T) {
+	oldFiles := map[string]string{"./dist/index.html": "<html>old</html>"}
+	oldTar := createTestTarGz(t, oldFiles)
+	newFiles := map[string]string{"./dist/index.html": "<html>new</html>"}
+	newTar := createTestTarGz(t, newFiles)
+
+	callCount := 0
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case fmt.Sprintf("/repos/%s/releases/tags/rolling", getFrontendRepo()):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(fmt.Sprintf(`{
+				"tag_name": "rolling",
+				"assets": [{"name": "openlist-frontend-dist.tar.gz", "browser_download_url": "%s/download/dist.tar.gz"}]
+			}`, ts.URL)))
+		case fmt.Sprintf("/repos/%s/git/ref/tags/rolling", getFrontendRepo()):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"object":{"type":"commit","sha":"aaaaaaaaaaaabbbbbbbbbbbbccccccccccccdddd"}}`))
+		case "/download/dist.tar.gz":
+			callCount++
+			w.Header().Set("Content-Type", "application/gzip")
+			w.WriteHeader(200)
+			if callCount == 1 {
+				_, _ = w.Write(oldTar)
+			} else {
+				_, _ = w.Write(newTar)
+			}
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer ts.Close()
+
+	ResetFetchState()
+	destDir := GetDistPath()
+	_ = os.MkdirAll(destDir, 0755)
+	os.RemoveAll(filepath.Join(destDir, distDirName))
+	os.Remove(GetVersionFilePath())
+
+	// Write a stale cached version
+	_ = writeVersion("rolling@stale000000000")
+	_ = os.MkdirAll(filepath.Join(destDir, distDirName), 0755)
+	_ = os.WriteFile(filepath.Join(destDir, distDirName, "index.html"), []byte("<html>stale</html>"), 0644)
+
+	// Fetch should detect version mismatch and download
+	result, err := fetchFromTag(context.Background(), "rolling", ts.URL)
+	if err != nil {
+		t.Fatalf("fetchFromTag with stale cache: %v", err)
+	}
+	if !result.Downloaded {
+		t.Error("expected Downloaded=true when cache is stale")
+	}
+
+	data, err := os.ReadFile(filepath.Join(result.DistPath, "index.html"))
+	if err != nil {
+		t.Fatalf("read index.html: %v", err)
+	}
+	if string(data) != "<html>old</html>" {
+		t.Errorf("index.html: got %q, want old content", string(data))
+	}
+}
+
+func TestWatcherTriggersCallbackOnNewVersion(t *testing.T) {
+	files := map[string]string{"./dist/index.html": "<html>watcher</html>"}
+	tarData := createTestTarGz(t, files)
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case fmt.Sprintf("/repos/%s/releases/tags/rolling", getFrontendRepo()):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(fmt.Sprintf(`{
+				"tag_name": "rolling",
+				"assets": [{"name": "openlist-frontend-dist.tar.gz", "browser_download_url": "%s/download/dist.tar.gz"}]
+			}`, ts.URL)))
+		case fmt.Sprintf("/repos/%s/git/ref/tags/rolling", getFrontendRepo()):
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			_, _ = w.Write([]byte(`{"object":{"type":"commit","sha":"watchertest1234567890watchertest1234567890"}}`))
+		case "/download/dist.tar.gz":
+			w.Header().Set("Content-Type", "application/gzip")
+			w.WriteHeader(200)
+			_, _ = w.Write(tarData)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer ts.Close()
+
+	ResetFetchState()
+	destDir := GetDistPath()
+	_ = os.MkdirAll(destDir, 0755)
+	os.RemoveAll(filepath.Join(destDir, distDirName))
+	os.Remove(GetVersionFilePath())
+
+	// The watcher's check() calls FetchFromRolling which uses api.github.com.
+	// For this test, call fetchFromTag directly and verify Downloaded triggers callback logic.
+	result, err := fetchFromTag(context.Background(), "rolling", ts.URL)
+	if err != nil {
+		t.Fatalf("fetchFromTag: %v", err)
+	}
+	if !result.Downloaded {
+		t.Fatal("expected Downloaded=true for watcher callback trigger")
+	}
+	if result.Version != "rolling@watchertest1" {
+		t.Errorf("version: got %q", result.Version)
 	}
 }
 

@@ -12,7 +12,7 @@ var (
 	GitCommit  string = "unknown"
 	Version    string = "dev"
 	WebVersion string = "rolling"
-	FrontendRepoDefault string = "OpenListTeam/OpenList-Frontend"
+	FrontendRepoDefault string = "Ironboxplus/OpenList-Frontend"
 )
 
 var (
