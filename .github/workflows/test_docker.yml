@@ -44,7 +44,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        frontend_channel: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.frontend_channel == 'both' && fromJSON('["rolling","latest"]') || fromJSON(format('["{0}"]', github.event.inputs.frontend_channel))) || fromJSON('["latest","rolling"]') }}
+        frontend_channel: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.frontend_channel == 'both' && fromJSON('["rolling","latest"]') || fromJSON(format('["{0}"]', github.event.inputs.frontend_channel))) || fromJSON('["rolling"]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -129,7 +129,7 @@ jobs:
       packages: write
     strategy:
       matrix:
-        frontend_channel: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.frontend_channel == 'both' && fromJSON('["rolling","latest"]') || fromJSON(format('["{0}"]', github.event.inputs.frontend_channel))) || fromJSON('["latest","rolling"]') }}
+        frontend_channel: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.frontend_channel == 'both' && fromJSON('["rolling","latest"]') || fromJSON(format('["{0}"]', github.event.inputs.frontend_channel))) || fromJSON('["rolling"]') }}
         # 四种变体，各自独立 image 名（推送到独立 GHCR repo）
         image: ["latest", "ffmpeg", "aria2", "aio"]
         include:
