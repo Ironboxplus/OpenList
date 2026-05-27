@@ -248,6 +248,10 @@ func Cors(r *gin.Engine) {
 	config.AllowHeaders = conf.Conf.Cors.AllowHeaders
 	config.AllowMethods = conf.Conf.Cors.AllowMethods
 	r.Use(cors.New(config))
+	r.Use(func(c *gin.Context) {
+		c.Header("Cross-Origin-Opener-Policy", "same-origin")
+		c.Header("Cross-Origin-Embedder-Policy", "credentialless")
+	})
 }
 
 func InitS3(e *gin.Engine) {
