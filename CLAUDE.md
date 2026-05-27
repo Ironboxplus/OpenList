@@ -1,14 +1,50 @@
-# CLAUDE.md
+# OpenList Workspace — CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file covers the entire OpenList workspace, which contains three main repositories:
 
-## Core Development Principles
+- **OP/** — OpenList backend (Go, main project)
+- **OpenList-Frontend/** — SolidJS frontend
+- **movi-player/** — FFmpeg WASM video player (local fork)
+
+Each section below is labeled by component. The backend section is the primary development guide.
+
+---
+
+## Environment Configuration
+
+| Item | Value |
+|------|-------|
+| OS | Windows 11 Pro for Workstations (10.0.26100) |
+| Go | go1.25.4 windows/amd64 |
+| Node.js | v22.19.0 |
+| Project Root | `E:\Go\Openlist\` |
+
+### Repository Map
+
+| Directory | Repo | Branch | Remote |
+|-----------|------|--------|--------|
+| `OP/` | [Ironboxplus/OpenList](https://github.com/Ironboxplus/OpenList) | `feat/dynamic-frontend` | origin (fork), op (upstream: OpenListTeam/OpenList) |
+| `OpenList-Frontend/` | [Ironboxplus/OpenList-Frontend](https://github.com/Ironboxplus/OpenList-Frontend) | `main` | origin (upstream: OpenListTeam/OpenList-Frontend), ironbox (fork) |
+| `movi-player/` | Local fork of [MrUjjwalG/movi-player](https://github.com/MrUjjwalG/movi-player) | `main` | — |
+| `115-sdk-go/` | [Ironboxplus/115-sdk-go](https://github.com/Ironboxplus/115-sdk-go) | — | — |
+
+### Module Replacements (Backend `go.mod`)
+
+| Module | Replace Target | Notes |
+|--------|---------------|-------|
+| `github.com/OpenListTeam/115-sdk-go` | `github.com/Ironboxplus/115-sdk-go v0.2.8` | Concurrent refresh fix, ErrDataEmpty, FlexString CID |
+| `github.com/ProtonMail/go-proton-api` | `github.com/henrybear327/go-proton-api v1.0.0` | Community fork |
+| `github.com/cronokirby/saferith` | `github.com/Da3zKi7/saferith v0.33.0-fixed` | Bug fix fork |
+
+---
+
+## [Backend] Core Development Principles
 
 1. **最小代码改动原则** (Minimum code changes): Make the smallest change necessary to achieve the goal
 2. **不缓存整个文件原则** (No full file caching for seekable streams): For SeekableStream, use RangeRead instead of caching entire file
 3. **必要情况下可以多遍上传原则** (Multi-pass upload when necessary): If rapid upload fails, fall back to normal upload
 
-## Build and Development Commands
+## [Backend] Build and Development Commands
 
 ```bash
 # Development
@@ -38,7 +74,7 @@ docker build -f Dockerfile .     # Build docker image
 
 **Module Replacements** (`go.mod`): Some dependencies use `replace` directives pointing to forks (e.g., `115-sdk-go` → `Ironboxplus/115-sdk-go`). When modifying SDK behavior, check if there's a local fork to edit.
 
-## Architecture Overview
+## [Backend] Architecture Overview
 
 ### Driver System (Storage Abstraction)
 
@@ -286,7 +322,7 @@ Order of initialization:
 6. `InitTaskManager()` - Start background tasks
 7. `Start()` - Start HTTP/HTTPS/WebDAV/FTP/SFTP servers
 
-## Common Patterns
+## [Backend] Common Patterns
 
 ### Error Handling
 
@@ -394,7 +430,7 @@ default:
 }
 ```
 
-## Important Conventions
+## [Backend] Important Conventions
 
 **Naming**:
 - Drivers: lowercase with underscores (e.g., `baidu_netdisk`, `aliyundrive_open`)
@@ -416,7 +452,7 @@ default:
 - Levels: `log.Debugf`, `log.Infof`, `log.Warnf`, `log.Errorf`
 - Include driver name in logs: `log.Infof("[driver_name] message")`
 
-## Project Context
+## [Backend] Project Context
 
 OpenList is a community-driven fork of AList, focused on:
 - Long-term governance and trust
@@ -428,3 +464,69 @@ OpenList is a community-driven fork of AList, focused on:
 - Archive extraction
 
 **License**: AGPL-3.0
+
+---
+
+## Frontend (OpenList-Frontend)
+
+SolidJS + Vite + Hope UI. Builds to `dist/` which gets embedded into the backend binary via `go:embed`.
+
+### Build Commands
+
+```bash
+pnpm install                    # Install dependencies
+pnpm dev                        # Dev server (port 5173)
+pnpm build                      # Production build
+pnpm test                       # Run vitest tests
+```
+
+### Preview System
+
+Previews registered in `src/pages/home/previews/index.ts`. Each preview declares `prior: true/false` for priority ordering. Current video priority: movi-player (default) > Artplayer (fallback).
+
+### Movi Player Integration
+
+movi-player (FFmpeg WASM + WebCodecs) is the default video player, with full subtitle support:
+- **SRT/VTT**: movi-player native parsing
+- **ASS (external)**: JASSUB (libass WASM) overlay canvas rendering with font fallback
+- **PGS/SUP (external)**: libpgs overlay canvas rendering
+- **Embedded subtitles**: movi-player WASM demuxer handles all embedded formats
+
+Requires COOP/COEP headers (`Cross-Origin-Opener-Policy: same-origin`, `Cross-Origin-Embedder-Policy: credentialless`) for SharedArrayBuffer. Set in backend `server/router.go`.
+
+---
+
+## Movi Player Fork (`movi-player/`)
+
+Clone of [MrUjjwalG/movi-player](https://github.com/MrUjjwalG/movi-player). FFmpeg WASM + WebCodecs browser-side video decoder.
+
+### Fork Changes
+
+- `src/core/MoviPlayer.ts`: Added `parseASS()` + `parseASSTime()` for external ASS subtitle support
+- Format detection in `selectSubtitleLang()` extended for `.ass`/`.ssa`
+
+### Build
+
+```bash
+npm run build:wasm    # Requires Docker (C → WASM)
+npm run build:ts      # TypeScript only (needs dist/wasm/movi.js)
+npm run build         # Full build (wasm + ts)
+```
+
+### Known Limitations
+
+| Limitation | Reason |
+|-----------|--------|
+| External ASS: text only (no styles) | SubtitleCue architecture is plain text. Full ASS → use JASSUB overlay |
+| External PGS: not supported in movi-player native | Binary format needs demuxer. Handled by libpgs overlay |
+| Dolby Vision: purple tint | WASM decoder lacks DV enhancement layer |
+| Requires COOP/COEP headers | SharedArrayBuffer for WASM threads |
+
+---
+
+## 115-sdk-go Fork
+
+Fork of upstream SDK at `github.com/Ironboxplus/115-sdk-go`. Key changes:
+- **Concurrent token refresh**: `authRequest` uses `sync.Mutex` + double-check to prevent multiple goroutines from racing on `RefreshToken`
+- **ErrDataEmpty sentinel**: `GetFolderInfoByPath` returning `data:[]` for non-existent paths → returns `ErrDataEmpty` instead of unmarshal error
+- **FlexString CID**: handles numeric/string JSON interop for category IDs
