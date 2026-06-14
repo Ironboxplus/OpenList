@@ -32,7 +32,7 @@ Each section below is labeled by component. The backend section is the primary d
 
 | Module | Replace Target | Notes |
 |--------|---------------|-------|
-| `github.com/OpenListTeam/115-sdk-go` | `github.com/Ironboxplus/115-sdk-go v0.2.8` | Concurrent refresh fix, ErrDataEmpty, FlexString CID |
+| `github.com/OpenListTeam/115-sdk-go` | `github.com/Ironboxplus/115-sdk-go v0.2.9` | Refresh context isolation, token error code filters, ErrDataEmpty, FlexString CID |
 | `github.com/ProtonMail/go-proton-api` | `github.com/henrybear327/go-proton-api v1.0.0` | Community fork |
 | `github.com/cronokirby/saferith` | `github.com/Da3zKi7/saferith v0.33.0-fixed` | Bug fix fork |
 
@@ -526,7 +526,9 @@ npm run build         # Full build (wasm + ts)
 
 ## 115-sdk-go Fork
 
-Fork of upstream SDK at `github.com/Ironboxplus/115-sdk-go`. Key changes:
+Fork of upstream SDK at `github.com/Ironboxplus/115-sdk-go`. Key changes (v0.2.9):
 - **Concurrent token refresh**: `authRequest` uses `sync.Mutex` + double-check to prevent multiple goroutines from racing on `RefreshToken`
+- **Refresh context isolation** (v0.2.9): `RefreshToken` runs under `context.WithTimeout(context.WithoutCancel(ctx), 30s)` — once a refresh starts, caller cancellation cannot abort it. Fixes token loss when video player cancels mid-refresh
+- **Token error code filters** (v0.2.9): `shouldRefreshToken(code)` excludes 40140117 (CodeRefreshFrequently) and 40140120 (CodeRefreshTokenError) from triggering refresh; prevents feeding rate limiter on unrecoverable auth failures
 - **ErrDataEmpty sentinel**: `GetFolderInfoByPath` returning `data:[]` for non-existent paths → returns `ErrDataEmpty` instead of unmarshal error
 - **FlexString CID**: handles numeric/string JSON interop for category IDs
