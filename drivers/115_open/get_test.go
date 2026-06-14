@@ -2,6 +2,7 @@ package _115_open
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
 	sdk "github.com/OpenListTeam/115-sdk-go"
@@ -42,6 +43,34 @@ func TestFromFolderInfo_FileReturnsNotImplement(t *testing.T) {
 	}
 	if !errors.Is(err, errs.NotImplement) {
 		t.Fatalf("err = %v, want errs.NotImplement (so op.Get falls through to list path)", err)
+	}
+}
+
+// driver.Get maps "path not found" to errs.ObjectNotFound so op.Get can fall
+// through cleanly instead of surfacing a raw SDK error. The SDK surfaces this
+// two ways and both must be honored: ErrDataEmpty (GetFolderInfoByPath returns
+// an empty array — the realistic case) and ErrObjectNotFound (upstream #2596's
+// SDK not-found mapping, kept as a forward-compatible second arm). Any other
+// error must NOT be swallowed.
+func TestIsObjectNotFound(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"ErrDataEmpty (empty folder-info array)", sdk.ErrDataEmpty, true},
+		{"ErrObjectNotFound (upstream #2596 mapping)", sdk.ErrObjectNotFound, true},
+		{"wrapped ErrDataEmpty", fmt.Errorf("GetFolderInfoByPath: %w", sdk.ErrDataEmpty), true},
+		{"wrapped ErrObjectNotFound", fmt.Errorf("GetFolderInfoByPath: %w", sdk.ErrObjectNotFound), true},
+		{"unrelated error must propagate", errors.New("429 rate limited"), false},
+		{"nil is not not-found", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isObjectNotFound(tt.err); got != tt.want {
+				t.Fatalf("isObjectNotFound(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }
 

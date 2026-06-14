@@ -1,10 +1,26 @@
 package _115_open
 
 import (
+	"errors"
+
 	sdk "github.com/OpenListTeam/115-sdk-go"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
+
+// isObjectNotFound reports whether err means the 115 API could not find the
+// requested path, so driver.Get can translate it into errs.ObjectNotFound and
+// let op.Get fall through instead of surfacing a raw SDK error. The SDK
+// surfaces "not found" two ways and both must be honored:
+//   - ErrDataEmpty: GetFolderInfoByPath returned an empty array. This is the
+//     realistic case — request.go collapses an empty/`[]` payload to
+//     ErrDataEmpty before the folder-info unmarshal can run.
+//   - ErrObjectNotFound: upstream #2596's mapping of SDK not-found errors.
+//     Currently shadowed for this call path but kept as a forward-compatible
+//     second arm so a future SDK that surfaces it directly still works.
+func isObjectNotFound(err error) bool {
+	return errors.Is(err, sdk.ErrObjectNotFound) || errors.Is(err, sdk.ErrDataEmpty)
+}
 
 // folderInfoToObj extracts the fields driver.Get needs from a
 // GetFolderInfoByPath response. We only look at FileID + FileName +

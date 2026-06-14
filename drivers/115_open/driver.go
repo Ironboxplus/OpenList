@@ -3,7 +3,6 @@ package _115_open
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	stdpath "path"
@@ -217,7 +216,7 @@ func (d *Open115) Get(ctx context.Context, path string) (model.Obj, error) {
 	path = stdpath.Join(d.parentPath, path)
 	resp, err := d.client.GetFolderInfoByPath(ctx, path)
 	if err != nil {
-		if errors.Is(err, sdk.ErrObjectNotFound) || errors.Is(err, sdk.ErrDataEmpty) {
+		if isObjectNotFound(err) {
 			return nil, errs.ObjectNotFound
 		}
 		return nil, err
