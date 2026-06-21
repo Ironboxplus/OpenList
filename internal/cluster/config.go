@@ -8,10 +8,17 @@ import (
 	"sync"
 )
 
-// Config is the operator-facing configuration of the storage-sharing cluster.
+// Config is the operator-facing configuration of the credential-sharing cluster.
 // It is persisted as JSON under <data>/cluster/config.json and edited through the
 // admin API (and the plugins page UI). Keeping it in its own file rather than the
 // global settings table keeps the feature self-contained and pluggable.
+//
+// The redesign narrows sharing to CREDENTIALS only (tokens/cookies/secrets) and
+// routes them through explicit, manually-defined sync groups (see groups.go).
+// Peer membership is auto-discovered: any node that can open our AEAD envelope is
+// admitted, public nodes advertise their address, and the rest is learned via
+// peer exchange. The only manual knobs left are the shared key, an optional
+// self-advertised address, and optional bootstrap seeds for the first join.
 type Config struct {
 	// Enabled turns the whole cluster sync on/off.
 	Enabled bool `json:"enabled"`
@@ -19,84 +26,65 @@ type Config struct {
 	// exact same value; it is the sole secret that authenticates membership and
 	// encrypts traffic. Empty key => sync stays disabled.
 	Key string `json:"key"`
-	// Peers are the base URLs of the other nodes, e.g. "https://node2.example.com".
-	// The cluster endpoints are reached at <peer>/api/cluster/...
-	Peers []string `json:"peers"`
-	// ShareDrivers, if non-empty, limits sharing to storages of these driver
-	// types (e.g. ["115 Cloud","BaiduNetdisk"]). Empty => share every driver.
-	ShareDrivers []string `json:"share_drivers"`
-	// ShareMounts, if non-empty, limits sharing to these exact mount paths.
-	// Empty => no mount-path restriction.
-	ShareMounts []string `json:"share_mounts"`
-	// ShareDeletes, when true, propagates storage deletions to peers as
-	// tombstones. Default false: deleting a mount on one node must NOT silently
-	// wipe it cluster-wide — sharing is about credentials/config, not lifecycle.
-	ShareDeletes bool `json:"share_deletes"`
-	// ApplyRemote, when true, lets incoming peer configs create/update local
-	// storages. Default (false) makes a node share-only/observe; set true on
-	// nodes that should adopt peer credentials. Most deployments want this true.
+	// Label is a human-friendly name for THIS node shown in the cluster UI of all
+	// nodes (e.g. "cfscan", "home-nas"). Falls back to the node id when empty.
+	Label string `json:"label"`
+	// Addr is this node's externally reachable base URL (e.g.
+	// "https://node1.example.com"). Advertising it lets other nodes auto-discover
+	// and dial this node. Leave empty for nodes behind NAT — they dial out and are
+	// reached through a connected public node's relay instead.
+	Addr string `json:"addr"`
+	// Seeds are optional bootstrap base URLs to dial when joining an existing
+	// cluster. Only needed once: after the first connection, every reachable
+	// node's address is learned automatically via peer exchange.
+	Seeds []string `json:"seeds"`
+	// ApplyRemote, when true (the default for a credential cluster), lets incoming
+	// peer credentials update local storages in a shared group. Set false to make
+	// a node observe/share-only.
 	ApplyRemote bool `json:"apply_remote"`
-	// AnnounceIntervalSec is how often this node broadcasts its digest so peers
-	// can pull anything they missed. 0 => default.
+	// AnnounceIntervalSec is how often this node re-broadcasts its inventory +
+	// credential digests so peers converge after any lost message. 0 => default.
 	AnnounceIntervalSec int `json:"announce_interval_sec"`
-	// RequestTimeoutSec bounds each outbound peer HTTP request. 0 => default.
-	RequestTimeoutSec int `json:"request_timeout_sec"`
 }
 
 const (
-	defaultAnnounceIntervalSec = 60
-	defaultRequestTimeoutSec   = 15
+	defaultAnnounceIntervalSec = 45
 )
 
-func (c *Config) announceInterval() int {
+func (c Config) announceInterval() int {
 	if c.AnnounceIntervalSec <= 0 {
 		return defaultAnnounceIntervalSec
 	}
 	return c.AnnounceIntervalSec
 }
 
-func (c *Config) requestTimeout() int {
-	if c.RequestTimeoutSec <= 0 {
-		return defaultRequestTimeoutSec
-	}
-	return c.RequestTimeoutSec
+// active reports whether sync should actually run: enabled with a key. Unlike the
+// previous design it does NOT require a configured peer — a reachable node can run
+// purely accept-only and still serve a whole cluster.
+func (c Config) active() bool {
+	return c.Enabled && strings.TrimSpace(c.Key) != ""
 }
 
-// active reports whether sync should actually run: enabled, with a key and at
-// least one peer.
-func (c *Config) active() bool {
-	return c.Enabled && strings.TrimSpace(c.Key) != "" && len(c.peerList()) > 0
+// seedList returns the trimmed, non-empty bootstrap URLs.
+func (c Config) seedList() []string {
+	return cleanURLs(c.Seeds)
 }
 
-// peerList returns the trimmed, non-empty peer URLs.
-func (c *Config) peerList() []string {
-	out := make([]string, 0, len(c.Peers))
-	for _, p := range c.Peers {
-		if p = strings.TrimRight(strings.TrimSpace(p), "/"); p != "" {
-			out = append(out, p)
+func cleanURLs(in []string) []string {
+	out := make([]string, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, p := range in {
+		p = strings.TrimRight(strings.TrimSpace(p), "/")
+		if p == "" {
+			continue
 		}
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		out = append(out, p)
 	}
 	return out
-}
-
-// shouldShare decides whether a storage of the given driver/mount is in scope.
-func (c *Config) shouldShare(driver, mountPath string) bool {
-	if len(c.ShareDrivers) > 0 && !contains(c.ShareDrivers, driver) {
-		return false
-	}
-	if len(c.ShareMounts) > 0 && !contains(c.ShareMounts, mountPath) {
-		return false
-	}
-	return true
-}
-
-func contains(haystack []string, needle string) bool {
-	for _, h := range haystack {
-		if strings.EqualFold(strings.TrimSpace(h), needle) {
-			return true
-		}
-	}
-	return false
 }
 
 // configStore handles persistence of Config under a directory.
@@ -112,14 +100,15 @@ func newConfigStore(dir string) *configStore {
 
 func (cs *configStore) path() string { return filepath.Join(cs.dir, "config.json") }
 
-// loadOrInit reads config.json, or returns a zero (disabled) config if absent.
+// loadOrInit reads config.json, or returns a default (disabled, apply-remote-on)
+// config if absent.
 func (cs *configStore) loadOrInit() (Config, error) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 	b, err := os.ReadFile(cs.path())
 	if err != nil {
 		if os.IsNotExist(err) {
-			cs.cfg = Config{}
+			cs.cfg = Config{ApplyRemote: true}
 			return cs.cfg, nil
 		}
 		return Config{}, err

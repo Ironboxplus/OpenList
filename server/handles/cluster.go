@@ -76,3 +76,23 @@ func ClusterStatus(c *gin.Context) {
 	}
 	common.SuccessResp(c, m.Status())
 }
+
+// ClusterSetGroups replaces the cluster-shared sync-group document. Admin only.
+func ClusterSetGroups(c *gin.Context) {
+	m := clusterMgr(c)
+	if m == nil {
+		return
+	}
+	var req struct {
+		Groups []cluster.GroupSpec `json:"groups"`
+	}
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	if err := m.SetGroups(req.Groups); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c, m.Status())
+}

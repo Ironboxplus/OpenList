@@ -8,11 +8,12 @@ func TestConfigActive(t *testing.T) {
 		cfg  Config
 		want bool
 	}{
-		{"disabled", Config{Enabled: false, Key: "k", Peers: []string{"http://p"}}, false},
-		{"no key", Config{Enabled: true, Peers: []string{"http://p"}}, false},
-		{"no peers", Config{Enabled: true, Key: "k"}, false},
-		{"blank peers only", Config{Enabled: true, Key: "k", Peers: []string{"  ", "/"}}, false},
-		{"active", Config{Enabled: true, Key: "k", Peers: []string{"http://p"}}, true},
+		{"disabled", Config{Enabled: false, Key: "k"}, false},
+		{"no key", Config{Enabled: true}, false},
+		{"blank key", Config{Enabled: true, Key: "   "}, false},
+		// A reachable node needs no peer/seed to be active — it can accept-only.
+		{"active no seed", Config{Enabled: true, Key: "k"}, true},
+		{"active with seed", Config{Enabled: true, Key: "k", Seeds: []string{"http://p"}}, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -23,29 +24,19 @@ func TestConfigActive(t *testing.T) {
 	}
 }
 
-func TestConfigShouldShare(t *testing.T) {
-	cfg := Config{ShareDrivers: []string{"115 Open"}, ShareMounts: []string{"/115"}}
-	if !cfg.shouldShare("115 Open", "/115") {
-		t.Fatal("in-scope storage should be shared")
-	}
-	if cfg.shouldShare("Local", "/115") {
-		t.Fatal("driver out of filter must not be shared")
-	}
-	if cfg.shouldShare("115 Open", "/other") {
-		t.Fatal("mount out of filter must not be shared")
-	}
-
-	// Empty filters => share everything.
-	open := Config{}
-	if !open.shouldShare("AnyDriver", "/anywhere") {
-		t.Fatal("empty filters should share everything")
+func TestConfigSeedListNormalizes(t *testing.T) {
+	cfg := Config{Seeds: []string{" http://a/ ", "http://b", "", "  ", "http://a"}}
+	got := cfg.seedList()
+	if len(got) != 2 || got[0] != "http://a" || got[1] != "http://b" {
+		t.Fatalf("seedList normalize/dedup failed: %#v", got)
 	}
 }
 
-func TestConfigPeerListNormalizes(t *testing.T) {
-	cfg := Config{Peers: []string{" http://a/ ", "http://b", "", "  "}}
-	got := cfg.peerList()
-	if len(got) != 2 || got[0] != "http://a" || got[1] != "http://b" {
-		t.Fatalf("peerList normalize failed: %#v", got)
+func TestConfigAnnounceIntervalDefault(t *testing.T) {
+	if (Config{}).announceInterval() != defaultAnnounceIntervalSec {
+		t.Fatal("zero interval should fall back to default")
+	}
+	if (Config{AnnounceIntervalSec: 10}).announceInterval() != 10 {
+		t.Fatal("explicit interval should be honored")
 	}
 }

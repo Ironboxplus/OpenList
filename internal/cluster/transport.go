@@ -10,17 +10,27 @@ import (
 )
 
 // syncMessage is the inner (encrypted) protocol payload exchanged between nodes.
-// One message type carries push, anti-entropy announce, and pull in a single
-// round trip:
-//   - Records: full configs the sender is offering (push, or reply to a Want).
-//   - Digests: compact (no-secrets) advert of everything the sender holds, so the
-//     receiver can detect what it is missing.
-//   - Wants:   mount paths the sender wants the receiver to send back in full.
+// A single struct carries every interaction (hello, inventory/PEX, group-doc
+// sync, credential push/pull, and anti-entropy) so one frame format covers them
+// all. Unused fields are omitted on the wire.
+//
+//   - Node:        the sender's own inventory entry (who am I, my storages, addr).
+//   - Nodes:       relayed inventory entries + advertised peer addresses (PEX).
+//   - Groups:      the shared sync-group document (LWW).
+//   - GroupsVer:   the sender's groups version, for cheap anti-entropy.
+//   - Creds:       credential records being offered (push, or reply to a Want).
+//   - CredDigests: compact, no-secret advert of the credential records the sender
+//     holds, so the receiver can detect what it is missing.
+//   - Wants:       group ids the sender wants the receiver to send creds for.
 type syncMessage struct {
-	Type    string    `json:"type"` // "push" | "announce" | "pull" | "reply"
-	Records []*record `json:"records,omitempty"`
-	Digests []digest  `json:"digests,omitempty"`
-	Wants   []string  `json:"wants,omitempty"`
+	Type        string        `json:"type"` // "hello" | "push" | "announce" | "pull" | "reply"
+	Node        *nodeInfo     `json:"node,omitempty"`
+	Nodes       []*nodeInfo   `json:"nodes,omitempty"`
+	Groups      *groupDoc     `json:"groups,omitempty"`
+	GroupsVer   uint64        `json:"groups_ver,omitempty"`
+	Creds       []*credRecord `json:"creds,omitempty"`
+	CredDigests []credDigest  `json:"cred_digests,omitempty"`
+	Wants       []string      `json:"wants,omitempty"`
 }
 
 // envelope is the outer, on-the-wire structure. Its Cipher is the syncMessage

@@ -2,144 +2,130 @@ package cluster
 
 import (
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"sort"
 	"sync"
-
-	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
 
-// syncableStorage is the canonical, node-independent view of a storage mount that
-// we replicate between cluster nodes. Node-local runtime fields (ID, Status,
-// Modified) are deliberately excluded so the content hash is identical on every
-// node for the same logical config — that idempotency is what lets a node ignore
-// a peer that reports "the same token I already have" ("其他节点看到一样的token就不用变").
-type syncableStorage struct {
-	MountPath           string `json:"mount_path"`
-	Order               int    `json:"order"`
-	Driver              string `json:"driver"`
-	CacheExpiration     int    `json:"cache_expiration"`
-	CustomCachePolicies string `json:"custom_cache_policies"`
-	Addition            string `json:"addition"`
-	Remark              string `json:"remark"`
-	Disabled            bool   `json:"disabled"`
-	DisableIndex        bool   `json:"disable_index"`
-	EnableSign          bool   `json:"enable_sign"`
-	// Sort
-	OrderBy        string `json:"order_by"`
-	OrderDirection string `json:"order_direction"`
-	ExtractFolder  string `json:"extract_folder"`
-	// Proxy
-	WebProxy         bool   `json:"web_proxy"`
-	WebdavPolicy     string `json:"webdav_policy"`
-	ProxyRange       bool   `json:"proxy_range"`
-	DownProxyURL     string `json:"down_proxy_url"`
-	DisableProxySign bool   `json:"disable_proxy_sign"`
+// ----------------------------------------------------------------------------
+// Sync groups (the multipartite mapping)
+//
+// A group links storages ACROSS nodes that should share one credential — e.g.
+// the same 115 account mounted on cfscan, tx and home-nas. The set of groups is
+// cluster-wide shared state, replicated as a single last-writer-wins document
+// (admin edits are infrequent, so whole-doc LWW is the simplest convergent
+// choice). Each group is a connected component of the overall k-partite graph.
+// ----------------------------------------------------------------------------
+
+// member is one storage on one node.
+type member struct {
+	NodeID    string `json:"node_id"`
+	MountPath string `json:"mount_path"`
 }
 
-func fromModel(s *model.Storage) syncableStorage {
-	return syncableStorage{
-		MountPath:           s.MountPath,
-		Order:               s.Order,
-		Driver:              s.Driver,
-		CacheExpiration:     s.CacheExpiration,
-		CustomCachePolicies: s.CustomCachePolicies,
-		Addition:            s.Addition,
-		Remark:              s.Remark,
-		Disabled:            s.Disabled,
-		DisableIndex:        s.DisableIndex,
-		EnableSign:          s.EnableSign,
-		OrderBy:             s.OrderBy,
-		OrderDirection:      s.OrderDirection,
-		ExtractFolder:       s.ExtractFolder,
-		WebProxy:            s.WebProxy,
-		WebdavPolicy:        s.WebdavPolicy,
-		ProxyRange:          s.ProxyRange,
-		DownProxyURL:        s.DownProxyURL,
-		DisableProxySign:    s.DisableProxySign,
-	}
+type group struct {
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	Members []member `json:"members"`
 }
 
-// applyTo writes the synced fields onto an existing storage model, preserving the
-// node-local runtime fields (ID/Status/Modified) of dst.
-func (sc syncableStorage) applyTo(dst *model.Storage) {
-	dst.MountPath = sc.MountPath
-	dst.Order = sc.Order
-	dst.Driver = sc.Driver
-	dst.CacheExpiration = sc.CacheExpiration
-	dst.CustomCachePolicies = sc.CustomCachePolicies
-	dst.Addition = sc.Addition
-	dst.Remark = sc.Remark
-	dst.Disabled = sc.Disabled
-	dst.DisableIndex = sc.DisableIndex
-	dst.EnableSign = sc.EnableSign
-	dst.OrderBy = sc.OrderBy
-	dst.OrderDirection = sc.OrderDirection
-	dst.ExtractFolder = sc.ExtractFolder
-	dst.WebProxy = sc.WebProxy
-	dst.WebdavPolicy = sc.WebdavPolicy
-	dst.ProxyRange = sc.ProxyRange
-	dst.DownProxyURL = sc.DownProxyURL
-	dst.DisableProxySign = sc.DisableProxySign
-}
-
-// canonicalJSON marshals deterministically. encoding/json already sorts struct
-// fields by declaration order (stable), so a plain Marshal is canonical here.
-func (sc syncableStorage) canonicalJSON() []byte {
-	b, _ := json.Marshal(sc)
-	return b
-}
-
-// contentHash is the idempotency key: identical config → identical hash on every
-// node, regardless of who authored it.
-func (sc syncableStorage) contentHash() string {
-	sum := sha256.Sum256(sc.canonicalJSON())
-	return hex.EncodeToString(sum[:])
-}
-
-// record is one replicated mount entry: the config plus CRDT version metadata.
-// Ordering is a Lamport clock with the origin node id as a deterministic
-// tiebreaker, giving a total order for last-writer-wins convergence.
-type record struct {
-	MountPath   string          `json:"mount_path"`
-	ContentHash string          `json:"content_hash"`
-	Version     uint64          `json:"version"`    // Lamport logical clock
-	Origin      string          `json:"origin"`     // node id that authored this version
-	OriginPub   []byte          `json:"origin_pub"` // origin's ed25519 pubkey; node id == hash(pubkey)
-	Tombstone   bool            `json:"tombstone"`  // true => mount was deleted
-	UpdatedAt   int64           `json:"updated_at"` // unix seconds, informational only
-	Config      syncableStorage `json:"config"`     // empty when Tombstone
-	Sig         []byte          `json:"sig"`        // origin's ed25519 signature over signingBytes
-}
-
-// verify checks a record is internally authentic: the origin node id is the hash
-// of the embedded pubkey (so a member cannot claim another node's id without its
-// private key), the signature is valid under that pubkey, and the content hash
-// matches the carried config. The cluster PSK (transport seal) gates membership;
-// this gates per-record origin integrity for relayed records.
-func (r *record) verify() bool {
-	if nodeIDFromPub(r.OriginPub) != r.Origin {
-		return false
-	}
-	if !r.Tombstone {
-		if r.Config.contentHash() != r.ContentHash {
-			return false
+// mountsForNode returns the mount paths this node contributes to the group.
+func (g group) mountsForNode(nodeID string) []string {
+	var out []string
+	for _, m := range g.Members {
+		if m.NodeID == nodeID {
+			out = append(out, m.MountPath)
 		}
-	} else if r.ContentHash != (syncableStorage{MountPath: r.MountPath}).contentHash() {
-		return false
 	}
-	return verifySig(r.OriginPub, r.signingBytes(), r.Sig)
+	return out
 }
 
-// signingBytes is the stable byte string an origin node signs to authenticate a
-// version. It excludes the signature itself and the (informational) timestamp.
-func (r *record) signingBytes() []byte {
-	// length-free, delimiter-joined fields; ContentHash already binds Config.
+// groupDoc is the replicated set of groups plus LWW version metadata.
+type groupDoc struct {
+	Groups    []group `json:"groups"`
+	Version   uint64  `json:"version"`
+	Origin    string  `json:"origin"`
+	OriginPub []byte  `json:"origin_pub"`
+	UpdatedAt int64   `json:"updated_at"`
+	Sig       []byte  `json:"sig"`
+}
+
+// canonicalGroups returns the groups sorted deterministically so signing and
+// comparison are stable regardless of insertion order.
+func canonicalGroups(groups []group) []group {
+	out := make([]group, len(groups))
+	copy(out, groups)
+	for i := range out {
+		ms := make([]member, len(out[i].Members))
+		copy(ms, out[i].Members)
+		sort.Slice(ms, func(a, b int) bool {
+			if ms[a].NodeID != ms[b].NodeID {
+				return ms[a].NodeID < ms[b].NodeID
+			}
+			return ms[a].MountPath < ms[b].MountPath
+		})
+		out[i].Members = ms
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].ID < out[b].ID })
+	return out
+}
+
+func (d *groupDoc) signingBytes() []byte {
+	canon := struct {
+		Groups  []group `json:"groups"`
+		Version uint64  `json:"version"`
+		Origin  string  `json:"origin"`
+	}{canonicalGroups(d.Groups), d.Version, d.Origin}
+	b, _ := json.Marshal(canon)
+	sum := sha256.Sum256(b)
+	return sum[:]
+}
+
+func (d *groupDoc) verify() bool {
+	if d.Version == 0 {
+		return true // the empty/default doc is implicitly valid
+	}
+	if nodeIDFromPub(d.OriginPub) != d.Origin {
+		return false
+	}
+	return verifySig(d.OriginPub, d.signingBytes(), d.Sig)
+}
+
+func (d *groupDoc) dominates(other *groupDoc) bool {
+	if d.Version != other.Version {
+		return d.Version > other.Version
+	}
+	return d.Origin > other.Origin
+}
+
+// ----------------------------------------------------------------------------
+// Credential records (the thing actually replicated per group)
+// ----------------------------------------------------------------------------
+
+// credRecord carries a group's current credential payload. The payload holds the
+// secret fields and only ever travels inside the AEAD-sealed envelope. Records
+// are signed by their origin so they stay authentic across relays.
+type credRecord struct {
+	GroupID      string                     `json:"group_id"`
+	OriginDriver string                     `json:"origin_driver"` // apply only to same-driver mounts
+	Fields       []string                   `json:"fields"`        // credential field names included
+	CredHash     string                     `json:"cred_hash"`     // idempotency key
+	Payload      map[string]json.RawMessage `json:"payload"`       // field -> value (secret)
+	Version      uint64                     `json:"version"`       // Lamport clock
+	Origin       string                     `json:"origin"`        // authoring node id
+	OriginPub    []byte                     `json:"origin_pub"`    // origin ed25519 pubkey
+	OriginMount  string                     `json:"origin_mount"`  // informational
+	UpdatedAt    int64                      `json:"updated_at"`
+	Sig          []byte                     `json:"sig"`
+}
+
+func (r *credRecord) signingBytes() []byte {
 	var b []byte
-	b = append(b, r.MountPath...)
+	b = append(b, r.GroupID...)
 	b = append(b, 0)
-	b = append(b, r.ContentHash...)
+	b = append(b, r.OriginDriver...)
+	b = append(b, 0)
+	b = append(b, r.CredHash...)
 	b = append(b, 0)
 	v := make([]byte, 8)
 	for i := 0; i < 8; i++ {
@@ -148,199 +134,369 @@ func (r *record) signingBytes() []byte {
 	b = append(b, v...)
 	b = append(b, 0)
 	b = append(b, r.Origin...)
-	b = append(b, 0)
-	if r.Tombstone {
-		b = append(b, 1)
-	} else {
-		b = append(b, 0)
-	}
 	return b
 }
 
-// dominates reports whether r should win over other under LWW ordering.
-func (r *record) dominates(other *record) bool {
+func (r *credRecord) verify() bool {
+	if nodeIDFromPub(r.OriginPub) != r.Origin {
+		return false
+	}
+	if credHash(r.Payload) != r.CredHash {
+		return false
+	}
+	return verifySig(r.OriginPub, r.signingBytes(), r.Sig)
+}
+
+func (r *credRecord) dominates(other *credRecord) bool {
 	if r.Version != other.Version {
 		return r.Version > other.Version
 	}
-	// Equal Lamport time: break ties deterministically by origin id, then by
-	// content hash so two distinct concurrent edits still converge identically
-	// on every node.
 	if r.Origin != other.Origin {
 		return r.Origin > other.Origin
 	}
-	return r.ContentHash > other.ContentHash
+	return r.CredHash > other.CredHash
 }
 
-// digest is the compact form announced to peers so they can detect divergence
-// without shipping full configs (and secrets) on every heartbeat.
-type digest struct {
-	MountPath   string `json:"mount_path"`
-	ContentHash string `json:"content_hash"`
-	Version     uint64 `json:"version"`
-	Origin      string `json:"origin"`
-	Tombstone   bool   `json:"tombstone"`
+// credDigest is the compact (no-secret) advert of a held credential record.
+type credDigest struct {
+	GroupID  string `json:"group_id"`
+	CredHash string `json:"cred_hash"`
+	Version  uint64 `json:"version"`
+	Origin   string `json:"origin"`
 }
 
-// store is the in-memory CRDT keyed by mount path, with a monotonically
-// non-decreasing Lamport clock shared across all mounts.
+func digestOfCred(r *credRecord) credDigest {
+	return credDigest{GroupID: r.GroupID, CredHash: r.CredHash, Version: r.Version, Origin: r.Origin}
+}
+
+func credDigestDominates(a, b credDigest) bool {
+	if a.Version != b.Version {
+		return a.Version > b.Version
+	}
+	if a.Origin != b.Origin {
+		return a.Origin > b.Origin
+	}
+	return a.CredHash > b.CredHash
+}
+
+// ----------------------------------------------------------------------------
+// Node inventory (soft state powering the UI + group editing)
+// ----------------------------------------------------------------------------
+
+type storageInfo struct {
+	MountPath string `json:"mount_path"`
+	Driver    string `json:"driver"`
+	Status    string `json:"status"`
+}
+
+type nodeInfo struct {
+	NodeID    string        `json:"node_id"`
+	Label     string        `json:"label"`
+	Addr      string        `json:"addr"`
+	Storages  []storageInfo `json:"storages"`
+	Version   uint64        `json:"version"`
+	UpdatedAt int64         `json:"updated_at"`
+	// seenAt is set locally on receipt for liveness; not part of the wire form's
+	// trust (it is overwritten each time we hear from/about the node).
+	seenAt int64 `json:"-"`
+}
+
+// ----------------------------------------------------------------------------
+// store: the in-memory cluster state (groups + creds + inventory)
+// ----------------------------------------------------------------------------
+
 type store struct {
-	mu      sync.RWMutex
-	records map[string]*record
-	lamport uint64
+	mu        sync.RWMutex
+	groups    groupDoc
+	creds     map[string]*credRecord // keyed by group id
+	inventory map[string]*nodeInfo   // keyed by node id
+	lamport   uint64
 }
 
 func newStore() *store {
-	return &store{records: make(map[string]*record)}
+	return &store{
+		creds:     make(map[string]*credRecord),
+		inventory: make(map[string]*nodeInfo),
+	}
 }
 
-// tick advances and returns the Lamport clock for a locally-originated change.
-func (s *store) tick() uint64 {
-	s.lamport++
-	return s.lamport
-}
-
-// observe bumps the Lamport clock to stay ahead of a value seen from a peer.
 func (s *store) observe(v uint64) {
 	if v > s.lamport {
 		s.lamport = v
 	}
 }
 
-func (s *store) get(mountPath string) (*record, bool) {
+// ---- groups ----
+
+func (s *store) groupDoc() groupDoc {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	r, ok := s.records[mountPath]
+	return s.groups
+}
+
+func (s *store) groupList() []group {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]group, len(s.groups.Groups))
+	copy(out, s.groups.Groups)
+	return out
+}
+
+// setGroups authors a new groups document locally (admin edit). Returns the
+// signed doc to broadcast.
+func (s *store) setGroups(id *identity, groups []group, now int64) groupDoc {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lamport++
+	d := groupDoc{
+		Groups:    canonicalGroups(groups),
+		Version:   s.lamport,
+		Origin:    id.NodeID,
+		OriginPub: id.Pub,
+		UpdatedAt: now,
+	}
+	d.Sig = id.sign(d.signingBytes())
+	s.groups = d
+	return d
+}
+
+// mergeGroups integrates a peer's groups document under LWW. Returns true if it
+// replaced ours.
+func (s *store) mergeGroups(d *groupDoc) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.observe(d.Version)
+	if d.dominates(&s.groups) {
+		s.groups = *d
+		return true
+	}
+	return false
+}
+
+// groupsForMount returns the groups that include a (this-node) mount path.
+func (s *store) groupsForMount(nodeID, mountPath string) []group {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []group
+	for _, g := range s.groups.Groups {
+		for _, m := range g.Members {
+			if m.NodeID == nodeID && m.MountPath == mountPath {
+				out = append(out, g)
+				break
+			}
+		}
+	}
+	return out
+}
+
+func (s *store) groupByID(id string) (group, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, g := range s.groups.Groups {
+		if g.ID == id {
+			return g, true
+		}
+	}
+	return group{}, false
+}
+
+// ---- creds ----
+
+func (s *store) getCred(groupID string) (*credRecord, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r, ok := s.creds[groupID]
 	return r, ok
 }
 
-func (s *store) snapshot() []*record {
+func (s *store) credSnapshot() []*credRecord {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]*record, 0, len(s.records))
-	for _, r := range s.records {
+	out := make([]*credRecord, 0, len(s.creds))
+	for _, r := range s.creds {
 		out = append(out, r)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].MountPath < out[j].MountPath })
+	sort.Slice(out, func(i, j int) bool { return out[i].GroupID < out[j].GroupID })
 	return out
 }
 
-func (s *store) digests() []digest {
+func (s *store) credDigests() []credDigest {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]digest, 0, len(s.records))
-	for _, r := range s.records {
-		out = append(out, digest{
-			MountPath:   r.MountPath,
-			ContentHash: r.ContentHash,
-			Version:     r.Version,
-			Origin:      r.Origin,
-			Tombstone:   r.Tombstone,
-		})
+	out := make([]credDigest, 0, len(s.creds))
+	for _, r := range s.creds {
+		out = append(out, digestOfCred(r))
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].MountPath < out[j].MountPath })
+	sort.Slice(out, func(i, j int) bool { return out[i].GroupID < out[j].GroupID })
 	return out
 }
 
-// localChange records a config a node authored itself. It returns the new record
-// to broadcast, or (nil,false) when nothing changed (idempotent no-op): same
-// content hash and not resurrecting a tombstone.
-func (s *store) localChange(id *identity, cfg syncableStorage, now int64) (*record, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	h := cfg.contentHash()
-	if cur, ok := s.records[cfg.MountPath]; ok && !cur.Tombstone && cur.ContentHash == h {
-		return nil, false // unchanged — do not bump version or churn peers
-	}
-	s.lamport++
-	r := &record{
-		MountPath:   cfg.MountPath,
-		ContentHash: h,
-		Version:     s.lamport,
-		Origin:      id.NodeID,
-		OriginPub:   id.Pub,
-		Tombstone:   false,
-		UpdatedAt:   now,
-		Config:      cfg,
-	}
-	r.Sig = id.sign(r.signingBytes())
-	s.records[cfg.MountPath] = r
-	return r, true
-}
-
-// localDelete authors a tombstone for a mount. Returns (nil,false) if already
-// tombstoned or unknown.
-func (s *store) localDelete(id *identity, mountPath string, now int64) (*record, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	cur, ok := s.records[mountPath]
-	if !ok || cur.Tombstone {
+// localCredChange records a credential a node observed on one of its own mounts.
+// Returns (nil,false) when the credential is unchanged (idempotent: "其他节点看到
+// 一样的 token 就不用变") or empty.
+func (s *store) localCredChange(id *identity, groupID, driver, mount string, payload map[string]json.RawMessage, now int64) (*credRecord, bool) {
+	h := credHash(payload)
+	if h == "" {
 		return nil, false
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cur, ok := s.creds[groupID]; ok && cur.CredHash == h {
+		return nil, false // identical credential already known — no churn
+	}
 	s.lamport++
-	r := &record{
-		MountPath: mountPath,
-		// hash of an empty config keeps signingBytes well-defined for tombstones
-		ContentHash: syncableStorage{MountPath: mountPath}.contentHash(),
-		Version:     s.lamport,
-		Origin:      id.NodeID,
-		OriginPub:   id.Pub,
-		Tombstone:   true,
-		UpdatedAt:   now,
+	r := &credRecord{
+		GroupID:      groupID,
+		OriginDriver: driver,
+		Fields:       credFieldNames(payload),
+		CredHash:     h,
+		Payload:      payload,
+		Version:      s.lamport,
+		Origin:       id.NodeID,
+		OriginPub:    id.Pub,
+		OriginMount:  mount,
+		UpdatedAt:    now,
 	}
 	r.Sig = id.sign(r.signingBytes())
-	s.records[mountPath] = r
+	s.creds[groupID] = r
 	return r, true
 }
 
-// mergeResult describes what merge did with an incoming record.
-type mergeResult int
-
-const (
-	mergeIgnored  mergeResult = iota // incoming did not win (older/equal/duplicate)
-	mergeApplied                     // incoming won and replaced local (config changed)
-	mergeTombstone                   // incoming won and is a delete
-)
-
-// merge integrates a peer's record. The caller must have already verified r.Sig
-// against the origin's known public key. merge enforces LWW ordering and the
-// idempotency rule, and advances the Lamport clock.
-func (s *store) merge(r *record) mergeResult {
+// mergeCred integrates a peer's credential record under LWW. The caller must have
+// verified the signature. Returns true if it replaced/added ours.
+func (s *store) mergeCred(r *credRecord) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if r.Version > s.lamport {
-		s.lamport = r.Version
-	}
-	cur, ok := s.records[r.MountPath]
+	s.observe(r.Version)
+	cur, ok := s.creds[r.GroupID]
 	if ok {
-		// Idempotent: identical live content, ignore regardless of version churn.
-		if !r.Tombstone && !cur.Tombstone && cur.ContentHash == r.ContentHash {
-			return mergeIgnored
+		if cur.CredHash == r.CredHash {
+			return false // idempotent: same credential
 		}
 		if !r.dominates(cur) {
-			return mergeIgnored
+			return false
 		}
 	}
 	cp := *r
-	s.records[r.MountPath] = &cp
-	if cp.Tombstone {
-		return mergeTombstone
-	}
-	return mergeApplied
+	s.creds[r.GroupID] = &cp
+	return true
 }
 
-// load replaces the store contents from a persisted snapshot.
-func (s *store) load(records []*record, lamport uint64) {
+// pruneCreds drops credential records for groups that no longer exist.
+func (s *store) pruneCreds() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.records = make(map[string]*record, len(records))
-	for _, r := range records {
-		s.records[r.MountPath] = r
+	live := make(map[string]struct{}, len(s.groups.Groups))
+	for _, g := range s.groups.Groups {
+		live[g.ID] = struct{}{}
 	}
-	s.lamport = lamport
+	for id := range s.creds {
+		if _, ok := live[id]; !ok {
+			delete(s.creds, id)
+		}
+	}
+}
+
+// ---- inventory ----
+
+func (s *store) setLocalInventory(info *nodeInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	info.seenAt = info.UpdatedAt
+	s.inventory[info.NodeID] = info
+}
+
+// mergeInventory integrates a peer's inventory entry (LWW by version). seenAt is
+// always refreshed so liveness reflects the latest contact.
+func (s *store) mergeInventory(info *nodeInfo, now int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.inventory[info.NodeID]
+	if ok && info.Version < cur.Version {
+		cur.seenAt = now // still heard about it; keep liveness fresh
+		return false
+	}
+	cp := *info
+	cp.seenAt = now
+	s.inventory[info.NodeID] = &cp
+	return true
+}
+
+func (s *store) inventoryList() []nodeInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]nodeInfo, 0, len(s.inventory))
+	for _, n := range s.inventory {
+		cp := *n
+		cp.seenAt = n.seenAt
+		out = append(out, cp)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })
+	return out
+}
+
+// dialableAddrs returns advertised peer addresses (excluding our own node id) for
+// auto-discovery dialing.
+func (s *store) dialableAddrs(selfID string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []string
+	for id, n := range s.inventory {
+		if id == selfID || n.Addr == "" {
+			continue
+		}
+		out = append(out, n.Addr)
+	}
+	return out
+}
+
+// ---- persistence ----
+
+type persistedState struct {
+	Lamport   uint64        `json:"lamport"`
+	Groups    groupDoc      `json:"groups"`
+	Creds     []*credRecord `json:"creds"`
+	Inventory []*nodeInfo   `json:"inventory"`
+}
+
+func (s *store) export() persistedState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ps := persistedState{Lamport: s.lamport, Groups: s.groups}
+	for _, r := range s.creds {
+		ps.Creds = append(ps.Creds, r)
+	}
+	for _, n := range s.inventory {
+		ps.Inventory = append(ps.Inventory, n)
+	}
+	return ps
+}
+
+func (s *store) load(ps persistedState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lamport = ps.Lamport
+	s.groups = ps.Groups
+	s.creds = make(map[string]*credRecord, len(ps.Creds))
+	for _, r := range ps.Creds {
+		s.creds[r.GroupID] = r
+	}
+	s.inventory = make(map[string]*nodeInfo, len(ps.Inventory))
+	for _, n := range ps.Inventory {
+		s.inventory[n.NodeID] = n
+	}
 }
 
 func (s *store) lamportNow() uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.lamport
+}
+
+// shortHash returns a short prefix of a hash for display.
+func shortHash(h string) string {
+	if len(h) <= 12 {
+		return h
+	}
+	return h[:12]
 }

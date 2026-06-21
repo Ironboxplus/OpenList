@@ -160,6 +160,7 @@ func admin(g *gin.RouterGroup) {
 	clusterGrp.GET("/config", handles.ClusterGetConfig)
 	clusterGrp.POST("/config", handles.ClusterSetConfig)
 	clusterGrp.GET("/status", handles.ClusterStatus)
+	clusterGrp.POST("/groups", handles.ClusterSetGroups)
 
 	// Admin-only user operations (create/delete/role-affecting). The profile-edit
 	// endpoints (list/get/update) live in a separate group that also accepts a

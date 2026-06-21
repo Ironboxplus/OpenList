@@ -44,17 +44,21 @@ type peerConn struct {
 	ws        *websocket.Conn
 	send      chan []byte
 	outbound  bool   // true if we dialed it
+	addr      string // base URL we dialed (outbound only); "" for inbound
+	since     int64  // unix seconds the connection was established
 	nodeID    string // learned from the first authenticated frame
 	closeOnce sync.Once
 	closed    chan struct{}
 }
 
-func newPeerConn(mgr *Manager, ws *websocket.Conn, outbound bool) *peerConn {
+func newPeerConn(mgr *Manager, ws *websocket.Conn, outbound bool, addr string) *peerConn {
 	return &peerConn{
 		mgr:      mgr,
 		ws:       ws,
 		send:     make(chan []byte, sendQueueLen),
 		outbound: outbound,
+		addr:     addr,
+		since:    now(),
 		closed:   make(chan struct{}),
 	}
 }
@@ -208,31 +212,34 @@ func wsURL(peer string) string {
 	return peer + wsPath
 }
 
-// startConn registers a connection, starts its pumps, and greets the peer with
-// our digests so anti-entropy begins immediately.
+// startConn registers a connection, starts its pumps, and greets the peer with a
+// hello (our inventory + known peer addresses for PEX + groups doc + credential
+// digests) so discovery and anti-entropy begin immediately.
 func (m *Manager) startConn(c *peerConn) {
 	m.conns.add(c)
 	go c.writePump()
 	go c.readPump()
-	m.sendTo(c, &syncMessage{Type: "announce", Digests: m.state.digests()})
+	m.sendTo(c, m.helloMessage())
 }
 
 // dialPeer opens an outbound persistent connection to a peer and blocks until it
 // closes. Dialing OUT is what lets a NAT'd node participate without being
 // reachable itself.
-func (m *Manager) dialPeer(peer string) error {
-	ws, _, err := websocket.DefaultDialer.Dial(wsURL(peer), nil)
+func (m *Manager) dialPeer(addr string) error {
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL(addr), nil)
 	if err != nil {
 		return err
 	}
-	c := newPeerConn(m, ws, true)
+	c := newPeerConn(m, ws, true, addr)
 	m.startConn(c)
 	<-c.closed
 	return nil
 }
 
 // ServeWS upgrades an inbound HTTP request to a persistent connection. Auth is
-// deferred to the first sealed frame (PSK), so the upgrade itself is open.
+// deferred to the first sealed frame (PSK), so the upgrade itself is open. Any
+// node that can open our AEAD envelope is admitted as a peer — this is the
+// "authenticated remotes auto-join" half of discovery.
 func (m *Manager) ServeWS(w http.ResponseWriter, r *http.Request) {
 	cfg := m.cfgStore.get()
 	if !cfg.active() {
@@ -243,16 +250,21 @@ func (m *Manager) ServeWS(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
-	m.startConn(newPeerConn(m, ws, false))
+	m.startConn(newPeerConn(m, ws, false, ""))
 }
 
-// dialSupervisor keeps one live outbound connection to every configured peer,
-// re-dialing as connections drop or config changes.
+// dialSupervisor keeps live outbound connections to bootstrap seeds and to every
+// auto-discovered peer address we are not already connected to, re-dialing as
+// connections drop. Seeds bootstrap the first join; learned addresses (from peer
+// inventory exchange) keep public nodes meshed without manual config.
 func (m *Manager) dialSupervisor() {
 	for {
 		if cfg := m.cfgStore.get(); cfg.active() {
-			for _, peer := range cfg.peerList() {
-				m.ensureDial(peer)
+			for _, seed := range cfg.seedList() {
+				m.ensureDial(seed)
+			}
+			for _, addr := range m.discoveredDialTargets() {
+				m.ensureDial(addr)
 			}
 		}
 		select {
@@ -263,25 +275,55 @@ func (m *Manager) dialSupervisor() {
 	}
 }
 
+// discoveredDialTargets returns advertised peer addresses we should dial: those
+// belonging to nodes we do not already have a live connection to, and that are
+// not our own advertised address.
+func (m *Manager) discoveredDialTargets() []string {
+	self := m.cfgStore.get().Addr
+	self = trimURL(self)
+	var out []string
+	for _, n := range m.state.inventoryList() {
+		if n.NodeID == m.id.NodeID || n.Addr == "" {
+			continue
+		}
+		if trimURL(n.Addr) == self && self != "" {
+			continue
+		}
+		if m.conns.hasNode(n.NodeID) {
+			continue
+		}
+		out = append(out, n.Addr)
+	}
+	return out
+}
+
+func trimURL(s string) string {
+	return strings.TrimRight(strings.TrimSpace(s), "/")
+}
+
 // ensureDial starts (at most one) outbound dial loop for a peer URL. dialPeer
 // blocks for the connection's lifetime, so the dialing flag also prevents a
 // duplicate link while connected.
-func (m *Manager) ensureDial(peer string) {
+func (m *Manager) ensureDial(addr string) {
+	addr = trimURL(addr)
+	if addr == "" {
+		return
+	}
 	m.dialMu.Lock()
-	if m.dialing[peer] {
+	if m.dialing[addr] {
 		m.dialMu.Unlock()
 		return
 	}
-	m.dialing[peer] = true
+	m.dialing[addr] = true
 	m.dialMu.Unlock()
 	go func() {
 		defer func() {
 			m.dialMu.Lock()
-			delete(m.dialing, peer)
+			delete(m.dialing, addr)
 			m.dialMu.Unlock()
 		}()
-		if err := m.dialPeer(peer); err != nil {
-			utils.Log.Debugf("[cluster] dial %s failed: %v", peer, err)
+		if err := m.dialPeer(addr); err != nil {
+			utils.Log.Debugf("[cluster] dial %s failed: %v", addr, err)
 			select {
 			case <-m.stopCh:
 			case <-time.After(dialBackoffMin):
