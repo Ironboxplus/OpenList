@@ -1,7 +1,6 @@
 package handles
 
 import (
-	"io"
 	"net/http"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/cluster"
@@ -9,30 +8,19 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ClusterSync is the peer-to-peer endpoint nodes use to exchange sealed,
-// encrypted sync messages. It is intentionally unauthenticated at the HTTP layer:
+// ClusterWS is the peer-to-peer endpoint nodes use to establish a persistent,
+// stateful sync connection (WebSocket). A persistent connection is required so a
+// node behind NAT can participate: it dials OUT to this endpoint and keeps the
+// link open, since it cannot be dialed itself. The HTTP upgrade is open;
 // authentication and confidentiality come from the cluster pre-shared key (only
-// PSK holders can seal/open the AEAD envelope). The body and response are raw
-// sealed bytes, not JSON.
-func ClusterSync(c *gin.Context) {
+// PSK holders can seal/open the per-frame AEAD envelope).
+func ClusterWS(c *gin.Context) {
 	m := cluster.Default
 	if m == nil {
 		c.Status(http.StatusServiceUnavailable)
 		return
 	}
-	raw, err := io.ReadAll(io.LimitReader(c.Request.Body, 16<<20))
-	if err != nil {
-		c.Status(http.StatusBadRequest)
-		return
-	}
-	reply, err := m.HandleSync(raw)
-	if err != nil {
-		// Do not leak crypto details; a wrong key / replay / disabled all map to
-		// a generic rejection.
-		c.Status(http.StatusForbidden)
-		return
-	}
-	c.Data(http.StatusOK, "application/octet-stream", reply)
+	m.ServeWS(c.Writer, c.Request)
 }
 
 // ---- Admin config/status ----

@@ -110,9 +110,10 @@ func Init(e *gin.Engine) {
 	api.GET("/plugin/manifest", handles.PluginManifest)
 	api.GET("/plugin/asset/:name", handles.PluginAsset)
 
-	// Cluster storage-sync peer endpoint. Unauthenticated at the HTTP layer —
-	// authentication and encryption come from the cluster pre-shared key.
-	api.POST("/cluster/sync", handles.ClusterSync)
+	// Cluster storage-sync peer endpoint: a persistent WebSocket so NAT'd nodes
+	// can dial out and stay connected. Authentication/encryption come from the
+	// cluster pre-shared key (per-frame AEAD), not the HTTP layer.
+	api.GET("/cluster/ws", handles.ClusterWS)
 
 	_fs(auth.Group("/fs"))
 	fsAndShare(api.Group("/fs", middlewares.Auth(true)))

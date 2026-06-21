@@ -1,11 +1,8 @@
 package cluster
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -20,8 +17,11 @@ import (
 const (
 	// replayWindowSec bounds clock skew + in-flight time for envelope freshness.
 	replayWindowSec = 300
-	// syncPath is the single endpoint peers exchange sealed messages on.
-	syncPath = "/api/cluster/sync"
+	// wsPath is the persistent-connection endpoint peers dial.
+	wsPath = "/api/cluster/ws"
+	// dialReconcile is how often the dial supervisor re-checks that every
+	// configured peer has a live outbound connection.
+	dialReconcile = 5 * time.Second
 )
 
 // Manager is the running cluster-sync engine for this node.
@@ -31,9 +31,12 @@ type Manager struct {
 	cfgStore *configStore
 	state    *store
 	replay   *replayCache
-	client   *http.Client
+	conns    *connRegistry
 
 	persistMu sync.Mutex
+
+	dialMu  sync.Mutex
+	dialing map[string]bool // peer URLs with an in-flight/live outbound dial
 
 	stopCh chan struct{}
 	once   sync.Once
@@ -61,13 +64,13 @@ func Init(dataDir string) (*Manager, error) {
 		cfgStore: newConfigStore(dir),
 		state:    newStore(),
 		replay:   newReplayCache(replayWindowSec),
+		conns:    newConnRegistry(),
+		dialing:  make(map[string]bool),
 		stopCh:   make(chan struct{}),
 	}
 	if _, err := m.cfgStore.loadOrInit(); err != nil {
 		return nil, err
 	}
-	cfg := m.cfgStore.get()
-	m.client = &http.Client{Timeout: time.Duration(cfg.requestTimeout()) * time.Second}
 	m.loadState()
 
 	op.RegisterStorageHook(m.onStorageHook)
@@ -186,7 +189,9 @@ func (m *Manager) SetConfig(c Config) error {
 	if err := m.cfgStore.save(c); err != nil {
 		return err
 	}
-	m.client.Timeout = time.Duration(c.requestTimeout()) * time.Second
+	// Drop all live connections so they reconnect with the new settings (key,
+	// peers, ...); the dial supervisor re-dials the configured peers.
+	m.conns.closeAll()
 	// Seed records for any newly in-scope local storages so we announce them.
 	go m.seedLocalStorages()
 	return nil
@@ -194,21 +199,24 @@ func (m *Manager) SetConfig(c Config) error {
 
 // ---- lifecycle ----
 
-// Start seeds records from local storages and launches the anti-entropy loop.
+// Start seeds records from local storages and launches the connection dialer and
+// anti-entropy loop.
 func (m *Manager) Start() {
 	m.once.Do(func() {
 		go m.seedLocalStorages()
 		go m.announceLoop()
+		go m.dialSupervisor()
 	})
 }
 
-// Stop halts background loops.
+// Stop halts background loops and closes all connections.
 func (m *Manager) Stop() {
 	select {
 	case <-m.stopCh:
 	default:
 		close(m.stopCh)
 	}
+	m.conns.closeAll()
 }
 
 // seedLocalStorages records the current healthy, in-scope local storages as CRDT
@@ -293,38 +301,32 @@ func (m *Manager) onStorageHook(typ string, d driver.Driver) {
 	}
 }
 
-// pullMount asks every peer for the latest record of a single mount and applies
-// the best healthy answer.
+// pullMount asks every connected peer for the latest record of a single mount.
+// Answers arrive asynchronously and are applied by handleFrame.
 func (m *Manager) pullMount(mountPath string) {
 	cfg := m.cfgStore.get()
 	if !cfg.active() {
 		return
 	}
-	msg := &syncMessage{Type: "pull", Wants: []string{mountPath}}
-	for _, peer := range cfg.peerList() {
-		m.exchange(peer, msg)
-	}
+	m.broadcast(&syncMessage{Type: "pull", Wants: []string{mountPath}})
 }
 
-// ---- message processing (shared by client replies and server requests) ----
+// ---- message processing ----
 
-// process integrates an incoming message and returns the reply to send back.
-// It is the heart of the anti-entropy algorithm.
-func (m *Manager) process(in *syncMessage) *syncMessage {
+// buildReply produces the anti-entropy answer to a peer's digests/wants. It does
+// NOT absorb the incoming records (handleFrame does that first, separately, so it
+// can relay newly-applied ones). Returns nil when there is nothing to send back.
+func (m *Manager) buildReply(in *syncMessage) *syncMessage {
 	reply := &syncMessage{Type: "reply"}
 
-	// 1. Absorb any full records offered to us.
-	m.applyRecords(in.Records)
-
-	// 2. Anti-entropy on digests: tell the peer where we differ.
+	// Anti-entropy on digests: tell the peer where we differ.
 	if len(in.Digests) > 0 {
 		peerHas := make(map[string]digest, len(in.Digests))
 		for _, dg := range in.Digests {
 			peerHas[dg.MountPath] = dg
 			local, ok := m.state.get(dg.MountPath)
 			if !ok {
-				// We lack it entirely — request the full record.
-				reply.Wants = append(reply.Wants, dg.MountPath)
+				reply.Wants = append(reply.Wants, dg.MountPath) // we lack it
 				continue
 			}
 			cmp := digestOf(local)
@@ -343,21 +345,29 @@ func (m *Manager) process(in *syncMessage) *syncMessage {
 		}
 	}
 
-	// 3. Serve explicit wants (pull).
+	// Serve explicit wants (pull).
 	for _, mp := range in.Wants {
 		if r, ok := m.state.get(mp); ok {
 			reply.Records = append(reply.Records, r)
 		}
 	}
+
+	if len(reply.Records) == 0 && len(reply.Wants) == 0 {
+		return nil
+	}
 	return reply
 }
 
-// applyRecords verifies, merges and (if configured) applies a batch of records.
-func (m *Manager) applyRecords(recs []*record) {
+// applyRecords verifies, merges and (if configured) applies a batch of records,
+// returning the records that were newly applied/tombstoned so the caller can
+// relay them onward (hub behaviour). Only genuine changes are returned, so relay
+// naturally terminates.
+func (m *Manager) applyRecords(recs []*record) []*record {
 	if len(recs) == 0 {
-		return
+		return nil
 	}
 	cfg := m.cfgStore.get()
+	var applied []*record
 	var dirty bool
 	for _, r := range recs {
 		if r == nil || !r.verify() {
@@ -366,11 +376,13 @@ func (m *Manager) applyRecords(recs []*record) {
 		switch m.state.merge(r) {
 		case mergeApplied:
 			dirty = true
+			applied = append(applied, r)
 			if cfg.ApplyRemote {
 				m.applyToLocal(r)
 			}
 		case mergeTombstone:
 			dirty = true
+			applied = append(applied, r)
 			if cfg.ApplyRemote {
 				m.deleteLocal(r.MountPath)
 			}
@@ -379,6 +391,7 @@ func (m *Manager) applyRecords(recs []*record) {
 	if dirty {
 		m.persist()
 	}
+	return applied
 }
 
 // applyToLocal creates or updates the local storage from a record's config. The
@@ -416,113 +429,96 @@ func (m *Manager) deleteLocal(mountPath string) {
 	}
 }
 
-// ---- networking ----
+// ---- networking (persistent connections) ----
 
-// broadcast sends a message to every peer (fire-and-forget), processing each
-// peer's reply.
+// seal wraps a message in an encrypted envelope addressed from this node.
+func (m *Manager) seal(msg *syncMessage) ([]byte, error) {
+	key, err := deriveAEADKey([]byte(m.cfgStore.get().Key))
+	if err != nil {
+		return nil, err
+	}
+	return sealEnvelope(key, m.id, msg, now())
+}
+
+// sendTo enqueues a sealed message on a single connection.
+func (m *Manager) sendTo(c *peerConn, msg *syncMessage) {
+	frame, err := m.seal(msg)
+	if err != nil {
+		return
+	}
+	c.enqueue(frame)
+}
+
+// broadcast enqueues a sealed message on every live connection. The same sealed
+// frame is reused for all peers (each peer keeps its own replay cache, so a
+// shared nonce is fine).
 func (m *Manager) broadcast(msg *syncMessage) {
-	cfg := m.cfgStore.get()
-	if !cfg.active() {
+	conns := m.conns.all()
+	if len(conns) == 0 {
 		return
 	}
-	for _, peer := range cfg.peerList() {
-		go m.exchange(peer, msg)
-	}
-}
-
-// exchange performs one full round-trip with a single peer: send msg, absorb the
-// reply's records, and satisfy any records the peer asked for (reply.Wants) with
-// an immediate follow-up push to that same peer.
-func (m *Manager) exchange(peer string, msg *syncMessage) {
-	reply, err := m.send(peer, msg)
+	frame, err := m.seal(msg)
 	if err != nil {
-		utils.Log.Debugf("[cluster] send to %s failed: %v", peer, err)
 		return
 	}
-	m.applyRecords(reply.Records)
-	if len(reply.Wants) > 0 {
-		out := &syncMessage{Type: "push"}
-		for _, mp := range reply.Wants {
-			if r, ok := m.state.get(mp); ok {
-				out.Records = append(out.Records, r)
-			}
-		}
-		if len(out.Records) > 0 {
-			if _, err := m.send(peer, out); err != nil {
-				utils.Log.Debugf("[cluster] follow-up push to %s failed: %v", peer, err)
-			}
-		}
+	for _, c := range conns {
+		c.enqueue(frame)
 	}
 }
 
-// send seals msg, POSTs it to a peer's sync endpoint, and returns the decrypted
-// reply.
-func (m *Manager) send(peer string, msg *syncMessage) (*syncMessage, error) {
-	cfg := m.cfgStore.get()
-	key, err := deriveAEADKey([]byte(cfg.Key))
+// relay forwards newly-applied records to every connection except the one they
+// arrived on — this is what lets two NAT'd nodes converge through a common
+// reachable peer. Records carry their own origin signature, so re-sealing them in
+// our envelope does not weaken authenticity.
+func (m *Manager) relay(recs []*record, except *peerConn) {
+	conns := m.conns.all()
+	if len(conns) <= 1 {
+		return
+	}
+	frame, err := m.seal(&syncMessage{Type: "push", Records: recs})
 	if err != nil {
-		return nil, err
+		return
 	}
-	body, err := sealEnvelope(key, m.id, msg, now())
-	if err != nil {
-		return nil, err
+	for _, c := range conns {
+		if c == except {
+			continue
+		}
+		c.enqueue(frame)
 	}
-	req, err := http.NewRequest(http.MethodPost, peer+syncPath, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-	resp, err := m.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, &httpError{code: resp.StatusCode, body: string(raw)}
-	}
-	_, reply, err := openEnvelope(key, raw, now(), m.replay, replayWindowSec)
-	if err != nil {
-		return nil, err
-	}
-	return reply, nil
 }
 
-// HandleSync is the HTTP handler body: it decrypts a peer's request, processes
-// it, and writes back a sealed reply. Returns the sealed reply bytes and any
-// error (caller maps error to an HTTP status).
-func (m *Manager) HandleSync(raw []byte) ([]byte, error) {
+// handleFrame authenticates and processes one inbound frame from a connection.
+// A frame that fails to open (wrong cluster key / replay / stale) drops the
+// connection — only PSK holders are admitted.
+func (m *Manager) handleFrame(c *peerConn, data []byte) {
 	cfg := m.cfgStore.get()
 	if !cfg.active() {
-		return nil, errDisabled
+		c.close()
+		return
 	}
 	key, err := deriveAEADKey([]byte(cfg.Key))
 	if err != nil {
-		return nil, err
+		c.close()
+		return
 	}
-	_, msg, err := openEnvelope(key, raw, now(), m.replay, replayWindowSec)
+	env, msg, err := openEnvelope(key, data, now(), m.replay, replayWindowSec)
 	if err != nil {
-		return nil, err
+		utils.Log.Debugf("[cluster] frame rejected from %s: %v", c.nodeID, err)
+		c.close()
+		return
 	}
-	reply := m.process(msg)
-	return sealEnvelope(key, m.id, reply, now())
+	if c.nodeID == "" && env.Sender != m.id.NodeID {
+		m.conns.bind(c, env.Sender)
+	}
+	// Absorb offered records first, then relay the ones that were new.
+	if applied := m.applyRecords(msg.Records); len(applied) > 0 {
+		m.relay(applied, c)
+	}
+	// Answer the peer's anti-entropy digests / pull wants.
+	if reply := m.buildReply(msg); reply != nil {
+		m.sendTo(c, reply)
+	}
 }
-
-type httpError struct {
-	code int
-	body string
-}
-
-func (e *httpError) Error() string { return e.body }
-
-type sentinel string
-
-func (s sentinel) Error() string { return string(s) }
-
-const errDisabled = sentinel("cluster sync disabled")
 
 // ---- digest helpers ----
 
