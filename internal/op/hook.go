@@ -110,3 +110,13 @@ func callStorageHooks(typ string, storage driver.Driver) {
 func RegisterStorageHook(hook StorageHook) {
 	storageHooks = append(storageHooks, hook)
 }
+
+// NotifyStorageTokenInvalid signals that a storage's credentials were found to be
+// invalid/expired while in use (as opposed to successfully refreshed). It fires
+// the storage hook with the "token-invalid" type so listeners — notably cluster
+// sync — can react by pulling fresh credentials from a healthy peer instead of
+// propagating the broken token. Drivers may call this when an API call fails with
+// an unrecoverable auth error.
+func NotifyStorageTokenInvalid(storage driver.Driver) {
+	go callStorageHooks("token-invalid", storage)
+}

@@ -40,6 +40,7 @@ func Init() {
 	InitIndex()
 	InitUpgradePatch()
 	InitPlugins()
+	InitClusterSync()
 }
 
 func Release() {
@@ -97,6 +98,7 @@ func Start() {
 	}
 	InitOfflineDownloadTools()
 	LoadStorages()
+	StartClusterSync()
 	InitTaskManager()
 	if !flags.Debug && !flags.Dev {
 		gin.SetMode(gin.ReleaseMode)

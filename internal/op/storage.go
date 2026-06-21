@@ -305,6 +305,11 @@ func saveDriverStorage(driver driver.Driver) error {
 	if err != nil {
 		return errors.WithMessage(err, "failed update storage in database")
 	}
+	// A driver persisting its own state is the canonical "token refreshed /
+	// rotated" moment. Fire the storage hook so listeners (e.g. cluster sync)
+	// can propagate the fresh credentials to peer nodes. Cluster sync dedups by
+	// content hash, so unchanged saves cause no churn.
+	go callStorageHooks("update", driver)
 	return nil
 }
 

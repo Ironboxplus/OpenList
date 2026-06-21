@@ -110,6 +110,10 @@ func Init(e *gin.Engine) {
 	api.GET("/plugin/manifest", handles.PluginManifest)
 	api.GET("/plugin/asset/:name", handles.PluginAsset)
 
+	// Cluster storage-sync peer endpoint. Unauthenticated at the HTTP layer —
+	// authentication and encryption come from the cluster pre-shared key.
+	api.POST("/cluster/sync", handles.ClusterSync)
+
 	_fs(auth.Group("/fs"))
 	fsAndShare(api.Group("/fs", middlewares.Auth(true)))
 	_task(auth.Group("/task", middlewares.AuthNotGuest))
@@ -149,6 +153,12 @@ func admin(g *gin.RouterGroup) {
 	plug.POST("/save", handles.PluginSave)
 	plug.POST("/delete", handles.PluginDelete)
 	plug.POST("/enable", handles.PluginSetEnabled)
+
+	// Cluster storage-sharing config/status. Admin only.
+	clusterGrp := g.Group("/cluster")
+	clusterGrp.GET("/config", handles.ClusterGetConfig)
+	clusterGrp.POST("/config", handles.ClusterSetConfig)
+	clusterGrp.GET("/status", handles.ClusterStatus)
 
 	// Admin-only user operations (create/delete/role-affecting). The profile-edit
 	// endpoints (list/get/update) live in a separate group that also accepts a
