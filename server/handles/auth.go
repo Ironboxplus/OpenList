@@ -8,6 +8,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/plugin"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
 	"github.com/pquerna/otp/totp"
@@ -79,6 +80,7 @@ func loginHash(c *gin.Context, req *LoginReq) {
 	}
 	common.SuccessResp(c, gin.H{"token": token})
 	model.LoginCache.Del(ip)
+	plugin.FireHook(plugin.HookUserLoginAfter, map[string]any{"username": user.Username})
 }
 
 type UserResp struct {

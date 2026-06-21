@@ -16,6 +16,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/frontend"
+	"github.com/OpenListTeam/OpenList/v4/internal/plugin"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server"
 	"github.com/OpenListTeam/OpenList/v4/server/middlewares"
@@ -38,9 +39,13 @@ func Init() {
 	InitStreamLimit()
 	InitIndex()
 	InitUpgradePatch()
+	InitPlugins()
 }
 
 func Release() {
+	if plugin.Default != nil {
+		_ = plugin.Default.Close()
+	}
 	db.Close()
 }
 

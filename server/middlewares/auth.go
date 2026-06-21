@@ -148,3 +148,15 @@ func AuthAdmin(c *gin.Context) {
 		c.Next()
 	}
 }
+
+// AuthUserInfoManage allows admins, or non-admins to whom an admin has delegated
+// the "manage user info" permission, to access user-profile management endpoints.
+func AuthUserInfoManage(c *gin.Context) {
+	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+	if !user.CanManageUserInfo() {
+		common.ErrorStrResp(c, "You are not allowed to manage users", 403)
+		c.Abort()
+	} else {
+		c.Next()
+	}
+}

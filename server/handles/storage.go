@@ -90,6 +90,12 @@ func ListStorages(c *gin.Context) {
 	})
 }
 
+// StorageLoadingStatus reports the per-storage startup load progress so the
+// frontend can render an async loading status bar.
+func StorageLoadingStatus(c *gin.Context) {
+	common.SuccessResp(c, op.StorageLoadProgress.Snapshot())
+}
+
 func CreateStorage(c *gin.Context) {
 	var req model.Storage
 	if err := c.ShouldBind(&req); err != nil {

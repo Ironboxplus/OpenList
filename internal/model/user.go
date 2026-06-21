@@ -64,6 +64,7 @@ type User struct {
 	//   13: can decompress archives
 	//   14: can share
 	//   15: can customize share id
+	//   16: can manage other users' profiles (delegated by admin: edit username/password only)
 	Permission int32  `json:"permission"`
 	OtpSecret  string `json:"-"`
 	SsoID      string `json:"sso_id"` // unique by sso platform
@@ -226,6 +227,17 @@ func CanCustomizeShareID(permission int32) bool {
 
 func (u *User) CanCustomizeShareID() bool {
 	return CanCustomizeShareID(u.Permission)
+}
+
+func CanManageUserInfo(permission int32) bool {
+	return (permission>>16)&1 == 1
+}
+
+// CanManageUserInfo reports whether this user may edit other users' profiles
+// (username/password). Admins always can; non-admins only when delegated this
+// permission bit by an admin.
+func (u *User) CanManageUserInfo() bool {
+	return u.IsAdmin() || CanManageUserInfo(u.Permission)
 }
 
 func (u *User) JoinPath(reqPath string) (string, error) {

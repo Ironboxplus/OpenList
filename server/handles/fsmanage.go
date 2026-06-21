@@ -10,6 +10,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/plugin"
 	"github.com/OpenListTeam/OpenList/v4/internal/sign"
 	"github.com/OpenListTeam/OpenList/v4/internal/task"
 	"github.com/OpenListTeam/OpenList/v4/pkg/generic"
@@ -528,4 +529,5 @@ func Link(c *gin.Context) {
 	}
 	defer link.Close()
 	common.SuccessResp(c, link)
+	plugin.FireHook(plugin.HookFsLinkAfter, map[string]any{"path": rawPath})
 }

@@ -50,7 +50,10 @@ func InitDB() {
 				if !(strings.HasSuffix(database.DBFile, ".db") && len(database.DBFile) > 3) {
 					log.Fatalf("db name error.")
 				}
-				dB, err = gorm.Open(openSQLite(fmt.Sprintf("%s?_journal=WAL&_vacuum=incremental",
+				// _busy_timeout makes concurrent writers wait for the WAL lock
+				// instead of failing with SQLITE_BUSY (e.g. parallel storage
+				// status persistence during startup).
+				dB, err = gorm.Open(openSQLite(fmt.Sprintf("%s?_journal=WAL&_vacuum=incremental&_busy_timeout=5000",
 					database.DBFile)), gormConfig)
 			}
 		case "mysql":

@@ -7,10 +7,12 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/plugin"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/internal/sign"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
@@ -55,6 +57,11 @@ type FsListResp struct {
 	WriteContentBypass bool      `json:"write_content_bypass"`
 	Provider           string    `json:"provider"`
 	DirectUploadTools  []string  `json:"direct_upload_tools,omitempty"`
+	// MountDetails is the disk usage of the storage that the *current directory*
+	// belongs to (nil at the virtual storages-root or when hidden). It lets the
+	// web header show the current mount's usage dynamically on folder navigation
+	// without firing an extra fs/get per click.
+	MountDetails *model.StorageDetails `json:"mount_details,omitempty"`
 }
 
 func FsListSplit(c *gin.Context) {
@@ -109,9 +116,18 @@ func FsList(c *gin.Context, req *ListReq, user *model.User) {
 	total, objs := pagination(objs, &req.PageReq)
 	provider := "unknown"
 	var directUploadTools []string
-	if canWriteContentAtPath {
-		if storage, err := fs.GetStorage(reqPath, &fs.GetStoragesArgs{}); err == nil {
+	var mountDetails *model.StorageDetails
+	if storage, err := fs.GetStorage(reqPath, &fs.GetStoragesArgs{}); err == nil {
+		if canWriteContentAtPath {
 			directUploadTools = op.GetDirectUploadTools(storage)
+		}
+		// Current directory's storage usage for the web header. Cache-backed +
+		// singleflight in op.GetStorageDetails, so concurrent multi-user access
+		// collapses to at most one provider call per storage per TTL — no 429.
+		if !user.IsGuest() && !setting.GetBool(conf.HideStorageDetails) {
+			if d, e := op.GetStorageDetails(c.Request.Context(), storage); e == nil {
+				mountDetails = d
+			}
 		}
 	}
 	common.SuccessResp(c, FsListResp{
@@ -123,7 +139,14 @@ func FsList(c *gin.Context, req *ListReq, user *model.User) {
 		WriteContentBypass: common.CanWriteContentBypassUserPerms(meta, reqPath),
 		Provider:           provider,
 		DirectUploadTools:  directUploadTools,
+		MountDetails:       mountDetails,
 	})
+	if plugin.HasSubscribers(plugin.HookFsListAfter) {
+		plugin.FireHook(plugin.HookFsListAfter, map[string]any{
+			"path":  reqPath,
+			"count": total,
+		})
+	}
 }
 
 func FsDirs(c *gin.Context) {
@@ -380,6 +403,63 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 		Provider: provider,
 		Related:  toObjsResp(related, parentPath, isEncrypt(parentMeta, parentPath)),
 	})
+}
+
+type FsVideoPlayReq struct {
+	Path     string `json:"path" form:"path"`
+	Password string `json:"password" form:"password"`
+}
+
+// FsVideoPlay exposes the storage provider's official online-play (transcoded
+// streaming) sources for a video at multiple resolutions, for drivers that
+// implement driver.VideoPlayer (e.g. 115_open).
+func FsVideoPlay(c *gin.Context) {
+	var req FsVideoPlayReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+	if user.IsGuest() && user.Disabled {
+		common.ErrorStrResp(c, "Guest user is disabled, login please", 401)
+		return
+	}
+	reqPath, err := user.JoinPath(req.Path)
+	if err != nil {
+		common.ErrorResp(c, err, 403)
+		return
+	}
+	meta, err := op.GetNearestMeta(reqPath)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		common.ErrorResp(c, err, 500, true)
+		return
+	}
+	common.GinAppendValues(c, conf.MetaKey, meta)
+	if !common.CanAccess(user, meta, reqPath, req.Password) {
+		common.ErrorStrResp(c, "password is incorrect or you have no permission", 403)
+		return
+	}
+	storage, err := fs.GetStorage(reqPath, &fs.GetStoragesArgs{})
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	vp, ok := storage.(driver.VideoPlayer)
+	if !ok {
+		common.ErrorStrResp(c, "driver does not support official play sources", 400)
+		return
+	}
+	obj, err := fs.Get(c.Request.Context(), reqPath, &fs.GetArgs{})
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	sources, err := vp.VideoPlay(c.Request.Context(), obj)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c, sources)
 }
 
 func filterRelated(objs []model.Obj, obj model.Obj) []model.Obj {

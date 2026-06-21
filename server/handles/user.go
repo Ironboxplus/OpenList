@@ -1,14 +1,39 @@
 package handles
 
 import (
+	"errors"
 	"strconv"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
 )
+
+// applyUserUpdatePolicy enforces who may change what during a user update.
+// Role can never change here. A non-admin editor (a user delegated the
+// "manage user info" permission) may only edit a normal user's username and
+// password; every privileged field (permission, role, base path, disabled,
+// otp) is forced back to the existing value, and admins can't be edited by them.
+func applyUserUpdatePolicy(existing, req *model.User, byAdmin bool) error {
+	if existing.Role != req.Role {
+		return errors.New("role can not be changed")
+	}
+	if byAdmin {
+		return nil
+	}
+	if existing.IsAdmin() {
+		return errors.New("you are not allowed to edit an admin user")
+	}
+	// Profile-only edit: keep all privileged fields, allow username/password.
+	username, password := req.Username, req.Password
+	*req = *existing
+	req.Username = username
+	req.Password = password
+	return nil
+}
 
 func ListUsers(c *gin.Context) {
 	var req model.PageReq
@@ -60,8 +85,10 @@ func UpdateUser(c *gin.Context) {
 		common.ErrorResp(c, err, 500)
 		return
 	}
-	if user.Role != req.Role {
-		common.ErrorStrResp(c, "role can not be changed", 400)
+	editor, _ := c.Request.Context().Value(conf.UserKey).(*model.User)
+	byAdmin := editor != nil && editor.IsAdmin()
+	if err := applyUserUpdatePolicy(user, &req, byAdmin); err != nil {
+		common.ErrorStrResp(c, err.Error(), 403)
 		return
 	}
 	if req.Password == "" {

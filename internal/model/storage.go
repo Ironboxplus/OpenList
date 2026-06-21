@@ -77,6 +77,18 @@ func (d DiskUsage) MarshalJSON() ([]byte, error) {
 
 type StorageDetails struct {
 	DiskUsage
+	// DriverName is the storage's driver/type (e.g. "Local", "BaiduNetdisk"),
+	// surfaced to the UI so it can label which storage a mount belongs to.
+	DriverName string
+}
+
+func (s StorageDetails) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"total_space": s.TotalSpace,
+		"used_space":  s.UsedSpace,
+		"free_space":  s.FreeSpace(),
+		"driver_name": s.DriverName,
+	})
 }
 
 type ObjWithStorageDetails interface {

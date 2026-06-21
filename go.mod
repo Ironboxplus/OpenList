@@ -1,8 +1,6 @@
 module github.com/OpenListTeam/OpenList/v4
 
-go 1.24.0
-
-toolchain go1.24.13
+go 1.25.0
 
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.18.1
@@ -72,6 +70,7 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/t3rm1n4l/go-mega v0.0.0-20241213151442-a19cff0ec7b5
 	github.com/tchap/go-patricia/v2 v2.3.3
+	github.com/traefik/yaegi v0.16.1
 	github.com/u2takey/ffmpeg-go v0.5.0
 	github.com/upyun/go-sdk/v3 v3.0.4
 	github.com/winfsp/cgofuse v1.6.0
@@ -295,7 +294,7 @@ require (
 	go.etcd.io/bbolt v1.4.0 // indirect
 	golang.org/x/arch v0.18.0 // indirect
 	golang.org/x/sync v0.19.0
-	golang.org/x/sys v0.40.0
+	golang.org/x/sys v0.44.0
 	golang.org/x/term v0.38.0 // indirect
 	golang.org/x/text v0.32.0
 	golang.org/x/tools v0.39.0 // indirect

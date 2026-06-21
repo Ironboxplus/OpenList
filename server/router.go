@@ -78,6 +78,9 @@ func Init(e *gin.Engine) {
 	auth.GET("/me/sshkey/list", handles.ListMyPublicKey)
 	auth.POST("/me/sshkey/add", handles.AddMyPublicKey)
 	auth.POST("/me/sshkey/delete", handles.DeleteMyPublicKey)
+	auth.GET("/me/favorites", handles.ListFavorites)
+	auth.POST("/me/favorites/add", handles.AddFavorite)
+	auth.POST("/me/favorites/delete", handles.DeleteFavorite)
 	auth.POST("/auth/2fa/generate", handles.Generate2FA)
 	auth.POST("/auth/2fa/verify", handles.Verify2FA)
 	auth.GET("/auth/logout", handles.LogOut)
@@ -102,17 +105,33 @@ func Init(e *gin.Engine) {
 	public.Any("/offline_download_tools", handles.OfflineDownloadTools)
 	public.Any("/archive_extensions", handles.ArchiveExtensions)
 
+	// Plugin system: frontend manifest + hot-loadable JS assets (public so the
+	// web UI can fetch them before auth).
+	api.GET("/plugin/manifest", handles.PluginManifest)
+	api.GET("/plugin/asset/:name", handles.PluginAsset)
+
 	_fs(auth.Group("/fs"))
 	fsAndShare(api.Group("/fs", middlewares.Auth(true)))
 	_task(auth.Group("/task", middlewares.AuthNotGuest))
 	_sharing(auth.Group("/share", middlewares.AuthNotGuest))
 	admin(auth.Group("/admin", middlewares.AuthAdmin))
+	// User-profile management: admins, or non-admins delegated the permission.
+	userManage(auth.Group("/admin/user", middlewares.AuthUserInfoManage))
 	if flags.Debug || flags.Dev {
 		debug(g.Group("/debug"))
 	}
 	static.Static(g, func(handlers ...gin.HandlerFunc) {
 		e.NoRoute(handlers...)
 	})
+}
+
+// userManage registers the user-profile endpoints that an admin may delegate to
+// a non-admin via the "manage user info" permission. The UpdateUser handler
+// itself restricts a non-admin editor to username/password only.
+func userManage(g *gin.RouterGroup) {
+	g.GET("/list", handles.ListUsers)
+	g.GET("/get", handles.GetUser)
+	g.POST("/update", handles.UpdateUser)
 }
 
 func admin(g *gin.RouterGroup) {
@@ -123,11 +142,19 @@ func admin(g *gin.RouterGroup) {
 	meta.POST("/update", handles.UpdateMeta)
 	meta.POST("/delete", handles.DeleteMeta)
 
+	// Backend (Go-source, yaegi) plugin management. Admin only.
+	plug := g.Group("/plugin")
+	plug.GET("/list", handles.PluginList)
+	plug.GET("/get", handles.PluginGet)
+	plug.POST("/save", handles.PluginSave)
+	plug.POST("/delete", handles.PluginDelete)
+	plug.POST("/enable", handles.PluginSetEnabled)
+
+	// Admin-only user operations (create/delete/role-affecting). The profile-edit
+	// endpoints (list/get/update) live in a separate group that also accepts a
+	// non-admin who has been delegated the "manage user info" permission.
 	user := g.Group("/user")
-	user.GET("/list", handles.ListUsers)
-	user.GET("/get", handles.GetUser)
 	user.POST("/create", handles.CreateUser)
-	user.POST("/update", handles.UpdateUser)
 	user.POST("/cancel_2fa", handles.Cancel2FAById)
 	user.POST("/delete", handles.DeleteUser)
 	user.POST("/del_cache", handles.DelUserCache)
@@ -136,6 +163,7 @@ func admin(g *gin.RouterGroup) {
 
 	storage := g.Group("/storage")
 	storage.GET("/list", handles.ListStorages)
+	storage.GET("/loading", handles.StorageLoadingStatus)
 	storage.GET("/get", handles.GetStorage)
 	storage.POST("/create", handles.CreateStorage)
 	storage.POST("/update", handles.UpdateStorage)
@@ -191,6 +219,7 @@ func admin(g *gin.RouterGroup) {
 func fsAndShare(g *gin.RouterGroup) {
 	g.Any("/list", handles.FsListSplit)
 	g.Any("/get", handles.FsGetSplit)
+	g.POST("/video_play", handles.FsVideoPlay)
 	a := g.Group("/archive")
 	a.Any("/meta", handles.FsArchiveMetaSplit)
 	a.Any("/list", handles.FsArchiveListSplit)

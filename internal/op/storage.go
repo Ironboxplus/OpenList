@@ -486,6 +486,9 @@ func GetStorageDetails(ctx context.Context, storage driver.Driver, refresh ...bo
 		if err != nil {
 			return nil, err
 		}
+		// Label the details with the storage's driver type so the UI can show
+		// which kind of storage the current mount is.
+		ret.DriverName = storage.Config().Name
 		Cache.SetStorageDetails(storage, ret)
 		return ret, nil
 	})
