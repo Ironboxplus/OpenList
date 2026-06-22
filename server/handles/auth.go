@@ -113,6 +113,13 @@ func UpdateCurrent(c *gin.Context) {
 		common.ErrorStrResp(c, model.GuestCannotUpdateProfile, 403)
 		return
 	}
+	// Changing the username or setting a new password requires the manage-user-info
+	// permission (admins always have it). SSO link/unlink — which posts the
+	// unchanged username with an empty password — stays open to every non-guest.
+	if (req.Username != user.Username || req.Password != "") && !user.CanManageUserInfo() {
+		common.ErrorStrResp(c, model.NoPermissionUpdateProfile, 403)
+		return
+	}
 	user.Username = req.Username
 	if req.Password != "" {
 		user.SetPassword(req.Password)

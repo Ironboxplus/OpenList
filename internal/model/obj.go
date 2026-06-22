@@ -75,6 +75,15 @@ type Thumb interface {
 	Thumb() string
 }
 
+// ObjExtra is an optional interface a driver's Obj may implement to surface
+// extra, driver-specific metadata (e.g. media duration, video resolution,
+// starred flag) without bloating the universal Obj. Keys are stable strings;
+// the frontend renders the keys it knows and ignores the rest, so adding or
+// removing keys never breaks clients. Implementations should omit empty values.
+type ObjExtra interface {
+	Extra() map[string]any
+}
+
 type SetPath interface {
 	SetPath(path string)
 }
@@ -158,6 +167,25 @@ func GetThumb(obj Obj) (thumb string, ok bool) {
 			obj = o.Unwrap()
 		default:
 			return
+		}
+	}
+}
+
+// GetExtra walks the unwrap chain and returns the driver-specific extra metadata
+// if the underlying Obj implements ObjExtra. An empty map is treated as absent.
+func GetExtra(obj Obj) (extra map[string]any, ok bool) {
+	for {
+		switch o := obj.(type) {
+		case ObjExtra:
+			e := o.Extra()
+			if len(e) == 0 {
+				return nil, false
+			}
+			return e, true
+		case ObjUnwrap:
+			obj = o.Unwrap()
+		default:
+			return nil, false
 		}
 	}
 }

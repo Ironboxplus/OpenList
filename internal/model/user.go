@@ -28,6 +28,7 @@ const (
 	TooManyAttempts           = "Too many unsuccessful sign-in attempts have been made using an incorrect username or password, Try again later."
 	GuestCannotUpdateProfile  = "Guest user can not update profile"
 	GuestCannotGenerate2FA    = "Guest user can not generate 2FA code"
+	NoPermissionUpdateProfile = "You are not allowed to modify your username or password"
 )
 
 var LoginCache = cache.NewMemCache[int]()

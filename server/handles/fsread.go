@@ -46,6 +46,9 @@ type ObjResp struct {
 	HashInfoStr  string                     `json:"hashinfo"`
 	HashInfo     map[*utils.HashType]string `json:"hash_info"`
 	MountDetails *model.StorageDetails      `json:"mount_details,omitempty"`
+	// Extra carries optional driver-specific metadata (e.g. media duration,
+	// video resolution, starred). Clients render known keys and ignore the rest.
+	Extra map[string]any `json:"extra,omitempty"`
 }
 
 type FsListResp struct {
@@ -253,6 +256,7 @@ func toObjsResp(objs []model.Obj, parent string, encrypt bool) []ObjResp {
 	for _, obj := range objs {
 		thumb, _ := model.GetThumb(obj)
 		mountDetails, _ := model.GetStorageDetails(obj)
+		extra, _ := model.GetExtra(obj)
 		hashInfo := obj.GetHash().Export()
 		if hashInfo == nil {
 			hashInfo = make(map[*utils.HashType]string)
@@ -269,6 +273,7 @@ func toObjsResp(objs []model.Obj, parent string, encrypt bool) []ObjResp {
 			Thumb:        thumb,
 			Type:         utils.GetObjType(obj.GetName(), obj.IsDir()),
 			MountDetails: mountDetails,
+			Extra:        extra,
 		})
 	}
 	return resp
@@ -383,6 +388,7 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 	parentMeta, _ := op.GetNearestMeta(parentPath)
 	thumb, _ := model.GetThumb(obj)
 	mountDetails, _ := model.GetStorageDetails(obj)
+	extra, _ := model.GetExtra(obj)
 	common.SuccessResp(c, FsGetResp{
 		ObjResp: ObjResp{
 			Name:         obj.GetName(),
@@ -396,6 +402,7 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 			Type:         utils.GetFileType(obj.GetName()),
 			Thumb:        thumb,
 			MountDetails: mountDetails,
+			Extra:        extra,
 		},
 		RawURL:   rawURL,
 		Readme:   getReadme(meta, reqPath),
