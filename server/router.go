@@ -163,6 +163,7 @@ func admin(g *gin.RouterGroup) {
 	// Cluster storage-sharing config/status. Admin only.
 	clusterGrp := g.Group("/cluster")
 	clusterGrp.GET("/config", handles.ClusterGetConfig)
+	clusterGrp.GET("/key", handles.ClusterRevealKey)
 	clusterGrp.POST("/config", handles.ClusterSetConfig)
 	clusterGrp.GET("/status", handles.ClusterStatus)
 	clusterGrp.POST("/groups", handles.ClusterSetGroups)

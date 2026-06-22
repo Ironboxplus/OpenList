@@ -46,6 +46,18 @@ func ClusterGetConfig(c *gin.Context) {
 	})
 }
 
+// ClusterRevealKey returns the cluster pre-shared key in PLAINTEXT for the admin
+// UI's "show key" toggle. ClusterGetConfig redacts the key (it is polled live),
+// so this dedicated endpoint serves the real value only on explicit request. It
+// lives in the admin-only cluster group, same as the other config routes.
+func ClusterRevealKey(c *gin.Context) {
+	m := clusterMgr(c)
+	if m == nil {
+		return
+	}
+	common.SuccessResp(c, gin.H{"key": m.GetConfig(false).Key})
+}
+
 // ClusterSetConfig persists a new cluster config. A blank or "********" key keeps
 // the existing key. Admin only.
 func ClusterSetConfig(c *gin.Context) {
