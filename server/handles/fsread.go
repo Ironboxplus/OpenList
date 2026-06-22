@@ -459,6 +459,15 @@ func FsVideoPlay(c *gin.Context) {
 		common.ErrorResp(c, err, 500)
 		return
 	}
+	// Route every transcoded source through OpenList's signed video proxy so the
+	// browser fetches them same-origin instead of hitting the provider CDN
+	// directly (which fails CORS for 115's online-play HLS).
+	apiURL := common.GetApiUrl(c)
+	for i := range sources {
+		if sources[i].URL != "" {
+			sources[i].URL = BuildVideoProxyURL(apiURL, sources[i].URL)
+		}
+	}
 	common.SuccessResp(c, sources)
 }
 

@@ -49,6 +49,11 @@ func Init(e *gin.Engine) {
 	g.GET("/p/*path", middlewares.PathParse, signCheck, downloadLimiter, handles.Proxy)
 	g.HEAD("/d/*path", middlewares.PathParse, signCheck, handles.Down)
 	g.HEAD("/p/*path", middlewares.PathParse, signCheck, handles.Proxy)
+	// /video_proxy streams a signed upstream media URL (query-param sign verified
+	// in-handler) so the browser never fetches a provider's transcoded CDN
+	// directly, e.g. 115 online-play HLS (avoids CORS). Sibling of /p.
+	g.GET("/video_proxy", downloadLimiter, handles.VideoProxy)
+	g.HEAD("/video_proxy", handles.VideoProxy)
 	archiveSignCheck := middlewares.Down(sign.VerifyArchive)
 	g.GET("/ad/*path", middlewares.PathParse, archiveSignCheck, downloadLimiter, handles.ArchiveDown)
 	g.GET("/ap/*path", middlewares.PathParse, archiveSignCheck, downloadLimiter, handles.ArchiveProxy)
