@@ -120,3 +120,12 @@ func RegisterStorageHook(hook StorageHook) {
 func NotifyStorageTokenInvalid(storage driver.Driver) {
 	go callStorageHooks("token-invalid", storage)
 }
+
+// NotifyStorageTokenValid signals that a storage's credentials were just proven
+// good by a successful authenticated request. It fires the storage hook with the
+// "token-valid" type so listeners — notably cluster sync — can (re)share the
+// proven token with peers. Drivers should call this only on a real transition
+// from invalid→valid to avoid per-request churn.
+func NotifyStorageTokenValid(storage driver.Driver) {
+	go callStorageHooks("token-valid", storage)
+}

@@ -182,6 +182,73 @@ func TestCredRecordVerifyRejectsForgery(t *testing.T) {
 	}
 }
 
+// dropOwnCred must remove only our own-authored record so a dead/stale local
+// token can never out-rank (by Lamport version) a peer's genuinely-valid one and
+// block recovery. A peer-authored record must survive.
+func TestDropOwnCred(t *testing.T) {
+	id1, _ := newIdentity() // self
+	id2, _ := newIdentity() // peer
+	s := newStore()
+
+	// nothing recorded yet -> nothing to drop.
+	if s.dropOwnCred("g1", id1.NodeID) {
+		t.Fatal("dropping a non-existent record must return false")
+	}
+
+	// our own credential -> dropped, store no longer holds it.
+	payloadA := map[string]json.RawMessage{"refresh_token": json.RawMessage(`"A"`)}
+	if _, ok := s.localCredChange(id1, "g1", "115", "/115", payloadA, 1); !ok {
+		t.Fatal("own credential should be recorded")
+	}
+	if !s.dropOwnCred("g1", id1.NodeID) {
+		t.Fatal("own credential should be dropped")
+	}
+	if _, ok := s.getCred("g1"); ok {
+		t.Fatal("store must not retain a dropped own credential")
+	}
+
+	// a peer's credential must NOT be dropped by us.
+	payloadB := map[string]json.RawMessage{"refresh_token": json.RawMessage(`"B"`)}
+	r := &credRecord{GroupID: "g2", OriginDriver: "115", Fields: []string{"refresh_token"}, Payload: payloadB, Version: 5, Origin: id2.NodeID, OriginPub: id2.Pub, CredHash: credHash(payloadB)}
+	r.Sig = id2.sign(r.signingBytes())
+	if !s.mergeCred(r) {
+		t.Fatal("peer credential should merge")
+	}
+	if s.dropOwnCred("g2", id1.NodeID) {
+		t.Fatal("a peer-authored credential must never be dropped as own")
+	}
+	if _, ok := s.getCred("g2"); !ok {
+		t.Fatal("peer credential must survive dropOwnCred")
+	}
+}
+
+// canOfferCred enforces "only share a token proven valid": a peer's record is
+// always relayable, but our OWN record is offered only while our token for that
+// group is healthy. With no matching group/healthy mount, ownTokenHealthy is
+// false so our own record must not be advertised (no poisoning peers with a
+// stale/boot token).
+func TestCanOfferCred(t *testing.T) {
+	id1, _ := newIdentity() // self
+	id2, _ := newIdentity() // peer
+	m := &Manager{id: id1, state: newStore()}
+
+	if m.canOfferCred(nil) {
+		t.Fatal("a nil record is never offerable")
+	}
+
+	// peer-authored record -> always offerable (relay).
+	peer := &credRecord{GroupID: "g1", Origin: id2.NodeID}
+	if !m.canOfferCred(peer) {
+		t.Fatal("a peer-authored record must always be offerable")
+	}
+
+	// our own record, but no group/healthy mount -> not offerable.
+	own := &credRecord{GroupID: "g1", Origin: id1.NodeID}
+	if m.canOfferCred(own) {
+		t.Fatal("our own record must NOT be offered when the token is not proven healthy")
+	}
+}
+
 // ---- inventory ----
 
 func TestInventoryMergeAndDialTargets(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	sdk "github.com/OpenListTeam/115-sdk-go"
@@ -31,6 +32,11 @@ type Open115 struct {
 	client     *sdk.Client
 	limiter    *rate.Limiter
 	parentPath string
+	// tokenInvalid is the edge-trigger latch for the cluster validity protocol:
+	// set once the refresh_token is found dead, cleared once a request succeeds
+	// again. It debounces the token-valid/invalid notifications down to real
+	// transitions instead of firing them on every request.
+	tokenInvalid atomic.Bool
 }
 
 var (
@@ -54,6 +60,19 @@ func (d *Open115) Init(ctx context.Context) error {
 			d.Addition.AccessToken = s1
 			d.Addition.RefreshToken = s2
 			op.MustSaveDriverStorage(d)
+		}),
+		// Cluster token-validity protocol: a node only shares a token it has
+		// proven valid, and pulls a fresh one from a healthy peer when its own
+		// dies. Edge-triggered so the cluster only reacts to real transitions.
+		sdk.WithOnTokenValid(func() {
+			if d.tokenInvalid.CompareAndSwap(true, false) {
+				op.NotifyStorageTokenValid(d)
+			}
+		}),
+		sdk.WithOnTokenInvalid(func() {
+			if d.tokenInvalid.CompareAndSwap(false, true) {
+				op.NotifyStorageTokenInvalid(d)
+			}
 		}))
 	if flags.Debug || flags.Dev {
 		d.client.SetDebug(true)

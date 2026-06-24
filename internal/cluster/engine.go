@@ -293,7 +293,7 @@ func (m *Manager) helloMessage() *syncMessage {
 		Nodes:       m.knownNodesForPEX(),
 		Groups:      &gd,
 		GroupsVer:   gd.Version,
-		CredDigests: m.state.credDigests(),
+		CredDigests: m.offerableDigests(),
 	}
 }
 
@@ -307,7 +307,7 @@ func (m *Manager) announceMessage() *syncMessage {
 		Nodes:       m.knownNodesForPEX(),
 		Groups:      &gd,
 		GroupsVer:   gd.Version,
-		CredDigests: m.state.credDigests(),
+		CredDigests: m.offerableDigests(),
 	}
 }
 
@@ -348,7 +348,12 @@ func (m *Manager) seedLocalCreds() {
 			continue
 		}
 		if st.Status != op.WORK {
+			// Unhealthy mount (e.g. token dead at boot): drop our own stale cred so
+			// it can't dominate a peer's valid one, then pull a fresh credential.
 			for _, g := range groups {
+				if m.state.dropOwnCred(g.ID, m.id.NodeID) {
+					changed = true
+				}
 				m.pullGroup(g.ID)
 			}
 			continue
@@ -396,7 +401,9 @@ func (m *Manager) onStorageHook(typ string, d driver.Driver) {
 		return
 	}
 	switch typ {
-	case "add", "update":
+	case "add", "update", "token-valid":
+		// "token-valid" is fired when an authenticated request just proved the
+		// token good — (re)share it so peers converge on the working credential.
 		if st.Status != op.WORK {
 			// Health gating: never propagate a broken/expired token. Try to recover
 			// a good one from peers instead.
@@ -421,8 +428,20 @@ func (m *Manager) onStorageHook(typ string, d driver.Driver) {
 		// A mount was removed locally. We keep the group's credential record (other
 		// members still rely on it); only our inventory changes (handled above).
 	case "token-invalid":
+		// Our token died. Drop our own (now-stale) credential record so its Lamport
+		// version can't out-rank a peer's valid one, then pull a fresh credential
+		// from a healthy peer.
+		var dropped bool
 		for _, g := range groups {
+			if m.state.dropOwnCred(g.ID, m.id.NodeID) {
+				dropped = true
+				m.recordEvent("invalidate", g.ID,
+					fmt.Sprintf("%s token invalid — dropped local cred, pulling from peers", st.MountPath))
+			}
 			m.pullGroup(g.ID)
+		}
+		if dropped {
+			m.persist()
 		}
 	}
 }
@@ -433,6 +452,52 @@ func (m *Manager) pullGroup(groupID string) {
 		return
 	}
 	m.broadcast(&syncMessage{Type: "pull", Wants: []string{groupID}})
+}
+
+// ownTokenHealthy reports whether THIS node currently holds a working token for a
+// group — at least one of our member mounts is in the WORK state (its last auth
+// attempt succeeded). It is the "token proven valid" gate.
+func (m *Manager) ownTokenHealthy(groupID string) bool {
+	g, ok := m.state.groupByID(groupID)
+	if !ok {
+		return false
+	}
+	for _, mp := range g.mountsForNode(m.id.NodeID) {
+		d, err := op.GetStorageByMountPath(mp)
+		if err != nil {
+			continue
+		}
+		if d.GetStorage().Status == op.WORK {
+			return true
+		}
+	}
+	return false
+}
+
+// canOfferCred reports whether this node may advertise/relay a credential record
+// in anti-entropy. Records authored by peers are always relayable. Our OWN record
+// is offered only while our token for that group is healthy — so a node booting
+// with a stale persisted token (or whose token just died) never poisons peers
+// with it: "only share a token proven valid".
+func (m *Manager) canOfferCred(r *credRecord) bool {
+	if r == nil {
+		return false
+	}
+	if r.Origin != m.id.NodeID {
+		return true
+	}
+	return m.ownTokenHealthy(r.GroupID)
+}
+
+// offerableDigests is credDigests() filtered to records this node may advertise.
+func (m *Manager) offerableDigests() []credDigest {
+	var out []credDigest
+	for _, r := range m.state.credSnapshot() {
+		if m.canOfferCred(r) {
+			out = append(out, digestOfCred(r))
+		}
+	}
+	return out
 }
 
 // applyCredRecord overlays a group's credential onto this node's member mounts.
@@ -545,21 +610,29 @@ func (m *Manager) buildReply(in *syncMessage) *syncMessage {
 		mine := digestOfCred(cur)
 		switch {
 		case credDigestDominates(mine, dg):
-			reply.Creds = append(reply.Creds, cur)
+			// Offer ours only if we may (own cred must be healthy). If we can't
+			// offer it (our token is stale/dead), pull theirs instead — this is
+			// what lets a node with a higher-versioned but DEAD credential still
+			// recover from a peer's lower-versioned but VALID one.
+			if m.canOfferCred(cur) {
+				reply.Creds = append(reply.Creds, cur)
+			} else {
+				reply.Wants = append(reply.Wants, dg.GroupID)
+			}
 		case credDigestDominates(dg, mine):
 			reply.Wants = append(reply.Wants, dg.GroupID)
 		}
 	}
 	// Records we hold the peer never mentioned.
 	for _, cur := range m.state.credSnapshot() {
-		if _, seen := peerHas[cur.GroupID]; !seen {
+		if _, seen := peerHas[cur.GroupID]; !seen && m.canOfferCred(cur) {
 			reply.Creds = append(reply.Creds, cur)
 		}
 	}
 
 	// Explicit pull wants.
 	for _, gid := range in.Wants {
-		if cur, ok := m.state.getCred(gid); ok {
+		if cur, ok := m.state.getCred(gid); ok && m.canOfferCred(cur) {
 			reply.Creds = append(reply.Creds, cur)
 		}
 	}

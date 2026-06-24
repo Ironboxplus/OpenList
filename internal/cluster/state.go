@@ -382,6 +382,21 @@ func (s *store) mergeCred(r *credRecord) bool {
 	return true
 }
 
+// dropOwnCred removes our own-authored credential record for a group. It is used
+// when the local token is found invalid: a dead/stale credential must not linger
+// as a dominating record (its Lamport version could otherwise out-rank a peer's
+// genuinely-valid credential and block recovery). Returns true if a record was
+// removed. Peer-authored records are never touched here.
+func (s *store) dropOwnCred(groupID, selfID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if r, ok := s.creds[groupID]; ok && r.Origin == selfID {
+		delete(s.creds, groupID)
+		return true
+	}
+	return false
+}
+
 // pruneCreds drops credential records for groups that no longer exist.
 func (s *store) pruneCreds() {
 	s.mu.Lock()
