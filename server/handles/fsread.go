@@ -478,6 +478,68 @@ func FsVideoPlay(c *gin.Context) {
 	common.SuccessResp(c, sources)
 }
 
+// FsVideoSubtitle exposes the provider's subtitle tracks for a video, for
+// drivers that implement driver.VideoSubtitleProvider (e.g. 115_open). These
+// subtitles are independent of the play source, so the frontend can render them
+// on every quality tier — including transcoded HLS streams that drop the
+// original container's embedded subtitle tracks.
+func FsVideoSubtitle(c *gin.Context) {
+	var req FsVideoPlayReq
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+	if user.IsGuest() && user.Disabled {
+		common.ErrorStrResp(c, "Guest user is disabled, login please", 401)
+		return
+	}
+	reqPath, err := user.JoinPath(req.Path)
+	if err != nil {
+		common.ErrorResp(c, err, 403)
+		return
+	}
+	meta, err := op.GetNearestMeta(reqPath)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		common.ErrorResp(c, err, 500, true)
+		return
+	}
+	common.GinAppendValues(c, conf.MetaKey, meta)
+	if !common.CanAccess(user, meta, reqPath, req.Password) {
+		common.ErrorStrResp(c, "password is incorrect or you have no permission", 403)
+		return
+	}
+	storage, err := fs.GetStorage(reqPath, &fs.GetStoragesArgs{})
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	vsp, ok := storage.(driver.VideoSubtitleProvider)
+	if !ok {
+		common.ErrorStrResp(c, "driver does not support subtitle tracks", 400)
+		return
+	}
+	obj, err := fs.Get(c.Request.Context(), reqPath, &fs.GetArgs{})
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	subs, err := vsp.VideoSubtitle(c.Request.Context(), obj)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	// Route subtitle files through the signed video proxy so the browser fetches
+	// them same-origin (provider CDNs reject cross-origin subtitle fetches).
+	apiURL := common.GetApiUrl(c)
+	for i := range subs {
+		if subs[i].URL != "" {
+			subs[i].URL = BuildVideoProxyURL(apiURL, subs[i].URL)
+		}
+	}
+	common.SuccessResp(c, subs)
+}
+
 func filterRelated(objs []model.Obj, obj model.Obj) []model.Obj {
 	var related []model.Obj
 	nameWithoutExt := strings.TrimSuffix(obj.GetName(), stdpath.Ext(obj.GetName()))

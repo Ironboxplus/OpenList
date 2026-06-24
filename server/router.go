@@ -238,6 +238,7 @@ func fsAndShare(g *gin.RouterGroup) {
 	g.Any("/list", handles.FsListSplit)
 	g.Any("/get", handles.FsGetSplit)
 	g.POST("/video_play", handles.FsVideoPlay)
+	g.POST("/video_subtitle", handles.FsVideoSubtitle)
 	a := g.Group("/archive")
 	a.Any("/meta", handles.FsArchiveMetaSplit)
 	a.Any("/list", handles.FsArchiveListSplit)
