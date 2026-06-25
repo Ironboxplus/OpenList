@@ -70,6 +70,28 @@ func Proxy(w http.ResponseWriter, r *http.Request, link *model.Link, file model.
 	})
 	return err
 }
+// ApplyProxyUserAgent overrides the User-Agent on the client request header used to
+// resolve and proxy a download when the storage configured a custom one. It mutates
+// the (request-scoped) request header BEFORE the link is resolved — deliberately not
+// the cached *model.Link — so it:
+//   - feeds drivers that sign the download URL with the request UA (e.g. 115 calls
+//     DownURL with args.Header's User-Agent), and is keyed correctly by drivers whose
+//     LinkCacheMode includes the UA;
+//   - covers transparent-proxy drivers too, since ProcessHeader copies the request
+//     header (the override) when link.Header carries no User-Agent;
+//   - never races on or pollutes the shared link cache (the previous approach mutated
+//     link.Header after caching, leaking the UA across concurrent/later downloads).
+//
+// Empty config keeps the default behavior (passthrough the client's User-Agent). A
+// driver that pins a fixed UA of its own still wins, which is intended — that UA is
+// usually required for the link to resolve.
+func ApplyProxyUserAgent(r *http.Request, storage *model.Storage) {
+	if r == nil || storage == nil || storage.ProxyUserAgent == "" {
+		return
+	}
+	r.Header.Set("User-Agent", storage.ProxyUserAgent)
+}
+
 func attachHeader(w http.ResponseWriter, file model.Obj, link *model.Link) {
 	fileName := file.GetName()
 	w.Header().Set("Content-Disposition", utils.GenerateContentDisposition(fileName))

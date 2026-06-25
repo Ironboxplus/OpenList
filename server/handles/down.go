@@ -58,6 +58,10 @@ func Proxy(c *gin.Context) {
 				return
 			}
 		}
+		// Override the upstream User-Agent before resolving the link so drivers that
+		// sign the download URL with it (e.g. 115) get the configured UA, not the
+		// passthrough client UA. No-op when proxy_user_agent is unset.
+		common.ApplyProxyUserAgent(c.Request, storage.GetStorage())
 		link, file, err := fs.Link(c.Request.Context(), rawPath, model.LinkArgs{
 			Header: c.Request.Header,
 			Type:   c.Query("type"),

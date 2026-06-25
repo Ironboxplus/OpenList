@@ -36,6 +36,9 @@ type Proxy struct {
 	DownProxyURL string `json:"down_proxy_url"`
 	// Disable sign for DownProxyURL
 	DisableProxySign bool `json:"disable_proxy_sign"`
+	// Custom User-Agent for proxy-download upstream requests.
+	// Empty = passthrough the client's User-Agent (default behavior).
+	ProxyUserAgent string `json:"proxy_user_agent"`
 }
 
 func (s *Storage) GetStorage() *Storage {
