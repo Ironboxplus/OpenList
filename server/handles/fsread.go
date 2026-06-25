@@ -514,30 +514,96 @@ func FsVideoSubtitle(c *gin.Context) {
 		common.ErrorResp(c, err, 500)
 		return
 	}
-	vsp, ok := storage.(driver.VideoSubtitleProvider)
-	if !ok {
-		common.ErrorStrResp(c, "driver does not support subtitle tracks", 400)
-		return
-	}
 	obj, err := fs.Get(c.Request.Context(), reqPath, &fs.GetArgs{})
 	if err != nil {
 		common.ErrorResp(c, err, 500)
 		return
 	}
-	subs, err := vsp.VideoSubtitle(c.Request.Context(), obj)
-	if err != nil {
-		common.ErrorResp(c, err, 500)
-		return
-	}
-	// Route subtitle files through the signed video proxy so the browser fetches
-	// them same-origin (provider CDNs reject cross-origin subtitle fetches).
-	apiURL := common.GetApiUrl(c)
-	for i := range subs {
-		if subs[i].URL != "" {
-			subs[i].URL = BuildVideoProxyURL(apiURL, subs[i].URL)
+	// Same-name sidecar subtitle files (any driver): list the folder once and
+	// match basename siblings carrying a subtitle extension. This is the unified
+	// subtitle source so the frontend doesn't have to compute it from `related`.
+	subs := resolveSidecarSubtitles(c, reqPath, obj)
+	// Provider subtitle tracks (e.g. 115 extracts a container's embedded subs
+	// during transcoding) — appended when the driver supports them. Best-effort:
+	// a provider error still returns the sidecar subs we already resolved.
+	if vsp, ok := storage.(driver.VideoSubtitleProvider); ok {
+		if providerSubs, perr := vsp.VideoSubtitle(c.Request.Context(), obj); perr == nil {
+			// Route provider subtitle files through the signed video proxy so the
+			// browser fetches them same-origin (provider CDNs reject cross-origin
+			// subtitle fetches).
+			apiURL := common.GetApiUrl(c)
+			for i := range providerSubs {
+				if providerSubs[i].URL != "" {
+					providerSubs[i].URL = BuildVideoProxyURL(apiURL, providerSubs[i].URL)
+				}
+			}
+			subs = append(subs, providerSubs...)
 		}
 	}
 	common.SuccessResp(c, subs)
+}
+
+// subtitleExts are the sidecar subtitle file types matched as same-name siblings
+// of a video. Matching is case-insensitive.
+var subtitleExts = map[string]bool{
+	"srt": true, "vtt": true, "ass": true, "ssa": true, "sup": true,
+}
+
+// matchSidecarSubtitle reports whether sibling is a same-name sidecar subtitle of
+// the video (basename.<...>.<ext> with ext ∈ subtitleExts), returning the
+// lowercased subtitle extension. It requires a '.' right after the video's
+// basename so "Movie2.srt" doesn't match video "Movie.mkv", and ignores the file
+// that is the video itself.
+func matchSidecarSubtitle(videoName, siblingName string) (string, bool) {
+	if strings.EqualFold(videoName, siblingName) {
+		return "", false
+	}
+	ext := strings.TrimPrefix(strings.ToLower(stdpath.Ext(siblingName)), ".")
+	if !subtitleExts[ext] {
+		return "", false
+	}
+	base := strings.ToLower(strings.TrimSuffix(videoName, stdpath.Ext(videoName)))
+	sib := strings.ToLower(siblingName)
+	if !strings.HasPrefix(sib, base) || !strings.HasPrefix(sib[len(base):], ".") {
+		return "", false
+	}
+	return ext, true
+}
+
+// resolveSidecarSubtitles lists the video's parent folder and returns the
+// same-name sidecar subtitle files (multi-type / multi-language) as
+// VideoSubtitleInfo with signed same-origin /p proxy URLs (mirroring the
+// frontend proxyLink + FsGet rawURL construction).
+func resolveSidecarSubtitles(c *gin.Context, reqPath string, video model.Obj) []driver.VideoSubtitleInfo {
+	parentPath := stdpath.Dir(reqPath)
+	siblings, err := fs.List(c.Request.Context(), parentPath, &fs.ListArgs{})
+	if err != nil {
+		return nil
+	}
+	parentMeta, _ := op.GetNearestMeta(parentPath)
+	encrypt := isEncrypt(parentMeta, parentPath)
+	apiURL := common.GetApiUrl(c)
+	var subs []driver.VideoSubtitleInfo
+	for _, o := range siblings {
+		if o.IsDir() {
+			continue
+		}
+		ext, ok := matchSidecarSubtitle(video.GetName(), o.GetName())
+		if !ok {
+			continue
+		}
+		query := ""
+		if s := common.Sign(o, parentPath, encrypt); s != "" {
+			query = "?sign=" + s
+		}
+		siblingPath := stdpath.Join(parentPath, o.GetName())
+		subs = append(subs, driver.VideoSubtitleInfo{
+			Title: strings.TrimSuffix(o.GetName(), stdpath.Ext(o.GetName())),
+			Type:  ext,
+			URL:   fmt.Sprintf("%s/p%s%s", apiURL, utils.EncodePath(siblingPath, true), query),
+		})
+	}
+	return subs
 }
 
 func filterRelated(objs []model.Obj, obj model.Obj) []model.Obj {

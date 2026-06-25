@@ -172,6 +172,37 @@ func TestGetHeader(t *testing.T) {
 	}
 }
 
+func TestMatchSidecarSubtitle(t *testing.T) {
+	tests := []struct {
+		name    string
+		video   string
+		sibling string
+		wantExt string
+		wantOK  bool
+	}{
+		{"plain srt", "Movie.mkv", "Movie.srt", "srt", true},
+		{"lang-tagged ass", "Movie.mkv", "Movie.zh.ass", "ass", true},
+		{"multi-tag vtt", "Show.S01E01.mkv", "Show.S01E01.eng.forced.vtt", "vtt", true},
+		{"sup pgs", "Movie.mkv", "Movie.sup", "sup", true},
+		{"ssa", "Movie.mkv", "Movie.SSA", "ssa", true},
+		{"case-insensitive both", "MOVIE.MKV", "movie.SRT", "srt", true},
+		{"prefix collision excluded", "Movie.mkv", "Movie2.srt", "", false},
+		{"different basename", "Movie.mkv", "Other.srt", "", false},
+		{"non-subtitle ext", "Movie.mkv", "Movie-poster.jpg", "", false},
+		{"video itself", "Movie.mkv", "Movie.mkv", "", false},
+		{"basename substring not boundary", "Movie.mkv", "Moviegoers.srt", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotExt, gotOK := matchSidecarSubtitle(tt.video, tt.sibling)
+			if gotExt != tt.wantExt || gotOK != tt.wantOK {
+				t.Errorf("matchSidecarSubtitle(%q, %q) = (%q, %v), want (%q, %v)",
+					tt.video, tt.sibling, gotExt, gotOK, tt.wantExt, tt.wantOK)
+			}
+		})
+	}
+}
+
 func TestIsEncrypt(t *testing.T) {
 	tests := []struct {
 		name   string
