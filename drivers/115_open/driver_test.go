@@ -171,6 +171,30 @@ func TestOpen115DriverInfoIncludesRemoveWay(t *testing.T) {
 	t.Fatalf("remove_way item not found in 115 Open driver info")
 }
 
+func TestOpen115ShouldNotifyTokenValidForInvalidTransitionOrStaleStatus(t *testing.T) {
+	driver := &Open115{}
+	driver.Storage.Status = "old init error"
+	if !driver.shouldNotifyTokenValid() {
+		t.Fatalf("expected stale storage status to trigger token-valid notification")
+	}
+	if driver.tokenInvalid.Load() {
+		t.Fatalf("stale-status notification should not mark tokenInvalid")
+	}
+
+	driver.Storage.Status = op.WORK
+	if driver.shouldNotifyTokenValid() {
+		t.Fatalf("expected healthy storage with no invalid transition to skip notification")
+	}
+
+	driver.tokenInvalid.Store(true)
+	if !driver.shouldNotifyTokenValid() {
+		t.Fatalf("expected invalid-to-valid transition to trigger token-valid notification")
+	}
+	if driver.tokenInvalid.Load() {
+		t.Fatalf("expected tokenInvalid latch to be cleared")
+	}
+}
+
 func newTestOpen115(t *testing.T, removeWay string, responder http.HandlerFunc) (*Open115, func() []recordedRequest) {
 	t.Helper()
 

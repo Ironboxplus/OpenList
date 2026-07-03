@@ -65,7 +65,7 @@ func (d *Open115) Init(ctx context.Context) error {
 		// proven valid, and pulls a fresh one from a healthy peer when its own
 		// dies. Edge-triggered so the cluster only reacts to real transitions.
 		sdk.WithOnTokenValid(func() {
-			if d.tokenInvalid.CompareAndSwap(true, false) {
+			if d.shouldNotifyTokenValid() {
 				op.NotifyStorageTokenValid(d)
 			}
 		}),
@@ -113,6 +113,13 @@ func (d *Open115) Init(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+func (d *Open115) shouldNotifyTokenValid() bool {
+	if d.tokenInvalid.CompareAndSwap(true, false) {
+		return true
+	}
+	return d.GetStorage().Status != op.WORK
 }
 
 func (d *Open115) WaitLimit(ctx context.Context) error {

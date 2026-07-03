@@ -22,6 +22,11 @@ func UpdateStorage(storage *model.Storage) error {
 	return errors.WithStack(db.Save(storage).Error)
 }
 
+// UpdateStorageStatus just updates storage status in database.
+func UpdateStorageStatus(id uint, status string) error {
+	return errors.WithStack(db.Model(&model.Storage{}).Where("id = ?", id).Update("status", status).Error)
+}
+
 // DeleteStorageById just delete storage from database by id
 func DeleteStorageById(id uint) error {
 	return errors.WithStack(db.Delete(&model.Storage{}, id).Error)

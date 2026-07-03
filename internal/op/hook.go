@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
@@ -122,10 +123,25 @@ func NotifyStorageTokenInvalid(storage driver.Driver) {
 }
 
 // NotifyStorageTokenValid signals that a storage's credentials were just proven
-// good by a successful authenticated request. It fires the storage hook with the
-// "token-valid" type so listeners — notably cluster sync — can (re)share the
-// proven token with peers. Drivers should call this only on a real transition
-// from invalid→valid to avoid per-request churn.
+// good by a successful authenticated request. It restores a stale failure status
+// before firing the storage hook, so listeners — notably cluster sync — can
+// (re)share the proven token with peers. Drivers should call this only on a real
+// transition or stale-status recovery to avoid per-request churn.
 func NotifyStorageTokenValid(storage driver.Driver) {
+	restoreStorageTokenValidStatus(storage)
 	go callStorageHooks("token-valid", storage)
+}
+
+func restoreStorageTokenValidStatus(storage driver.Driver) {
+	st := storage.GetStorage()
+	if st == nil || st.Disabled || st.Status == WORK {
+		return
+	}
+	st.SetStatus(WORK)
+	if st.ID == 0 {
+		return
+	}
+	if err := db.UpdateStorageStatus(st.ID, WORK); err != nil {
+		log.Errorf("failed mark storage token valid: %s", err)
+	}
 }
