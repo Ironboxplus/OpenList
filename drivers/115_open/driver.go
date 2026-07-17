@@ -68,6 +68,10 @@ func (d *Open115) Init(ctx context.Context) error {
 		// proven valid, and pulls a fresh one from a healthy peer when its own
 		// dies. Edge-triggered so the cluster only reacts to real transitions.
 		sdk.WithOnTokenValid(func() {
+			// A successful authenticated request renews the cluster's in-memory
+			// proof only. This avoids a periodic refresh/push while preventing a
+			// working credential from ageing out of recovery advertisement.
+			op.NotifyStorageTokenHealthy(d)
 			if d.shouldNotifyTokenValid() {
 				op.NotifyStorageTokenValid(d)
 			}

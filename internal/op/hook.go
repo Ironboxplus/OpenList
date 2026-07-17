@@ -4,6 +4,7 @@ import (
 	"context"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
@@ -99,8 +100,13 @@ func HandleSettingItemHook(item *model.SettingItem) (hasHook bool, err error) {
 
 // Storage
 type StorageHook func(typ string, storage driver.Driver)
+type StorageHealthHook func(storage driver.Driver)
 
-var storageHooks = make([]StorageHook, 0)
+var (
+	storageHooks         = make([]StorageHook, 0)
+	storageHealthHooks   = make([]StorageHealthHook, 0)
+	storageTokenStatusMu sync.Mutex
+)
 
 func callStorageHooks(typ string, storage driver.Driver) {
 	for _, hook := range storageHooks {
@@ -112,6 +118,19 @@ func RegisterStorageHook(hook StorageHook) {
 	storageHooks = append(storageHooks, hook)
 }
 
+// RegisterStorageHealthHook receives a cheap proof that an authenticated
+// request succeeded. It is distinct from StorageHook: callers use it for
+// in-memory liveness only, never for database writes or lifecycle work.
+func RegisterStorageHealthHook(hook StorageHealthHook) {
+	storageHealthHooks = append(storageHealthHooks, hook)
+}
+
+func NotifyStorageTokenHealthy(storage driver.Driver) {
+	for _, hook := range storageHealthHooks {
+		hook(storage)
+	}
+}
+
 // NotifyStorageTokenInvalid signals that a storage's credentials were found to be
 // invalid/expired while in use (as opposed to successfully refreshed). It fires
 // the storage hook with the "token-invalid" type so listeners — notably cluster
@@ -119,23 +138,28 @@ func RegisterStorageHook(hook StorageHook) {
 // propagating the broken token. Drivers may call this when an API call fails with
 // an unrecoverable auth error.
 func NotifyStorageTokenInvalid(storage driver.Driver) {
-	markStorageTokenInvalidStatus(storage)
-	go callStorageHooks("token-invalid", storage)
+	storageTokenStatusMu.Lock()
+	changed := markStorageTokenInvalidStatus(storage)
+	storageTokenStatusMu.Unlock()
+	if changed {
+		go callStorageHooks("token-invalid", storage)
+	}
 }
 
-func markStorageTokenInvalidStatus(storage driver.Driver) {
+func markStorageTokenInvalidStatus(storage driver.Driver) bool {
 	st := storage.GetStorage()
 	if st == nil || st.Disabled || st.Status != WORK {
-		return
+		return false
 	}
 	const invalidStatus = "token invalid"
 	st.SetStatus(invalidStatus)
 	if st.ID == 0 {
-		return
+		return true
 	}
 	if err := db.UpdateStorageStatus(st.ID, invalidStatus); err != nil {
 		log.Errorf("failed mark storage token invalid: %s", err)
 	}
+	return true
 }
 
 // NotifyStorageTokenValid signals that a storage's credentials were just proven
@@ -144,20 +168,25 @@ func markStorageTokenInvalidStatus(storage driver.Driver) {
 // (re)share the proven token with peers. Drivers should call this only on a real
 // transition or stale-status recovery to avoid per-request churn.
 func NotifyStorageTokenValid(storage driver.Driver) {
-	restoreStorageTokenValidStatus(storage)
-	go callStorageHooks("token-valid", storage)
+	storageTokenStatusMu.Lock()
+	changed := restoreStorageTokenValidStatus(storage)
+	storageTokenStatusMu.Unlock()
+	if changed {
+		go callStorageHooks("token-valid", storage)
+	}
 }
 
-func restoreStorageTokenValidStatus(storage driver.Driver) {
+func restoreStorageTokenValidStatus(storage driver.Driver) bool {
 	st := storage.GetStorage()
 	if st == nil || st.Disabled || st.Status == WORK {
-		return
+		return false
 	}
 	st.SetStatus(WORK)
 	if st.ID == 0 {
-		return
+		return true
 	}
 	if err := db.UpdateStorageStatus(st.ID, WORK); err != nil {
 		log.Errorf("failed mark storage token valid: %s", err)
 	}
+	return true
 }

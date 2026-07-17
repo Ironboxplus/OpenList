@@ -256,6 +256,7 @@ func TestCredRecordVerifyRejectsForgery(t *testing.T) {
 	payload := map[string]json.RawMessage{"token": json.RawMessage(`"x"`)}
 	r := &credRecord{GroupID: "g", Payload: payload, CredHash: credHash(payload), Version: 1, Origin: id.NodeID, OriginPub: id.Pub}
 	r.Sig = id.sign(r.signingBytes())
+	r.MountSig = id.sign(r.mountSigningBytes())
 	// claim someone else's origin without their key.
 	r.Origin = other.NodeID
 	if r.verify() {
@@ -277,12 +278,104 @@ func TestCredRecordVerifyBindsOriginMount(t *testing.T) {
 		OriginMount:  "/115-a",
 	}
 	r.Sig = id.sign(r.signingBytes())
+	r.MountSig = id.sign(r.mountSigningBytes())
 	if !r.verify() {
 		t.Fatal("freshly signed record must verify")
 	}
 	r.OriginMount = "/115-b"
 	if r.verify() {
 		t.Fatal("changing origin mount must invalidate the credential signature")
+	}
+}
+
+// legacyCredSigningBytes is the credential wire-signature format used before
+// OriginMount was bound separately. Keeping this fixture lets an upgrade prove
+// it can still read state.json written by the deployed 53bc1db protocol.
+func legacyCredSigningBytes(r *credRecord) []byte {
+	var b []byte
+	b = append(b, r.GroupID...)
+	b = append(b, 0)
+	b = append(b, r.OriginDriver...)
+	b = append(b, 0)
+	b = append(b, r.CredHash...)
+	b = append(b, 0)
+	v := make([]byte, 8)
+	for i := 0; i < 8; i++ {
+		v[i] = byte(r.Version >> (8 * uint(i)))
+	}
+	b = append(b, v...)
+	b = append(b, 0)
+	b = append(b, r.Origin...)
+	return b
+}
+
+func TestCredRecordVerifiesLegacySignature(t *testing.T) {
+	id, _ := newIdentity()
+	payload := map[string]json.RawMessage{"refresh_token": json.RawMessage(`"legacy"`)}
+	r := &credRecord{
+		GroupID:      "g",
+		OriginDriver: "115 Open",
+		Payload:      payload,
+		CredHash:     credHash(payload),
+		Version:      7,
+		Origin:       id.NodeID,
+		OriginPub:    id.Pub,
+		OriginMount:  "/115",
+	}
+	r.Sig = id.sign(legacyCredSigningBytes(r))
+	if !r.verify() {
+		t.Fatal("a 53bc1db credential must remain verifiable after upgrade")
+	}
+}
+
+func TestLocalCredChangeMigratesLegacySourceWithoutTokenChange(t *testing.T) {
+	id, _ := newIdentity()
+	s := newStore()
+	payload := map[string]json.RawMessage{"refresh_token": json.RawMessage(`"legacy"`)}
+	legacy := &credRecord{
+		GroupID:      "g",
+		OriginDriver: "115 Open",
+		Payload:      payload,
+		CredHash:     credHash(payload),
+		Version:      1,
+		Origin:       id.NodeID,
+		OriginPub:    id.Pub,
+		OriginMount:  "/115",
+	}
+	legacy.Sig = id.sign(legacyCredSigningBytes(legacy))
+	if !s.mergeCred(legacy) {
+		t.Fatal("legacy credential should be accepted into local state")
+	}
+	migrated, ok := s.localCredChange(id, "g", "115 Open", "/115", payload, 2)
+	if !ok || migrated == nil || len(migrated.MountSig) == 0 {
+		t.Fatal("a healthy local source must rewrite its legacy record with MountSig")
+	}
+	if migrated.signatureKind() != credentialSignatureMountBound {
+		t.Fatal("migrated record must use the rolling-compatible mount-bound format")
+	}
+}
+
+func TestSameOriginMultipleMountCandidatesArePreserved(t *testing.T) {
+	id, _ := newIdentity()
+	s := newStore()
+	first := map[string]json.RawMessage{"refresh_token": json.RawMessage(`"first"`)}
+	second := map[string]json.RawMessage{"refresh_token": json.RawMessage(`"second"`)}
+	if _, ok := s.localCredChange(id, "g", "115 Open", "/115-a", first, 1); !ok {
+		t.Fatal("first local mount candidate was not recorded")
+	}
+	if _, ok := s.localCredChange(id, "g", "115 Open", "/115-b", second, 2); !ok {
+		t.Fatal("second local mount candidate was not recorded")
+	}
+	got := s.credsForGroup("g")
+	if len(got) != 2 {
+		t.Fatalf("candidate count = %d, want separate candidates for both mounts: %#v", len(got), got)
+	}
+	if !s.dropOwnCred("g", id.NodeID, "/115-a") {
+		t.Fatal("invalidating one source mount must drop that source candidate")
+	}
+	remaining := s.credsForGroup("g")
+	if len(remaining) != 1 || remaining[0].OriginMount != "/115-b" {
+		t.Fatalf("invalidating /115-a removed the wrong candidate: %#v", remaining)
 	}
 }
 
@@ -295,7 +388,7 @@ func TestDropOwnCred(t *testing.T) {
 	s := newStore()
 
 	// nothing recorded yet -> nothing to drop.
-	if s.dropOwnCred("g1", id1.NodeID) {
+	if s.dropOwnCred("g1", id1.NodeID, "/115") {
 		t.Fatal("dropping a non-existent record must return false")
 	}
 
@@ -304,7 +397,7 @@ func TestDropOwnCred(t *testing.T) {
 	if _, ok := s.localCredChange(id1, "g1", "115", "/115", payloadA, 1); !ok {
 		t.Fatal("own credential should be recorded")
 	}
-	if !s.dropOwnCred("g1", id1.NodeID) {
+	if !s.dropOwnCred("g1", id1.NodeID, "/115") {
 		t.Fatal("own credential should be dropped")
 	}
 	if _, ok := s.getCred("g1"); ok {
@@ -318,7 +411,7 @@ func TestDropOwnCred(t *testing.T) {
 	if !s.mergeCred(r) {
 		t.Fatal("peer credential should merge")
 	}
-	if s.dropOwnCred("g2", id1.NodeID) {
+	if s.dropOwnCred("g2", id1.NodeID, "/115") {
 		t.Fatal("a peer-authored credential must never be dropped as own")
 	}
 	if _, ok := s.getCred("g2"); !ok {
@@ -326,23 +419,40 @@ func TestDropOwnCred(t *testing.T) {
 	}
 }
 
-// canOfferCred enforces "only share a token proven valid" for every candidate.
-// Receiving a signed peer record is not proof that this node can use it, so it
-// must not turn this node into a blind relay for an unvalidated credential.
+// canOfferCred requires a local health proof for this node's own candidates.
+// A signed, group-authorized peer candidate remains relayable: the hub need not
+// overwrite a healthy local mount merely to forward NAT peers' recovery path.
 func TestCanOfferCred(t *testing.T) {
 	id1, _ := newIdentity() // self
 	id2, _ := newIdentity() // peer
-	m := &Manager{id: id1, state: newStore()}
+	admin, _ := newIdentity()
+	s := newStore()
+	s.setGroups(admin, []group{{
+		ID:      "g1",
+		Members: []member{{NodeID: id1.NodeID, MountPath: "/local"}, {NodeID: id2.NodeID, MountPath: "/peer"}},
+	}}, 1)
+	m := &Manager{id: id1, state: s}
 
 	if m.canOfferCred(nil) {
 		t.Fatal("a nil record is never offerable")
 	}
 
-	// A peer-authored record is not offerable without a matching local healthy
-	// mount. This manager has neither a group nor a live validated candidate.
-	peer := &credRecord{GroupID: "g1", Origin: id2.NodeID}
-	if m.canOfferCred(peer) {
-		t.Fatal("a peer-authored record must NOT be relayed before local validation")
+	// The hub may relay a peer-authored candidate without first applying it to a
+	// working local mount; its signature and group membership authorize that.
+	payload := map[string]json.RawMessage{"refresh_token": json.RawMessage(`"peer"`)}
+	peer := &credRecord{
+		GroupID:      "g1",
+		OriginDriver: "115 Open",
+		Payload:      payload,
+		CredHash:     credHash(payload),
+		Version:      1,
+		Origin:       id2.NodeID,
+		OriginPub:    id2.Pub,
+		OriginMount:  "/peer",
+	}
+	peer.Sig = id2.sign(peer.signingBytes())
+	if !m.canOfferCred(peer) {
+		t.Fatal("an authorized peer candidate must remain relayable")
 	}
 
 	// our own record, but no group/healthy mount -> not offerable.
@@ -379,7 +489,7 @@ func TestAbsorbCredsRejectsUnauthorizedOriginMount(t *testing.T) {
 	if got := m.absorbCreds([]*credRecord{bad}); len(got) != 0 {
 		t.Fatalf("unauthorized origin mount was accepted: %#v", got)
 	}
-	if _, ok := s.getCredForOrigin("g1", memberID.NodeID); ok {
+	if _, ok := s.getCredForSource("g1", memberID.NodeID, "/115"); ok {
 		t.Fatal("unauthorized credential must not enter replicated state")
 	}
 

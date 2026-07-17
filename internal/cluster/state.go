@@ -120,19 +120,35 @@ type credRecord struct {
 	Version      uint64                     `json:"version"`       // Lamport clock
 	Origin       string                     `json:"origin"`        // authoring node id
 	OriginPub    []byte                     `json:"origin_pub"`    // origin ed25519 pubkey
-	OriginMount  string                     `json:"origin_mount"`  // informational
+	OriginMount  string                     `json:"origin_mount"`  // authoring mount path
 	UpdatedAt    int64                      `json:"updated_at"`
-	Sig          []byte                     `json:"sig"`
+	Sig          []byte                     `json:"sig"`                 // v1-compatible record signature
+	MountSig     []byte                     `json:"mount_sig,omitempty"` // binds OriginMount for upgraded peers
 }
 
+// signingBytes deliberately preserves the original credential signature format.
+// Older nodes ignore MountSig and can therefore keep verifying records from an
+// upgraded node during a rolling deployment.
 func (r *credRecord) signingBytes() []byte {
+	return r.credentialSigningBytes(false)
+}
+
+// v2SigningBytes was briefly emitted by 5a61c4b5. It is accepted on read so a
+// state.json written by that revision is not silently discarded.
+func (r *credRecord) v2SigningBytes() []byte {
+	return r.credentialSigningBytes(true)
+}
+
+func (r *credRecord) credentialSigningBytes(bindMount bool) []byte {
 	var b []byte
 	b = append(b, r.GroupID...)
 	b = append(b, 0)
 	b = append(b, r.OriginDriver...)
 	b = append(b, 0)
-	b = append(b, r.OriginMount...)
-	b = append(b, 0)
+	if bindMount {
+		b = append(b, r.OriginMount...)
+		b = append(b, 0)
+	}
 	b = append(b, r.CredHash...)
 	b = append(b, 0)
 	v := make([]byte, 8)
@@ -145,14 +161,43 @@ func (r *credRecord) signingBytes() []byte {
 	return b
 }
 
+func (r *credRecord) mountSigningBytes() []byte {
+	b := append([]byte("openlist/cluster/credential-mount/v1\x00"), r.signingBytes()...)
+	b = append(b, 0)
+	b = append(b, r.OriginMount...)
+	return b
+}
+
+type credentialSignature uint8
+
+const (
+	credentialSignatureInvalid credentialSignature = iota
+	credentialSignatureLegacy
+	credentialSignatureMountBound
+	credentialSignatureV2
+)
+
+func (r *credRecord) signatureKind() credentialSignature {
+	if r == nil || nodeIDFromPub(r.OriginPub) != r.Origin || credHash(r.Payload) != r.CredHash {
+		return credentialSignatureInvalid
+	}
+	if verifySig(r.OriginPub, r.signingBytes(), r.Sig) {
+		if len(r.MountSig) == 0 {
+			return credentialSignatureLegacy
+		}
+		if verifySig(r.OriginPub, r.mountSigningBytes(), r.MountSig) {
+			return credentialSignatureMountBound
+		}
+		return credentialSignatureInvalid
+	}
+	if len(r.MountSig) == 0 && verifySig(r.OriginPub, r.v2SigningBytes(), r.Sig) {
+		return credentialSignatureV2
+	}
+	return credentialSignatureInvalid
+}
+
 func (r *credRecord) verify() bool {
-	if nodeIDFromPub(r.OriginPub) != r.Origin {
-		return false
-	}
-	if credHash(r.Payload) != r.CredHash {
-		return false
-	}
-	return verifySig(r.OriginPub, r.signingBytes(), r.Sig)
+	return r.signatureKind() != credentialSignatureInvalid
 }
 
 func (r *credRecord) dominates(other *credRecord) bool {
@@ -167,19 +212,22 @@ func (r *credRecord) dominates(other *credRecord) bool {
 
 // credDigest is the compact (no-secret) advert of a held credential record.
 type credDigest struct {
-	GroupID  string `json:"group_id"`
-	CredHash string `json:"cred_hash"`
-	Version  uint64 `json:"version"`
-	Origin   string `json:"origin"`
+	GroupID     string `json:"group_id"`
+	CredHash    string `json:"cred_hash"`
+	Version     uint64 `json:"version"`
+	Origin      string `json:"origin"`
+	OriginMount string `json:"origin_mount,omitempty"`
 }
 
 func digestOfCred(r *credRecord) credDigest {
-	return credDigest{GroupID: r.GroupID, CredHash: r.CredHash, Version: r.Version, Origin: r.Origin}
+	return credDigest{GroupID: r.GroupID, CredHash: r.CredHash, Version: r.Version, Origin: r.Origin, OriginMount: r.OriginMount}
 }
 
-// credDigestKey identifies one origin's current candidate within a group.
+func candidateKey(origin, mount string) string { return origin + "\x00" + mount }
+
+// credDigestKey identifies one mount-level candidate within a group.
 func credDigestKey(d credDigest) string {
-	return d.GroupID + "\x00" + d.Origin
+	return d.GroupID + "\x00" + candidateKey(d.Origin, d.OriginMount)
 }
 
 func credDigestDominates(a, b credDigest) bool {
@@ -188,6 +236,9 @@ func credDigestDominates(a, b credDigest) bool {
 	}
 	if a.Origin != b.Origin {
 		return a.Origin > b.Origin
+	}
+	if a.OriginMount != b.OriginMount {
+		return a.OriginMount > b.OriginMount
 	}
 	return a.CredHash > b.CredHash
 }
@@ -222,9 +273,9 @@ type store struct {
 	mu     sync.RWMutex
 	groups groupDoc
 	// One group is a peer set, not a primary/replica pair. Each member keeps its
-	// own current candidate, keyed by the signing origin; Lamport ordering only
-	// resolves successive credentials from the same origin.
-	creds map[string]map[string]*credRecord // group id -> origin node id -> candidate
+	// own current candidate, keyed by the signing origin and mount; Lamport
+	// ordering only resolves successive credentials from the same source mount.
+	creds map[string]map[string]*credRecord // group id -> (origin, mount) -> candidate
 	// candidateHealth is an in-memory proof that this node has actually used a
 	// credential successfully. It is deliberately not persisted: a restart must
 	// prove the credential again instead of trusting a stale WORK status.
@@ -323,6 +374,36 @@ func (s *store) groupByID(id string) (group, bool) {
 	return group{}, false
 }
 
+// credentialAuthorizedByGroups binds a signed credential to a configured source
+// mount. Legacy signatures did not bind OriginMount, so they are safe only when
+// that node has exactly one member mount in the group; upgraded records carry a
+// separate MountSig and support multiple mounts from the same node.
+func credentialAuthorizedByGroups(groups []group, r *credRecord) bool {
+	if r == nil || r.GroupID == "" || r.Origin == "" || r.OriginMount == "" || !r.verify() {
+		return false
+	}
+	var membersForOrigin int
+	var exactMount bool
+	for _, g := range groups {
+		if g.ID != r.GroupID {
+			continue
+		}
+		for _, member := range g.Members {
+			if member.NodeID != r.Origin {
+				continue
+			}
+			membersForOrigin++
+			if member.MountPath == r.OriginMount {
+				exactMount = true
+			}
+		}
+	}
+	if !exactMount {
+		return false
+	}
+	return r.signatureKind() != credentialSignatureLegacy || membersForOrigin == 1
+}
+
 // ---- creds ----
 
 func (s *store) getCred(groupID string) (*credRecord, bool) {
@@ -337,10 +418,10 @@ func (s *store) getCred(groupID string) (*credRecord, bool) {
 	return newest, newest != nil
 }
 
-func (s *store) getCredForOrigin(groupID, origin string) (*credRecord, bool) {
+func (s *store) getCredForSource(groupID, origin, mount string) (*credRecord, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	r, ok := s.creds[groupID][origin]
+	r, ok := s.creds[groupID][candidateKey(origin, mount)]
 	return r, ok
 }
 
@@ -352,7 +433,12 @@ func (s *store) credsForGroup(groupID string) []*credRecord {
 	for _, r := range byOrigin {
 		out = append(out, r)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Origin < out[j].Origin })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Origin != out[j].Origin {
+			return out[i].Origin < out[j].Origin
+		}
+		return out[i].OriginMount < out[j].OriginMount
+	})
 	return out
 }
 
@@ -370,6 +456,16 @@ func (s *store) hasCredHash(groupID, hash string) bool {
 	return false
 }
 
+func (s *store) hasCredForSource(groupID, origin, mount, hash string) bool {
+	if hash == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r, ok := s.creds[groupID][candidateKey(origin, mount)]
+	return ok && r.CredHash == hash
+}
+
 func (s *store) credSnapshot() []*credRecord {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -383,7 +479,10 @@ func (s *store) credSnapshot() []*credRecord {
 		if out[i].GroupID != out[j].GroupID {
 			return out[i].GroupID < out[j].GroupID
 		}
-		return out[i].Origin < out[j].Origin
+		if out[i].Origin != out[j].Origin {
+			return out[i].Origin < out[j].Origin
+		}
+		return out[i].OriginMount < out[j].OriginMount
 	})
 	return out
 }
@@ -401,7 +500,10 @@ func (s *store) credDigests() []credDigest {
 		if out[i].GroupID != out[j].GroupID {
 			return out[i].GroupID < out[j].GroupID
 		}
-		return out[i].Origin < out[j].Origin
+		if out[i].Origin != out[j].Origin {
+			return out[i].Origin < out[j].Origin
+		}
+		return out[i].OriginMount < out[j].OriginMount
 	})
 	return out
 }
@@ -421,10 +523,8 @@ func (s *store) localCredChange(id *identity, groupID, driver, mount string, pay
 		byOrigin = make(map[string]*credRecord)
 		s.creds[groupID] = byOrigin
 	}
-	for _, cur := range byOrigin {
-		if cur.CredHash == h {
-			return nil, false // a known candidate need not be re-authored
-		}
+	if cur, ok := byOrigin[candidateKey(id.NodeID, mount)]; ok && cur.CredHash == h && cur.signatureKind() == credentialSignatureMountBound {
+		return nil, false // this source mount has not changed
 	}
 	s.lamport++
 	r := &credRecord{
@@ -440,7 +540,8 @@ func (s *store) localCredChange(id *identity, groupID, driver, mount string, pay
 		UpdatedAt:    now,
 	}
 	r.Sig = id.sign(r.signingBytes())
-	byOrigin[id.NodeID] = r
+	r.MountSig = id.sign(r.mountSigningBytes())
+	byOrigin[candidateKey(id.NodeID, mount)] = r
 	return r, true
 }
 
@@ -455,7 +556,8 @@ func (s *store) mergeCred(r *credRecord) bool {
 		byOrigin = make(map[string]*credRecord)
 		s.creds[r.GroupID] = byOrigin
 	}
-	cur, ok := byOrigin[r.Origin]
+	key := candidateKey(r.Origin, r.OriginMount)
+	cur, ok := byOrigin[key]
 	if ok {
 		if cur.CredHash == r.CredHash {
 			return false // idempotent: same credential
@@ -465,7 +567,7 @@ func (s *store) mergeCred(r *credRecord) bool {
 		}
 	}
 	cp := *r
-	byOrigin[r.Origin] = &cp
+	byOrigin[key] = &cp
 	return true
 }
 
@@ -474,14 +576,15 @@ func (s *store) mergeCred(r *credRecord) bool {
 // as a dominating record (its Lamport version could otherwise out-rank a peer's
 // genuinely-valid credential and block recovery). Returns true if a record was
 // removed. Peer-authored records are never touched here.
-func (s *store) dropOwnCred(groupID, selfID string) bool {
+func (s *store) dropOwnCred(groupID, selfID, mount string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if byOrigin := s.creds[groupID]; byOrigin != nil {
-		if _, ok := byOrigin[selfID]; !ok {
+		key := candidateKey(selfID, mount)
+		if _, ok := byOrigin[key]; !ok {
 			return false
 		}
-		delete(byOrigin, selfID)
+		delete(byOrigin, key)
 		if len(byOrigin) == 0 {
 			delete(s.creds, groupID)
 		}
@@ -632,7 +735,7 @@ func (s *store) load(ps persistedState) {
 	s.creds = make(map[string]map[string]*credRecord)
 	s.candidateHealth = make(map[string]map[string]int64)
 	for _, r := range ps.Creds {
-		if r == nil || r.GroupID == "" || r.Origin == "" || !r.verify() {
+		if !credentialAuthorizedByGroups(s.groups.Groups, r) {
 			continue
 		}
 		byOrigin := s.creds[r.GroupID]
@@ -640,9 +743,10 @@ func (s *store) load(ps persistedState) {
 			byOrigin = make(map[string]*credRecord)
 			s.creds[r.GroupID] = byOrigin
 		}
-		if cur, ok := byOrigin[r.Origin]; !ok || r.dominates(cur) {
+		key := candidateKey(r.Origin, r.OriginMount)
+		if cur, ok := byOrigin[key]; !ok || r.dominates(cur) {
 			cp := *r
-			byOrigin[r.Origin] = &cp
+			byOrigin[key] = &cp
 		}
 		if r.Version > s.lamport {
 			s.lamport = r.Version

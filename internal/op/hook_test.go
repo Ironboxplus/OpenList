@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
@@ -84,5 +85,29 @@ func TestNotifyStorageTokenInvalidMarksStatusAndPersists(t *testing.T) {
 	}
 	if got.Status == op.WORK {
 		t.Fatal("token-invalid must persist a non-work status before peer recovery")
+	}
+}
+
+func TestNotifyStorageTokenHealthyDoesNotChangeLifecycleStatus(t *testing.T) {
+	d := &tokenValidStorageDriver{Storage: model.Storage{Status: op.WORK}}
+	called := make(chan struct{}, 1)
+	op.RegisterStorageHealthHook(func(got driver.Driver) {
+		if got != d {
+			return
+		}
+		select {
+		case called <- struct{}{}:
+		default:
+		}
+	})
+
+	op.NotifyStorageTokenHealthy(d)
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("health hook was not invoked")
+	}
+	if d.GetStorage().Status != op.WORK {
+		t.Fatal("a healthy proof must not mutate the storage lifecycle status")
 	}
 }

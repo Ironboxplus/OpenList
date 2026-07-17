@@ -40,6 +40,9 @@ type Manager struct {
 
 	persistMu sync.Mutex
 
+	recoveryMu    sync.Mutex
+	recoveryLocks map[string]*sync.Mutex // per local mount: serialize credential adoption
+
 	dialMu  sync.Mutex
 	dialing map[string]bool // peer URLs with an in-flight/live outbound dial
 
@@ -69,14 +72,15 @@ func Init(dataDir string) (*Manager, error) {
 		return nil, err
 	}
 	m := &Manager{
-		dir:      dir,
-		id:       id,
-		cfgStore: newConfigStore(dir),
-		state:    newStore(),
-		replay:   newReplayCache(replayWindowSec),
-		conns:    newConnRegistry(),
-		dialing:  make(map[string]bool),
-		stopCh:   make(chan struct{}),
+		dir:           dir,
+		id:            id,
+		cfgStore:      newConfigStore(dir),
+		state:         newStore(),
+		replay:        newReplayCache(replayWindowSec),
+		conns:         newConnRegistry(),
+		dialing:       make(map[string]bool),
+		recoveryLocks: make(map[string]*sync.Mutex),
+		stopCh:        make(chan struct{}),
 	}
 	if _, err := m.cfgStore.loadOrInit(); err != nil {
 		return nil, err
@@ -84,6 +88,7 @@ func Init(dataDir string) (*Manager, error) {
 	m.loadState()
 
 	op.RegisterStorageHook(m.onStorageHook)
+	op.RegisterStorageHealthHook(m.onStorageHealthy)
 	Default = m
 	return m, nil
 }
@@ -349,19 +354,25 @@ func (m *Manager) seedLocalCreds() {
 		}
 		if st.Status != op.WORK {
 			// Unhealthy mount (e.g. token dead at boot): drop our own stale cred so
-			// it can't dominate a peer's valid one, then pull a fresh credential.
+			// it can't dominate a peer's valid one. Persisted peer candidates are
+			// tried before a network pull so restart recovery also works offline.
 			for _, g := range groups {
-				if m.state.dropOwnCred(g.ID, m.id.NodeID) {
+				if m.state.dropOwnCred(g.ID, m.id.NodeID, st.MountPath) {
 					changed = true
 				}
-				m.pullGroup(g.ID)
+				for _, candidate := range m.state.credsForGroup(g.ID) {
+					m.applyCredRecord(candidate)
+				}
+				if d.GetStorage().Status != op.WORK {
+					m.pullGroup(g.ID)
+				}
 			}
 			continue
 		}
 		creds := extractCreds(st.Addition)
 		credID := credHash(creds)
 		for _, g := range groups {
-			if m.state.hasCredHash(g.ID, credID) {
+			if m.state.hasCredForSource(g.ID, selfID, st.MountPath, credID) {
 				m.state.markCandidateHealthy(g.ID, credID, now())
 				continue // keep the original peer signature when the token is identical
 			}
@@ -418,7 +429,7 @@ func (m *Manager) onStorageHook(typ string, d driver.Driver) {
 		credID := credHash(creds)
 		var dirty bool
 		for _, g := range groups {
-			if m.state.hasCredHash(g.ID, credID) {
+			if m.state.hasCredForSource(g.ID, selfID, st.MountPath, credID) {
 				m.state.markCandidateHealthy(g.ID, credID, now())
 				continue
 			}
@@ -436,6 +447,12 @@ func (m *Manager) onStorageHook(typ string, d driver.Driver) {
 		// A mount was removed locally. We keep the group's credential record (other
 		// members still rely on it); only our inventory changes (handled above).
 	case "token-invalid":
+		if st.Status == op.WORK {
+			// Hooks are asynchronous. A later successful request may already have
+			// restored this storage, so an older invalid event must not revoke the
+			// healthy candidate it would otherwise overwrite.
+			return
+		}
 		// Our token died. Drop our own (now-stale) credential record so its Lamport
 		// version can't out-rank a peer's valid one, then pull a fresh credential
 		// from a healthy peer.
@@ -443,7 +460,7 @@ func (m *Manager) onStorageHook(typ string, d driver.Driver) {
 		credID := credHash(extractCreds(st.Addition))
 		for _, g := range groups {
 			m.state.forgetCandidateHealth(g.ID, credID)
-			if m.state.dropOwnCred(g.ID, m.id.NodeID) {
+			if m.state.dropOwnCred(g.ID, m.id.NodeID, st.MountPath) {
 				dropped = true
 				m.recordEvent("invalidate", g.ID,
 					fmt.Sprintf("%s token invalid — dropped local cred, pulling from peers", st.MountPath))
@@ -452,6 +469,29 @@ func (m *Manager) onStorageHook(typ string, d driver.Driver) {
 		}
 		if dropped {
 			m.persist()
+		}
+	}
+}
+
+// onStorageHealthy renews only the in-memory proof for an already working
+// credential. It deliberately does not write the database, broadcast a record,
+// or emit a storage lifecycle event; ordinary successful requests therefore keep
+// a candidate usable without causing token-refresh or cluster-sync churn.
+func (m *Manager) onStorageHealthy(d driver.Driver) {
+	if !m.cfgStore.get().active() {
+		return
+	}
+	st := d.GetStorage()
+	if st == nil || st.Status != op.WORK {
+		return
+	}
+	credID := credHash(extractCreds(st.Addition))
+	if credID == "" {
+		return
+	}
+	for _, g := range m.state.groupsForMount(m.id.NodeID, st.MountPath) {
+		if m.state.hasCredHash(g.ID, credID) {
+			m.state.markCandidateHealthy(g.ID, credID, now())
 		}
 	}
 }
@@ -495,9 +535,17 @@ func (m *Manager) hasHealthyLocalCandidate(r *credRecord) bool {
 }
 
 // canOfferCred reports whether this node may advertise a credential candidate.
-// Receiving a record does not turn this node into a blind relay: it must first
-// be proven by a matching local working mount within the health lease.
+// A remote candidate is authenticated by its signature and the signed group
+// document, and must remain relayable through an accept-only/NAT hub. This
+// node's own candidate additionally needs a recent local health proof so stale
+// credentials from its state.json are never reintroduced after a restart.
 func (m *Manager) canOfferCred(r *credRecord) bool {
+	if !m.credentialAuthorized(r) {
+		return false
+	}
+	if r.Origin != m.id.NodeID {
+		return true
+	}
 	return m.hasHealthyLocalCandidate(r)
 }
 
@@ -510,6 +558,20 @@ func (m *Manager) offerableDigests() []credDigest {
 		}
 	}
 	return out
+}
+
+func (m *Manager) recoveryLock(mount string) *sync.Mutex {
+	m.recoveryMu.Lock()
+	defer m.recoveryMu.Unlock()
+	if m.recoveryLocks == nil {
+		m.recoveryLocks = make(map[string]*sync.Mutex)
+	}
+	lock := m.recoveryLocks[mount]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		m.recoveryLocks[mount] = lock
+	}
+	return lock
 }
 
 // applyCredRecord overlays a group's credential onto this node's member mounts.
@@ -527,32 +589,37 @@ func (m *Manager) applyCredRecord(r *credRecord) {
 	}
 	ctx := context.Background()
 	for _, mp := range g.mountsForNode(m.id.NodeID) {
-		d, err := op.GetStorageByMountPath(mp)
-		if err != nil {
-			continue
-		}
-		st := *d.GetStorage() // copy; preserve ID/Status/local fields
-		if r.OriginDriver != "" && st.Driver != r.OriginDriver {
-			utils.Log.Warnf("[cluster] skip applying %s creds to %s: driver mismatch (%s != %s)",
-				r.GroupID, mp, st.Driver, r.OriginDriver)
-			continue
-		}
-		if st.Status == op.WORK {
-			// A peer's newer Lamport value is a recovery candidate, not authority
-			// to overwrite credentials this mount has already proved locally.
-			continue
-		}
-		newAdd, changed := applyCreds(st.Addition, r.Payload)
-		if !changed {
-			continue // already has these credentials — no churn, no re-init
-		}
-		st.Addition = newAdd
-		if err := op.UpdateStorage(ctx, st); err != nil {
-			utils.Log.Warnf("[cluster] apply creds to %s failed: %v", mp, err)
-			continue
-		}
-		m.recordEvent("apply", r.GroupID, fmt.Sprintf("%s adopted credentials from %s", mp, shortNode(r.Origin)))
-		utils.Log.Infof("[cluster] applied group %s credentials to %s (v%d from %s)", r.GroupID, mp, r.Version, r.Origin)
+		lock := m.recoveryLock(mp)
+		lock.Lock()
+		func() {
+			defer lock.Unlock()
+			d, err := op.GetStorageByMountPath(mp)
+			if err != nil {
+				return
+			}
+			st := *d.GetStorage() // copy; preserve ID/Status/local fields
+			if r.OriginDriver != "" && st.Driver != r.OriginDriver {
+				utils.Log.Warnf("[cluster] skip applying %s creds to %s: driver mismatch (%s != %s)",
+					r.GroupID, mp, st.Driver, r.OriginDriver)
+				return
+			}
+			if st.Status == op.WORK {
+				// A peer's newer Lamport value is a recovery candidate, not authority
+				// to overwrite credentials this mount has already proved locally.
+				return
+			}
+			newAdd, changed := applyCreds(st.Addition, r.Payload)
+			if !changed {
+				return // already has these credentials — no churn, no re-init
+			}
+			st.Addition = newAdd
+			if err := op.UpdateStorage(ctx, st); err != nil {
+				utils.Log.Warnf("[cluster] apply creds to %s failed: %v", mp, err)
+				return
+			}
+			m.recordEvent("apply", r.GroupID, fmt.Sprintf("%s adopted credentials from %s", mp, shortNode(r.Origin)))
+			utils.Log.Infof("[cluster] applied group %s credentials to %s (v%d from %s)", r.GroupID, mp, r.Version, r.Origin)
+		}()
 	}
 }
 
@@ -606,19 +673,7 @@ func (m *Manager) absorbCreds(recs []*credRecord) []*credRecord {
 // the signed group at the exact mount it claims. The signature proves who wrote
 // the record; the group document proves that writer may supply this group.
 func (m *Manager) credentialAuthorized(r *credRecord) bool {
-	if r == nil || r.GroupID == "" || r.Origin == "" || r.OriginMount == "" {
-		return false
-	}
-	g, ok := m.state.groupByID(r.GroupID)
-	if !ok {
-		return false
-	}
-	for _, member := range g.Members {
-		if member.NodeID == r.Origin && member.MountPath == r.OriginMount {
-			return true
-		}
-	}
-	return false
+	return credentialAuthorizedByGroups(m.state.groupList(), r)
 }
 
 // ---- anti-entropy reply ----
@@ -634,7 +689,7 @@ func (m *Manager) buildReply(in *syncMessage) *syncMessage {
 		reply.Groups = &local
 	}
 
-	// Credential anti-entropy is per (group, origin) candidate. A group-level
+	// Credential anti-entropy is per (group, origin, mount) candidate. A group-level
 	// LWW exchange would silently promote one member into a primary and discard
 	// the independent recovery paths held by the other members.
 	peerHas := make(map[string]credDigest, len(in.CredDigests))
@@ -667,7 +722,7 @@ func (m *Manager) buildReply(in *syncMessage) *syncMessage {
 		}
 		key := credDigestKey(dg)
 		peerHas[key] = dg
-		cur, ok := m.state.getCredForOrigin(dg.GroupID, dg.Origin)
+		cur, ok := m.state.getCredForSource(dg.GroupID, dg.Origin, dg.OriginMount)
 		if !ok {
 			appendWant(dg.GroupID)
 			continue
