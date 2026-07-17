@@ -131,6 +131,8 @@ func (r *credRecord) signingBytes() []byte {
 	b = append(b, 0)
 	b = append(b, r.OriginDriver...)
 	b = append(b, 0)
+	b = append(b, r.OriginMount...)
+	b = append(b, 0)
 	b = append(b, r.CredHash...)
 	b = append(b, 0)
 	v := make([]byte, 8)

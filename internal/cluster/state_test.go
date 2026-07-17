@@ -263,6 +263,29 @@ func TestCredRecordVerifyRejectsForgery(t *testing.T) {
 	}
 }
 
+func TestCredRecordVerifyBindsOriginMount(t *testing.T) {
+	id, _ := newIdentity()
+	payload := map[string]json.RawMessage{"refresh_token": json.RawMessage(`"x"`)}
+	r := &credRecord{
+		GroupID:      "g",
+		OriginDriver: "115 Open",
+		Payload:      payload,
+		CredHash:     credHash(payload),
+		Version:      1,
+		Origin:       id.NodeID,
+		OriginPub:    id.Pub,
+		OriginMount:  "/115-a",
+	}
+	r.Sig = id.sign(r.signingBytes())
+	if !r.verify() {
+		t.Fatal("freshly signed record must verify")
+	}
+	r.OriginMount = "/115-b"
+	if r.verify() {
+		t.Fatal("changing origin mount must invalidate the credential signature")
+	}
+}
+
 // dropOwnCred must remove only our own-authored record so a dead/stale local
 // token can never out-rank (by Lamport version) a peer's genuinely-valid one and
 // block recovery. A peer-authored record must survive.
