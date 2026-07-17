@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	stdpath "path"
 	"slices"
 	"strconv"
@@ -15,6 +16,7 @@ import (
 	sdk "github.com/OpenListTeam/115-sdk-go"
 	"github.com/OpenListTeam/OpenList/v4/cmd/flags"
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -43,6 +45,7 @@ var (
 	// 回收站列表存在短暂最终一致性延迟，永久删除 fallback 查找增加短重试。
 	recycleBinLookupMaxAttempts = 4
 	recycleBinLookupRetryDelay  = 300 * time.Millisecond
+	new115SDKClient             = sdk.New
 )
 
 func (d *Open115) Config() driver.Config {
@@ -54,7 +57,7 @@ func (d *Open115) GetAddition() driver.Additional {
 }
 
 func (d *Open115) Init(ctx context.Context) error {
-	d.client = sdk.New(sdk.WithRefreshToken(d.Addition.RefreshToken),
+	d.client = new115SDKClient(sdk.WithRefreshToken(d.Addition.RefreshToken),
 		sdk.WithAccessToken(d.Addition.AccessToken),
 		sdk.WithOnRefreshToken(func(s1, s2 string) {
 			d.Addition.AccessToken = s1
@@ -74,15 +77,17 @@ func (d *Open115) Init(ctx context.Context) error {
 				op.NotifyStorageTokenInvalid(d)
 			}
 		}))
+	applySDKProxyIfConfigured(d.client)
 	if flags.Debug || flags.Dev {
 		d.client.SetDebug(true)
+	}
+	d.initLimiter()
+	if err := d.WaitLimit(ctx); err != nil {
+		return err
 	}
 	_, err := d.client.UserInfo(ctx)
 	if err != nil {
 		return err
-	}
-	if d.Addition.LimitRate > 0 {
-		d.limiter = rate.NewLimiter(rate.Limit(d.Addition.LimitRate), 1)
 	}
 	if d.PageSize <= 0 {
 		d.PageSize = 200
@@ -93,6 +98,9 @@ func (d *Open115) Init(ctx context.Context) error {
 	// add parent path
 	d.parentPath = "/"
 	if d.GetRootId() != d.Config().DefaultRoot {
+		if err := d.WaitLimit(ctx); err != nil {
+			return err
+		}
 		folderInfo, err := d.client.GetFolderInfo(ctx, d.GetRootId())
 		if err != nil {
 			return err
@@ -122,6 +130,25 @@ func (d *Open115) shouldNotifyTokenValid() bool {
 	return d.GetStorage().Status != op.WORK
 }
 
+func (d *Open115) initLimiter() {
+	if d.Addition.LimitRate > 0 {
+		d.limiter = rate.NewLimiter(rate.Limit(d.Addition.LimitRate), 1)
+		return
+	}
+	d.limiter = nil
+}
+
+func applySDKProxyIfConfigured(client *sdk.Client) {
+	if client == nil || conf.Conf == nil || strings.TrimSpace(conf.Conf.ProxyAddress) == "" {
+		return
+	}
+	proxyAddress := strings.TrimSpace(conf.Conf.ProxyAddress)
+	if _, err := url.Parse(proxyAddress); err != nil {
+		log.Warnf("[115] invalid proxy address ignored: %v", err)
+		return
+	}
+	client.SetProxy(proxyAddress)
+}
 func (d *Open115) WaitLimit(ctx context.Context) error {
 	if d.limiter != nil {
 		return d.limiter.Wait(ctx)

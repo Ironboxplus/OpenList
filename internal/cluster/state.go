@@ -82,8 +82,14 @@ func (d *groupDoc) signingBytes() []byte {
 }
 
 func (d *groupDoc) verify() bool {
+	if d == nil {
+		return false
+	}
 	if d.Version == 0 {
-		return true // the empty/default doc is implicitly valid
+		// Version zero is reserved for the exact local bootstrap document. A
+		// non-empty v0 document has no authenticated ordering and must not win a
+		// tie-break against a fresh node's empty state.
+		return len(d.Groups) == 0 && d.Origin == "" && len(d.OriginPub) == 0 && len(d.Sig) == 0 && d.UpdatedAt == 0
 	}
 	if nodeIDFromPub(d.OriginPub) != d.Origin {
 		return false
@@ -169,6 +175,11 @@ func digestOfCred(r *credRecord) credDigest {
 	return credDigest{GroupID: r.GroupID, CredHash: r.CredHash, Version: r.Version, Origin: r.Origin}
 }
 
+// credDigestKey identifies one origin's current candidate within a group.
+func credDigestKey(d credDigest) string {
+	return d.GroupID + "\x00" + d.Origin
+}
+
 func credDigestDominates(a, b credDigest) bool {
 	if a.Version != b.Version {
 		return a.Version > b.Version
@@ -206,17 +217,27 @@ type nodeInfo struct {
 // ----------------------------------------------------------------------------
 
 type store struct {
-	mu        sync.RWMutex
-	groups    groupDoc
-	creds     map[string]*credRecord // keyed by group id
-	inventory map[string]*nodeInfo   // keyed by node id
-	lamport   uint64
+	mu     sync.RWMutex
+	groups groupDoc
+	// One group is a peer set, not a primary/replica pair. Each member keeps its
+	// own current candidate, keyed by the signing origin; Lamport ordering only
+	// resolves successive credentials from the same origin.
+	creds map[string]map[string]*credRecord // group id -> origin node id -> candidate
+	// candidateHealth is an in-memory proof that this node has actually used a
+	// credential successfully. It is deliberately not persisted: a restart must
+	// prove the credential again instead of trusting a stale WORK status.
+	candidateHealth map[string]map[string]int64 // group id -> credential hash -> last proven unix second
+	inventory       map[string]*nodeInfo        // keyed by node id
+	lamport         uint64
 }
+
+const candidateLeaseSec int64 = 15 * 60
 
 func newStore() *store {
 	return &store{
-		creds:     make(map[string]*credRecord),
-		inventory: make(map[string]*nodeInfo),
+		creds:           make(map[string]map[string]*credRecord),
+		candidateHealth: make(map[string]map[string]int64),
+		inventory:       make(map[string]*nodeInfo),
 	}
 }
 
@@ -305,29 +326,81 @@ func (s *store) groupByID(id string) (group, bool) {
 func (s *store) getCred(groupID string) (*credRecord, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	r, ok := s.creds[groupID]
+	var newest *credRecord
+	for _, r := range s.creds[groupID] {
+		if newest == nil || r.dominates(newest) {
+			newest = r
+		}
+	}
+	return newest, newest != nil
+}
+
+func (s *store) getCredForOrigin(groupID, origin string) (*credRecord, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	r, ok := s.creds[groupID][origin]
 	return r, ok
+}
+
+func (s *store) credsForGroup(groupID string) []*credRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	byOrigin := s.creds[groupID]
+	out := make([]*credRecord, 0, len(byOrigin))
+	for _, r := range byOrigin {
+		out = append(out, r)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Origin < out[j].Origin })
+	return out
+}
+
+func (s *store) hasCredHash(groupID, hash string) bool {
+	if hash == "" {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, r := range s.creds[groupID] {
+		if r.CredHash == hash {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *store) credSnapshot() []*credRecord {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]*credRecord, 0, len(s.creds))
-	for _, r := range s.creds {
-		out = append(out, r)
+	var out []*credRecord
+	for _, byOrigin := range s.creds {
+		for _, r := range byOrigin {
+			out = append(out, r)
+		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].GroupID < out[j].GroupID })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].GroupID != out[j].GroupID {
+			return out[i].GroupID < out[j].GroupID
+		}
+		return out[i].Origin < out[j].Origin
+	})
 	return out
 }
 
 func (s *store) credDigests() []credDigest {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]credDigest, 0, len(s.creds))
-	for _, r := range s.creds {
-		out = append(out, digestOfCred(r))
+	var out []credDigest
+	for _, byOrigin := range s.creds {
+		for _, r := range byOrigin {
+			out = append(out, digestOfCred(r))
+		}
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].GroupID < out[j].GroupID })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].GroupID != out[j].GroupID {
+			return out[i].GroupID < out[j].GroupID
+		}
+		return out[i].Origin < out[j].Origin
+	})
 	return out
 }
 
@@ -341,8 +414,15 @@ func (s *store) localCredChange(id *identity, groupID, driver, mount string, pay
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if cur, ok := s.creds[groupID]; ok && cur.CredHash == h {
-		return nil, false // identical credential already known — no churn
+	byOrigin := s.creds[groupID]
+	if byOrigin == nil {
+		byOrigin = make(map[string]*credRecord)
+		s.creds[groupID] = byOrigin
+	}
+	for _, cur := range byOrigin {
+		if cur.CredHash == h {
+			return nil, false // a known candidate need not be re-authored
+		}
 	}
 	s.lamport++
 	r := &credRecord{
@@ -358,7 +438,7 @@ func (s *store) localCredChange(id *identity, groupID, driver, mount string, pay
 		UpdatedAt:    now,
 	}
 	r.Sig = id.sign(r.signingBytes())
-	s.creds[groupID] = r
+	byOrigin[id.NodeID] = r
 	return r, true
 }
 
@@ -368,7 +448,12 @@ func (s *store) mergeCred(r *credRecord) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.observe(r.Version)
-	cur, ok := s.creds[r.GroupID]
+	byOrigin := s.creds[r.GroupID]
+	if byOrigin == nil {
+		byOrigin = make(map[string]*credRecord)
+		s.creds[r.GroupID] = byOrigin
+	}
+	cur, ok := byOrigin[r.Origin]
 	if ok {
 		if cur.CredHash == r.CredHash {
 			return false // idempotent: same credential
@@ -378,7 +463,7 @@ func (s *store) mergeCred(r *credRecord) bool {
 		}
 	}
 	cp := *r
-	s.creds[r.GroupID] = &cp
+	byOrigin[r.Origin] = &cp
 	return true
 }
 
@@ -390,8 +475,14 @@ func (s *store) mergeCred(r *credRecord) bool {
 func (s *store) dropOwnCred(groupID, selfID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if r, ok := s.creds[groupID]; ok && r.Origin == selfID {
-		delete(s.creds, groupID)
+	if byOrigin := s.creds[groupID]; byOrigin != nil {
+		if _, ok := byOrigin[selfID]; !ok {
+			return false
+		}
+		delete(byOrigin, selfID)
+		if len(byOrigin) == 0 {
+			delete(s.creds, groupID)
+		}
 		return true
 	}
 	return false
@@ -408,8 +499,46 @@ func (s *store) pruneCreds() {
 	for id := range s.creds {
 		if _, ok := live[id]; !ok {
 			delete(s.creds, id)
+			delete(s.candidateHealth, id)
 		}
 	}
+}
+
+func (s *store) markCandidateHealthy(groupID, hash string, at int64) {
+	if groupID == "" || hash == "" || at <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	byHash := s.candidateHealth[groupID]
+	if byHash == nil {
+		byHash = make(map[string]int64)
+		s.candidateHealth[groupID] = byHash
+	}
+	byHash[hash] = at
+}
+
+func (s *store) forgetCandidateHealth(groupID, hash string) {
+	if groupID == "" || hash == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	byHash := s.candidateHealth[groupID]
+	delete(byHash, hash)
+	if len(byHash) == 0 {
+		delete(s.candidateHealth, groupID)
+	}
+}
+
+func (s *store) candidateHealthy(groupID, hash string, at int64) bool {
+	if groupID == "" || hash == "" || at <= 0 {
+		return false
+	}
+	s.mu.RLock()
+	provenAt := s.candidateHealth[groupID][hash]
+	s.mu.RUnlock()
+	return provenAt > 0 && at >= provenAt && at-provenAt <= candidateLeaseSec
 }
 
 // ---- inventory ----
@@ -478,8 +607,10 @@ func (s *store) export() persistedState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	ps := persistedState{Lamport: s.lamport, Groups: s.groups}
-	for _, r := range s.creds {
-		ps.Creds = append(ps.Creds, r)
+	for _, byOrigin := range s.creds {
+		for _, r := range byOrigin {
+			ps.Creds = append(ps.Creds, r)
+		}
 	}
 	for _, n := range s.inventory {
 		ps.Inventory = append(ps.Inventory, n)
@@ -491,14 +622,37 @@ func (s *store) load(ps persistedState) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.lamport = ps.Lamport
-	s.groups = ps.Groups
-	s.creds = make(map[string]*credRecord, len(ps.Creds))
+	if ps.Groups.verify() {
+		s.groups = ps.Groups
+	} else {
+		s.groups = groupDoc{}
+	}
+	s.creds = make(map[string]map[string]*credRecord)
+	s.candidateHealth = make(map[string]map[string]int64)
 	for _, r := range ps.Creds {
-		s.creds[r.GroupID] = r
+		if r == nil || r.GroupID == "" || r.Origin == "" || !r.verify() {
+			continue
+		}
+		byOrigin := s.creds[r.GroupID]
+		if byOrigin == nil {
+			byOrigin = make(map[string]*credRecord)
+			s.creds[r.GroupID] = byOrigin
+		}
+		if cur, ok := byOrigin[r.Origin]; !ok || r.dominates(cur) {
+			cp := *r
+			byOrigin[r.Origin] = &cp
+		}
+		if r.Version > s.lamport {
+			s.lamport = r.Version
+		}
 	}
 	s.inventory = make(map[string]*nodeInfo, len(ps.Inventory))
 	for _, n := range ps.Inventory {
-		s.inventory[n.NodeID] = n
+		if n == nil || n.NodeID == "" {
+			continue
+		}
+		cp := *n
+		s.inventory[n.NodeID] = &cp
 	}
 }
 

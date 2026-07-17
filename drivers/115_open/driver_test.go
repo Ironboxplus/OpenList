@@ -15,6 +15,8 @@ import (
 	"time"
 
 	sdk "github.com/OpenListTeam/115-sdk-go"
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	driverpkg "github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
@@ -192,6 +194,123 @@ func TestOpen115ShouldNotifyTokenValidForInvalidTransitionOrStaleStatus(t *testi
 	}
 	if driver.tokenInvalid.Load() {
 		t.Fatalf("expected tokenInvalid latch to be cleared")
+	}
+}
+
+func TestOpen115SDKClientUsesConfiguredProxy(t *testing.T) {
+	oldConf := conf.Conf
+	t.Cleanup(func() {
+		conf.Conf = oldConf
+	})
+
+	var gotURL string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURL = r.URL.String()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	t.Cleanup(proxy.Close)
+
+	conf.Conf = &conf.Config{ProxyAddress: proxy.URL}
+	client := sdk.New()
+	applySDKProxyIfConfigured(client)
+
+	resp, err := client.Request(
+		context.Background(),
+		"http://openlist-proxy-test.invalid/ping",
+		http.MethodGet,
+	)
+	if err != nil {
+		t.Fatalf("expected request to go through configured proxy: %v", err)
+	}
+	if resp.StatusCode() != http.StatusOK {
+		t.Fatalf("unexpected status via proxy: %d", resp.StatusCode())
+	}
+	if gotURL != "http://openlist-proxy-test.invalid/ping" {
+		t.Fatalf("proxy did not receive the absolute target URL, got %q", gotURL)
+	}
+}
+
+func TestOpen115InitRateLimitsAuthAndRootInfo(t *testing.T) {
+	const limitRate = 10.0
+
+	var (
+		mu       sync.Mutex
+		requests []recordedRequest
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("ParseForm failed: %v", err)
+		}
+		mu.Lock()
+		requests = append(requests, recordedRequest{
+			Path: r.URL.Path,
+			Form: cloneValues(r.Form),
+			Time: time.Now(),
+		})
+		mu.Unlock()
+
+		switch r.URL.Path {
+		case "/open/user/info":
+			writeSDKSuccess(t, w, map[string]any{})
+		case "/open/folder/get_info":
+			writeSDKSuccess(t, w, map[string]any{
+				"file_id":   "root-1",
+				"file_name": "Media",
+				"paths": []map[string]string{
+					{"file_id": "0", "file_name": ""},
+				},
+			})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	target, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("Parse server URL failed: %v", err)
+	}
+
+	oldNewClient := new115SDKClient
+	t.Cleanup(func() {
+		new115SDKClient = oldNewClient
+	})
+	new115SDKClient = func(opts ...sdk.Option) *sdk.Client {
+		client := sdk.New(opts...)
+		client.SetHttpClient(&http.Client{
+			Transport: &rewriteTransport{
+				target: target,
+				base:   http.DefaultTransport,
+			},
+		})
+		return client
+	}
+
+	driver := &Open115{Addition: Addition{
+		RootID:       driverpkg.RootID{RootFolderID: "root-1"},
+		AccessToken:  "test-access-token",
+		RefreshToken: "test-refresh-token",
+		LimitRate:    limitRate,
+	}}
+	driver.Storage.Status = "old init error"
+
+	if err := driver.Init(context.Background()); err != nil {
+		t.Fatalf("Init returned error: %v", err)
+	}
+	if driver.GetStorage().Status != op.WORK {
+		t.Fatalf("successful authenticated Init should restore storage status to work, got %q", driver.GetStorage().Status)
+	}
+
+	mu.Lock()
+	reqs := append([]recordedRequest(nil), requests...)
+	mu.Unlock()
+
+	assertRequestPaths(t, reqs, "/open/user/info", "/open/folder/get_info")
+	gap := reqs[1].Time.Sub(reqs[0].Time)
+	minGap := time.Duration(float64(time.Second) / limitRate * 0.7)
+	if gap < minGap {
+		t.Fatalf("Init SDK requests were too close (%v), expected at least %v; auth/root-info calls are not both rate-limited", gap, minGap)
 	}
 }
 
@@ -681,24 +800,24 @@ type mockFileStreamer struct {
 	data     []byte
 }
 
-func (m *mockFileStreamer) Read(p []byte) (int, error)                    { return 0, io.EOF }
-func (m *mockFileStreamer) Close() error                                  { return nil }
-func (m *mockFileStreamer) Add(_ io.Closer)                               {}
-func (m *mockFileStreamer) AddIfCloser(_ any)                             {}
-func (m *mockFileStreamer) GetSize() int64                                { return m.size }
-func (m *mockFileStreamer) GetName() string                               { return m.name }
-func (m *mockFileStreamer) ModTime() time.Time                            { return time.Time{} }
-func (m *mockFileStreamer) CreateTime() time.Time                         { return time.Time{} }
-func (m *mockFileStreamer) IsDir() bool                                   { return false }
-func (m *mockFileStreamer) GetHash() utils.HashInfo                       { return m.hashInfo }
-func (m *mockFileStreamer) GetID() string                                 { return "" }
-func (m *mockFileStreamer) GetPath() string                               { return "" }
-func (m *mockFileStreamer) GetMimetype() string                           { return "application/octet-stream" }
-func (m *mockFileStreamer) NeedStore() bool                               { return false }
-func (m *mockFileStreamer) IsForceStreamUpload() bool                     { return false }
-func (m *mockFileStreamer) GetExist() model.Obj                           { return nil }
-func (m *mockFileStreamer) SetExist(_ model.Obj)                          {}
-func (m *mockFileStreamer) GetFile() model.File                           { return nil }
+func (m *mockFileStreamer) Read(p []byte) (int, error) { return 0, io.EOF }
+func (m *mockFileStreamer) Close() error               { return nil }
+func (m *mockFileStreamer) Add(_ io.Closer)            {}
+func (m *mockFileStreamer) AddIfCloser(_ any)          {}
+func (m *mockFileStreamer) GetSize() int64             { return m.size }
+func (m *mockFileStreamer) GetName() string            { return m.name }
+func (m *mockFileStreamer) ModTime() time.Time         { return time.Time{} }
+func (m *mockFileStreamer) CreateTime() time.Time      { return time.Time{} }
+func (m *mockFileStreamer) IsDir() bool                { return false }
+func (m *mockFileStreamer) GetHash() utils.HashInfo    { return m.hashInfo }
+func (m *mockFileStreamer) GetID() string              { return "" }
+func (m *mockFileStreamer) GetPath() string            { return "" }
+func (m *mockFileStreamer) GetMimetype() string        { return "application/octet-stream" }
+func (m *mockFileStreamer) NeedStore() bool            { return false }
+func (m *mockFileStreamer) IsForceStreamUpload() bool  { return false }
+func (m *mockFileStreamer) GetExist() model.Obj        { return nil }
+func (m *mockFileStreamer) SetExist(_ model.Obj)       {}
+func (m *mockFileStreamer) GetFile() model.File        { return nil }
 func (m *mockFileStreamer) RangeRead(_ http_range.Range) (io.Reader, error) {
 	return strings.NewReader(string(m.data)), nil
 }

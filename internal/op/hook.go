@@ -119,7 +119,23 @@ func RegisterStorageHook(hook StorageHook) {
 // propagating the broken token. Drivers may call this when an API call fails with
 // an unrecoverable auth error.
 func NotifyStorageTokenInvalid(storage driver.Driver) {
+	markStorageTokenInvalidStatus(storage)
 	go callStorageHooks("token-invalid", storage)
+}
+
+func markStorageTokenInvalidStatus(storage driver.Driver) {
+	st := storage.GetStorage()
+	if st == nil || st.Disabled || st.Status != WORK {
+		return
+	}
+	const invalidStatus = "token invalid"
+	st.SetStatus(invalidStatus)
+	if st.ID == 0 {
+		return
+	}
+	if err := db.UpdateStorageStatus(st.ID, invalidStatus); err != nil {
+		log.Errorf("failed mark storage token invalid: %s", err)
+	}
 }
 
 // NotifyStorageTokenValid signals that a storage's credentials were just proven

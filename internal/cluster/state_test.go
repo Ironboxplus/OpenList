@@ -114,6 +114,23 @@ func TestGroupDocSignAndMerge(t *testing.T) {
 	}
 }
 
+func TestGroupDocRejectsNonCanonicalVersionZero(t *testing.T) {
+	if !(&groupDoc{}).verify() {
+		t.Fatal("the empty bootstrap document must remain valid")
+	}
+	id, _ := newIdentity()
+	forged := &groupDoc{
+		Groups:    []group{{ID: "g1", Members: []member{{NodeID: id.NodeID, MountPath: "/115"}}}},
+		Origin:    id.NodeID,
+		OriginPub: id.Pub,
+		UpdatedAt: 1,
+	}
+	forged.Sig = id.sign(forged.signingBytes())
+	if forged.verify() {
+		t.Fatal("a non-empty version-zero group document must be rejected")
+	}
+}
+
 func TestGroupsForMount(t *testing.T) {
 	id, _ := newIdentity()
 	s := newStore()
@@ -166,6 +183,70 @@ func TestCredRecordMergeLWW(t *testing.T) {
 	// idempotent merge of identical hash.
 	if s.mergeCred(r2) {
 		t.Fatal("merging identical credential must be a no-op")
+	}
+}
+
+// A group is a peer set, not a primary/replica pair. A newer credential from
+// one healthy member must never erase a different member's candidate: each
+// origin owns its current candidate and nodes choose what to activate locally.
+func TestCredRecordMergePreservesCandidatesFromIndependentOrigins(t *testing.T) {
+	id1, _ := newIdentity()
+	id2, _ := newIdentity()
+	s := newStore()
+
+	payloadA := map[string]json.RawMessage{"refresh_token": json.RawMessage(`"A"`)}
+	if _, ok := s.localCredChange(id1, "g1", "115", "/115-a", payloadA, 1); !ok {
+		t.Fatal("local candidate should be recorded")
+	}
+
+	payloadB := map[string]json.RawMessage{"refresh_token": json.RawMessage(`"B"`)}
+	peer := &credRecord{
+		GroupID:      "g1",
+		OriginDriver: "115",
+		Fields:       []string{"refresh_token"},
+		Payload:      payloadB,
+		Version:      99, // Must not make this origin a group-wide primary.
+		Origin:       id2.NodeID,
+		OriginPub:    id2.Pub,
+		OriginMount:  "/115-b",
+		CredHash:     credHash(payloadB),
+	}
+	peer.Sig = id2.sign(peer.signingBytes())
+	if !s.mergeCred(peer) {
+		t.Fatal("peer candidate should merge")
+	}
+
+	got := s.credSnapshot()
+	if len(got) != 2 {
+		t.Fatalf("candidate count = %d, want 2 independent origins; snapshot=%#v", len(got), got)
+	}
+	seen := map[string]string{}
+	for _, candidate := range got {
+		seen[candidate.Origin] = candidate.CredHash
+	}
+	if seen[id1.NodeID] != credHash(payloadA) || seen[id2.NodeID] != credHash(payloadB) {
+		t.Fatalf("candidate origins were not preserved: %#v", seen)
+	}
+}
+
+func TestCandidateHealthLeaseExpires(t *testing.T) {
+	s := newStore()
+	const groupID = "g1"
+	const hash = "candidate-hash"
+	const provenAt int64 = 1_000
+
+	s.markCandidateHealthy(groupID, hash, provenAt)
+	if !s.candidateHealthy(groupID, hash, provenAt+candidateLeaseSec) {
+		t.Fatal("candidate must remain offerable through its health lease")
+	}
+	if s.candidateHealthy(groupID, hash, provenAt+candidateLeaseSec+1) {
+		t.Fatal("idle candidate must stop being offerable after its health lease")
+	}
+
+	s.markCandidateHealthy(groupID, hash, provenAt)
+	s.forgetCandidateHealth(groupID, hash)
+	if s.candidateHealthy(groupID, hash, provenAt) {
+		t.Fatal("token-invalid must revoke the health lease immediately")
 	}
 }
 
@@ -222,11 +303,9 @@ func TestDropOwnCred(t *testing.T) {
 	}
 }
 
-// canOfferCred enforces "only share a token proven valid": a peer's record is
-// always relayable, but our OWN record is offered only while our token for that
-// group is healthy. With no matching group/healthy mount, ownTokenHealthy is
-// false so our own record must not be advertised (no poisoning peers with a
-// stale/boot token).
+// canOfferCred enforces "only share a token proven valid" for every candidate.
+// Receiving a signed peer record is not proof that this node can use it, so it
+// must not turn this node into a blind relay for an unvalidated credential.
 func TestCanOfferCred(t *testing.T) {
 	id1, _ := newIdentity() // self
 	id2, _ := newIdentity() // peer
@@ -236,16 +315,56 @@ func TestCanOfferCred(t *testing.T) {
 		t.Fatal("a nil record is never offerable")
 	}
 
-	// peer-authored record -> always offerable (relay).
+	// A peer-authored record is not offerable without a matching local healthy
+	// mount. This manager has neither a group nor a live validated candidate.
 	peer := &credRecord{GroupID: "g1", Origin: id2.NodeID}
-	if !m.canOfferCred(peer) {
-		t.Fatal("a peer-authored record must always be offerable")
+	if m.canOfferCred(peer) {
+		t.Fatal("a peer-authored record must NOT be relayed before local validation")
 	}
 
 	// our own record, but no group/healthy mount -> not offerable.
 	own := &credRecord{GroupID: "g1", Origin: id1.NodeID}
 	if m.canOfferCred(own) {
 		t.Fatal("our own record must NOT be offered when the token is not proven healthy")
+	}
+}
+
+func TestAbsorbCredsRejectsUnauthorizedOriginMount(t *testing.T) {
+	admin, _ := newIdentity()
+	memberID, _ := newIdentity()
+	localID, _ := newIdentity()
+	s := newStore()
+	s.setGroups(admin, []group{{
+		ID:      "g1",
+		Members: []member{{NodeID: memberID.NodeID, MountPath: "/115"}},
+	}}, 1)
+	m := &Manager{id: localID, state: s, cfgStore: &configStore{cfg: Config{ApplyRemote: false}}}
+
+	payload := map[string]json.RawMessage{"refresh_token": json.RawMessage(`"candidate"`)}
+	bad := &credRecord{
+		GroupID:      "g1",
+		OriginDriver: "115 Open",
+		Fields:       []string{"refresh_token"},
+		Payload:      payload,
+		CredHash:     credHash(payload),
+		Version:      2,
+		Origin:       memberID.NodeID,
+		OriginPub:    memberID.Pub,
+		OriginMount:  "/not-a-group-member",
+	}
+	bad.Sig = memberID.sign(bad.signingBytes())
+	if got := m.absorbCreds([]*credRecord{bad}); len(got) != 0 {
+		t.Fatalf("unauthorized origin mount was accepted: %#v", got)
+	}
+	if _, ok := s.getCredForOrigin("g1", memberID.NodeID); ok {
+		t.Fatal("unauthorized credential must not enter replicated state")
+	}
+
+	good := *bad
+	good.OriginMount = "/115"
+	good.Sig = memberID.sign(good.signingBytes())
+	if got := m.absorbCreds([]*credRecord{&good}); len(got) != 1 {
+		t.Fatalf("authorized group member credential rejected: %#v", got)
 	}
 }
 

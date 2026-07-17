@@ -359,8 +359,14 @@ func (m *Manager) seedLocalCreds() {
 			continue
 		}
 		creds := extractCreds(st.Addition)
+		credID := credHash(creds)
 		for _, g := range groups {
+			if m.state.hasCredHash(g.ID, credID) {
+				m.state.markCandidateHealthy(g.ID, credID, now())
+				continue // keep the original peer signature when the token is identical
+			}
 			if rec, ok := m.state.localCredChange(m.id, g.ID, st.Driver, st.MountPath, creds, now()); ok {
+				m.state.markCandidateHealthy(g.ID, rec.CredHash, now())
 				changed = true
 				m.recordEvent("share", g.ID, fmt.Sprintf("%s shared %d credential field(s)", st.MountPath, len(rec.Fields)))
 				m.broadcast(&syncMessage{Type: "push", Creds: []*credRecord{rec}})
@@ -372,13 +378,9 @@ func (m *Manager) seedLocalCreds() {
 		if len(g.mountsForNode(selfID)) == 0 {
 			continue
 		}
-		if _, ok := m.state.getCred(g.ID); !ok {
+		if len(m.state.credsForGroup(g.ID)) == 0 {
 			m.pullGroup(g.ID)
 		}
-	}
-	// (re)apply held credentials to local mounts.
-	for _, r := range m.state.credSnapshot() {
-		m.applyCredRecord(r)
 	}
 	if changed {
 		m.persist()
@@ -413,9 +415,15 @@ func (m *Manager) onStorageHook(typ string, d driver.Driver) {
 			return
 		}
 		creds := extractCreds(st.Addition)
+		credID := credHash(creds)
 		var dirty bool
 		for _, g := range groups {
+			if m.state.hasCredHash(g.ID, credID) {
+				m.state.markCandidateHealthy(g.ID, credID, now())
+				continue
+			}
 			if rec, ok := m.state.localCredChange(m.id, g.ID, st.Driver, st.MountPath, creds, now()); ok {
+				m.state.markCandidateHealthy(g.ID, rec.CredHash, now())
 				dirty = true
 				m.recordEvent("share", g.ID, fmt.Sprintf("%s refreshed credentials", st.MountPath))
 				m.broadcast(&syncMessage{Type: "push", Creds: []*credRecord{rec}})
@@ -432,7 +440,9 @@ func (m *Manager) onStorageHook(typ string, d driver.Driver) {
 		// version can't out-rank a peer's valid one, then pull a fresh credential
 		// from a healthy peer.
 		var dropped bool
+		credID := credHash(extractCreds(st.Addition))
 		for _, g := range groups {
+			m.state.forgetCandidateHealth(g.ID, credID)
 			if m.state.dropOwnCred(g.ID, m.id.NodeID) {
 				dropped = true
 				m.recordEvent("invalidate", g.ID,
@@ -454,11 +464,14 @@ func (m *Manager) pullGroup(groupID string) {
 	m.broadcast(&syncMessage{Type: "pull", Wants: []string{groupID}})
 }
 
-// ownTokenHealthy reports whether THIS node currently holds a working token for a
-// group — at least one of our member mounts is in the WORK state (its last auth
-// attempt succeeded). It is the "token proven valid" gate.
-func (m *Manager) ownTokenHealthy(groupID string) bool {
-	g, ok := m.state.groupByID(groupID)
+// hasHealthyLocalCandidate reports whether this node is currently using this
+// exact credential successfully. A signed record received from a peer is not
+// evidence that it works on this machine.
+func (m *Manager) hasHealthyLocalCandidate(r *credRecord) bool {
+	if r == nil || !m.state.candidateHealthy(r.GroupID, r.CredHash, now()) {
+		return false
+	}
+	g, ok := m.state.groupByID(r.GroupID)
 	if !ok {
 		return false
 	}
@@ -467,26 +480,25 @@ func (m *Manager) ownTokenHealthy(groupID string) bool {
 		if err != nil {
 			continue
 		}
-		if d.GetStorage().Status == op.WORK {
+		st := d.GetStorage()
+		if st.Status != op.WORK {
+			continue
+		}
+		if r.OriginDriver != "" && st.Driver != r.OriginDriver {
+			continue
+		}
+		if credHash(extractCreds(st.Addition)) == r.CredHash {
 			return true
 		}
 	}
 	return false
 }
 
-// canOfferCred reports whether this node may advertise/relay a credential record
-// in anti-entropy. Records authored by peers are always relayable. Our OWN record
-// is offered only while our token for that group is healthy — so a node booting
-// with a stale persisted token (or whose token just died) never poisons peers
-// with it: "only share a token proven valid".
+// canOfferCred reports whether this node may advertise a credential candidate.
+// Receiving a record does not turn this node into a blind relay: it must first
+// be proven by a matching local working mount within the health lease.
 func (m *Manager) canOfferCred(r *credRecord) bool {
-	if r == nil {
-		return false
-	}
-	if r.Origin != m.id.NodeID {
-		return true
-	}
-	return m.ownTokenHealthy(r.GroupID)
+	return m.hasHealthyLocalCandidate(r)
 }
 
 // offerableDigests is credDigests() filtered to records this node may advertise.
@@ -523,6 +535,11 @@ func (m *Manager) applyCredRecord(r *credRecord) {
 		if r.OriginDriver != "" && st.Driver != r.OriginDriver {
 			utils.Log.Warnf("[cluster] skip applying %s creds to %s: driver mismatch (%s != %s)",
 				r.GroupID, mp, st.Driver, r.OriginDriver)
+			continue
+		}
+		if st.Status == op.WORK {
+			// A peer's newer Lamport value is a recovery candidate, not authority
+			// to overwrite credentials this mount has already proved locally.
 			continue
 		}
 		newAdd, changed := applyCreds(st.Addition, r.Payload)
@@ -571,7 +588,7 @@ func (m *Manager) absorbGroups(d *groupDoc) bool {
 func (m *Manager) absorbCreds(recs []*credRecord) []*credRecord {
 	var merged []*credRecord
 	for _, r := range recs {
-		if r == nil || !r.verify() {
+		if r == nil || !r.verify() || !m.credentialAuthorized(r) {
 			continue
 		}
 		if m.state.mergeCred(r) {
@@ -583,6 +600,25 @@ func (m *Manager) absorbCreds(recs []*credRecord) []*credRecord {
 		m.persist()
 	}
 	return merged
+}
+
+// credentialAuthorized verifies that a record signer is an explicit member of
+// the signed group at the exact mount it claims. The signature proves who wrote
+// the record; the group document proves that writer may supply this group.
+func (m *Manager) credentialAuthorized(r *credRecord) bool {
+	if r == nil || r.GroupID == "" || r.Origin == "" || r.OriginMount == "" {
+		return false
+	}
+	g, ok := m.state.groupByID(r.GroupID)
+	if !ok {
+		return false
+	}
+	for _, member := range g.Members {
+		if member.NodeID == r.Origin && member.MountPath == r.OriginMount {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- anti-entropy reply ----
@@ -598,42 +634,67 @@ func (m *Manager) buildReply(in *syncMessage) *syncMessage {
 		reply.Groups = &local
 	}
 
-	// Credential anti-entropy on digests.
+	// Credential anti-entropy is per (group, origin) candidate. A group-level
+	// LWW exchange would silently promote one member into a primary and discard
+	// the independent recovery paths held by the other members.
 	peerHas := make(map[string]credDigest, len(in.CredDigests))
+	wanted := make(map[string]struct{})
+	offered := make(map[string]struct{})
+	appendWant := func(groupID string) {
+		if groupID == "" {
+			return
+		}
+		if _, exists := wanted[groupID]; exists {
+			return
+		}
+		wanted[groupID] = struct{}{}
+		reply.Wants = append(reply.Wants, groupID)
+	}
+	appendCred := func(r *credRecord) {
+		if r == nil || !m.canOfferCred(r) {
+			return
+		}
+		key := credDigestKey(digestOfCred(r))
+		if _, exists := offered[key]; exists {
+			return
+		}
+		offered[key] = struct{}{}
+		reply.Creds = append(reply.Creds, r)
+	}
 	for _, dg := range in.CredDigests {
-		peerHas[dg.GroupID] = dg
-		cur, ok := m.state.getCred(dg.GroupID)
+		if dg.GroupID == "" || dg.Origin == "" {
+			continue
+		}
+		key := credDigestKey(dg)
+		peerHas[key] = dg
+		cur, ok := m.state.getCredForOrigin(dg.GroupID, dg.Origin)
 		if !ok {
-			reply.Wants = append(reply.Wants, dg.GroupID)
+			appendWant(dg.GroupID)
 			continue
 		}
 		mine := digestOfCred(cur)
 		switch {
 		case credDigestDominates(mine, dg):
-			// Offer ours only if we may (own cred must be healthy). If we can't
-			// offer it (our token is stale/dead), pull theirs instead — this is
-			// what lets a node with a higher-versioned but DEAD credential still
-			// recover from a peer's lower-versioned but VALID one.
 			if m.canOfferCred(cur) {
-				reply.Creds = append(reply.Creds, cur)
+				appendCred(cur)
 			} else {
-				reply.Wants = append(reply.Wants, dg.GroupID)
+				appendWant(dg.GroupID)
 			}
 		case credDigestDominates(dg, mine):
-			reply.Wants = append(reply.Wants, dg.GroupID)
+			appendWant(dg.GroupID)
 		}
 	}
 	// Records we hold the peer never mentioned.
 	for _, cur := range m.state.credSnapshot() {
-		if _, seen := peerHas[cur.GroupID]; !seen && m.canOfferCred(cur) {
-			reply.Creds = append(reply.Creds, cur)
+		if _, seen := peerHas[credDigestKey(digestOfCred(cur))]; !seen {
+			appendCred(cur)
 		}
 	}
 
-	// Explicit pull wants.
+	// An explicit pull requests every locally-proven candidate in the group.
 	for _, gid := range in.Wants {
-		if cur, ok := m.state.getCred(gid); ok && m.canOfferCred(cur) {
-			reply.Creds = append(reply.Creds, cur)
+		for _, cur := range m.state.credsForGroup(gid) {
+			appendCred(cur)
 		}
 	}
 
@@ -746,8 +807,17 @@ func (m *Manager) handleFrame(c *peerConn, data []byte) {
 	}
 	// Credentials.
 	if merged := m.absorbCreds(msg.Creds); len(merged) > 0 {
-		relay.Creds = merged
-		relayHas = true
+		// A relay must not amplify a peer credential merely because its signature
+		// was valid. Only candidates that this node has actually proven locally
+		// may leave this node again.
+		for _, r := range merged {
+			if m.canOfferCred(r) {
+				relay.Creds = append(relay.Creds, r)
+			}
+		}
+		if len(relay.Creds) > 0 {
+			relayHas = true
+		}
 	}
 	if relayHas {
 		m.relayMsg(relay, c)

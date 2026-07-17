@@ -61,3 +61,28 @@ func TestNotifyStorageTokenValidRestoresStatus(t *testing.T) {
 		t.Fatalf("persisted status = %q, want %q", got.Status, op.WORK)
 	}
 }
+func TestNotifyStorageTokenInvalidMarksStatusAndPersists(t *testing.T) {
+	storage := model.Storage{
+		Driver:    "TokenInvalidTest",
+		MountPath: "/token-invalid-status",
+		Status:    op.WORK,
+		Addition:  "{}",
+	}
+	if err := db.CreateStorage(&storage); err != nil {
+		t.Fatalf("CreateStorage failed: %v", err)
+	}
+
+	d := &tokenValidStorageDriver{Storage: storage}
+	op.NotifyStorageTokenInvalid(d)
+
+	if d.GetStorage().Status == op.WORK {
+		t.Fatal("token-invalid must make the in-memory storage non-work before recovery hooks run")
+	}
+	got, err := db.GetStorageById(storage.ID)
+	if err != nil {
+		t.Fatalf("GetStorageById failed: %v", err)
+	}
+	if got.Status == op.WORK {
+		t.Fatal("token-invalid must persist a non-work status before peer recovery")
+	}
+}
