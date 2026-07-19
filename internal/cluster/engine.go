@@ -693,14 +693,25 @@ func probeCredential(ctx context.Context, storage model.Storage, addition string
 		return err
 	}
 	temporary := constructor()
-	storage.Addition = addition
-	temporary.SetStorage(storage)
-	if err := utils.Json.UnmarshalFromString(storage.Addition, temporary.GetAddition()); err != nil {
+	probe := newProbeStorage(storage, addition)
+	temporary.SetStorage(probe)
+	if err := utils.Json.UnmarshalFromString(probe.Addition, temporary.GetAddition()); err != nil {
 		return err
 	}
 	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 	return temporary.Init(probeCtx)
+}
+
+// newProbeStorage gives a temporary driver the candidate fields but no ownership
+// of the persisted storage row. Some production drivers report an authenticated
+// Init through lifecycle hooks; ID=0 prevents such a callback from changing the
+// live row, and WORK prevents a successful probe from emitting token-valid.
+func newProbeStorage(live model.Storage, addition string) model.Storage {
+	live.ID = 0
+	live.Status = op.WORK
+	live.Addition = addition
+	return live
 }
 
 func isProvider401(err error) bool {

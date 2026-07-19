@@ -180,6 +180,34 @@ func TestOnlyTokenValidMayPublishStoragePair(t *testing.T) {
 	}
 }
 
+// Candidate verification must be hermetic with respect to the live storage
+// record. A temporary driver's successful Init can emit lifecycle callbacks, so
+// its storage identity must never point at the persisted mount being recovered.
+func TestProbeStorageIsEphemeralAndKeepsCandidateAddition(t *testing.T) {
+	live := model.Storage{
+		ID:        42,
+		MountPath: "/storage/115",
+		Driver:    "115 Open",
+		Status:    "token invalid",
+		Addition:  `{"access_token":"old","refresh_token":"old"}`,
+	}
+	candidate := `{"access_token":"new","refresh_token":"new"}`
+
+	probe := newProbeStorage(live, candidate)
+	if probe.ID != 0 {
+		t.Fatalf("probe storage ID = %d, want 0 so callbacks cannot write the live row", probe.ID)
+	}
+	if probe.Status != op.WORK {
+		t.Fatalf("probe storage status = %q, want %q to suppress token-valid lifecycle writes", probe.Status, op.WORK)
+	}
+	if probe.Addition != candidate {
+		t.Fatalf("probe addition = %q, want candidate payload", probe.Addition)
+	}
+	if probe.MountPath != live.MountPath || probe.Driver != live.Driver {
+		t.Fatalf("probe changed mount identity: %#v", probe)
+	}
+}
+
 func TestCredHashIdempotent(t *testing.T) {
 	a := map[string]json.RawMessage{"refresh_token": json.RawMessage(`"x"`), "access_token": json.RawMessage(`"y"`)}
 	b := map[string]json.RawMessage{"access_token": json.RawMessage(`"y"`), "refresh_token": json.RawMessage(`"x"`)}
