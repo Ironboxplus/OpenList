@@ -19,18 +19,20 @@ import (
 //   - Groups:      the shared sync-group document (LWW).
 //   - GroupsVer:   the sender's groups version, for cheap anti-entropy.
 //   - Creds:       credential records being offered (push, or reply to a Want).
+//   - Revocations: source-signed tombstones for invalidated credential records.
 //   - CredDigests: compact, no-secret advert of the credential records the sender
 //     holds, so the receiver can detect what it is missing.
 //   - Wants:       group ids the sender wants the receiver to send creds for.
 type syncMessage struct {
-	Type        string        `json:"type"` // "hello" | "push" | "announce" | "pull" | "reply"
-	Node        *nodeInfo     `json:"node,omitempty"`
-	Nodes       []*nodeInfo   `json:"nodes,omitempty"`
-	Groups      *groupDoc     `json:"groups,omitempty"`
-	GroupsVer   uint64        `json:"groups_ver,omitempty"`
-	Creds       []*credRecord `json:"creds,omitempty"`
-	CredDigests []credDigest  `json:"cred_digests,omitempty"`
-	Wants       []string      `json:"wants,omitempty"`
+	Type        string            `json:"type"` // "hello" | "push" | "announce" | "pull" | "reply"
+	Node        *nodeInfo         `json:"node,omitempty"`
+	Nodes       []*nodeInfo       `json:"nodes,omitempty"`
+	Groups      *groupDoc         `json:"groups,omitempty"`
+	GroupsVer   uint64            `json:"groups_ver,omitempty"`
+	Creds       []*credRecord     `json:"creds,omitempty"`
+	Revocations []*credRevocation `json:"revocations,omitempty"`
+	CredDigests []credDigest      `json:"cred_digests,omitempty"`
+	Wants       []string          `json:"wants,omitempty"`
 }
 
 // envelope is the outer, on-the-wire structure. Its Cipher is the syncMessage

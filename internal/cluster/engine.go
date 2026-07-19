@@ -27,6 +27,10 @@ const (
 	peerLivenessSec = 130
 	// maxEvents bounds the in-memory activity log surfaced to the UI.
 	maxEvents = 60
+	// candidateRecoveryCooldown prevents an invalid mount from cycling through
+	// every persisted credential on each caller retry. A new credential push is
+	// still applied immediately; this only bounds local fallback attempts.
+	candidateRecoveryCooldown = 5 * time.Minute
 )
 
 // Manager is the running cluster credential-sync engine for this node.
@@ -42,6 +46,7 @@ type Manager struct {
 
 	recoveryMu    sync.Mutex
 	recoveryLocks map[string]*sync.Mutex // per local mount: serialize credential adoption
+	recoveryLast  map[string]time.Time
 
 	dialMu  sync.Mutex
 	dialing map[string]bool // peer URLs with an in-flight/live outbound dial
@@ -80,6 +85,7 @@ func Init(dataDir string) (*Manager, error) {
 		conns:         newConnRegistry(),
 		dialing:       make(map[string]bool),
 		recoveryLocks: make(map[string]*sync.Mutex),
+		recoveryLast:  make(map[string]time.Time),
 		stopCh:        make(chan struct{}),
 	}
 	if _, err := m.cfgStore.loadOrInit(); err != nil {
@@ -298,6 +304,7 @@ func (m *Manager) helloMessage() *syncMessage {
 		Nodes:       m.knownNodesForPEX(),
 		Groups:      &gd,
 		GroupsVer:   gd.Version,
+		Revocations: m.state.revocationSnapshot(),
 		CredDigests: m.offerableDigests(),
 	}
 }
@@ -312,6 +319,7 @@ func (m *Manager) announceMessage() *syncMessage {
 		Nodes:       m.knownNodesForPEX(),
 		Groups:      &gd,
 		GroupsVer:   gd.Version,
+		Revocations: m.state.revocationSnapshot(),
 		CredDigests: m.offerableDigests(),
 	}
 }
@@ -357,8 +365,9 @@ func (m *Manager) seedLocalCreds() {
 			// it can't dominate a peer's valid one. Persisted peer candidates are
 			// tried before a network pull so restart recovery also works offline.
 			for _, g := range groups {
-				if m.state.dropOwnCred(g.ID, m.id.NodeID, st.MountPath) {
+				if rev, ok := m.revokeOwnCandidate(g.ID, st.MountPath); ok {
 					changed = true
+					m.broadcast(&syncMessage{Type: "push", Revocations: []*credRevocation{rev}})
 				}
 				for _, candidate := range m.state.credsForGroup(g.ID) {
 					m.applyCredRecord(candidate)
@@ -396,6 +405,14 @@ func (m *Manager) seedLocalCreds() {
 	if changed {
 		m.persist()
 	}
+}
+
+// revokeOwnCandidate removes the local source candidate and returns a signed
+// tombstone that every relay can retain. The tombstone's version is newer than
+// the removed credential, so an old relay replay cannot re-enter state while a
+// future credential rotation from this source remains valid.
+func (m *Manager) revokeOwnCandidate(groupID, mount string) (*credRevocation, bool) {
+	return m.state.revokeOwnCred(m.id, groupID, mount, now())
 }
 
 // onStorageHook reacts to local storage lifecycle/credential changes.
@@ -455,19 +472,26 @@ func (m *Manager) onStorageHook(typ string, d driver.Driver) {
 		}
 		// Our token died. Drop our own (now-stale) credential record so its Lamport
 		// version can't out-rank a peer's valid one, then pull a fresh credential
-		// from a healthy peer.
-		var dropped bool
+		// from a healthy peer. The currently-used credential is quarantined for
+		// this mount even when it originated on a peer: that prevents a restart
+		// from immediately retrying the exact 40140125/26 candidate.
+		var changed bool
 		credID := credHash(extractCreds(st.Addition))
 		for _, g := range groups {
 			m.state.forgetCandidateHealth(g.ID, credID)
-			if m.state.dropOwnCred(g.ID, m.id.NodeID, st.MountPath) {
-				dropped = true
+			m.state.markCandidateFailed(g.ID, st.MountPath, credID, now())
+			changed = true
+			if rev, ok := m.revokeOwnCandidate(g.ID, st.MountPath); ok {
 				m.recordEvent("invalidate", g.ID,
 					fmt.Sprintf("%s token invalid — dropped local cred, pulling from peers", st.MountPath))
+				m.broadcast(&syncMessage{Type: "push", Revocations: []*credRevocation{rev}})
+			} else {
+				m.recordEvent("invalidate", g.ID,
+					fmt.Sprintf("%s token invalid — quarantined failed peer candidate", st.MountPath))
 			}
-			m.pullGroup(g.ID)
+			go m.recoverKnownCandidates(g.ID, st.MountPath, credID)
 		}
-		if dropped {
+		if changed {
 			m.persist()
 		}
 	}
@@ -492,8 +516,50 @@ func (m *Manager) onStorageHealthy(d driver.Driver) {
 	for _, g := range m.state.groupsForMount(m.id.NodeID, st.MountPath) {
 		if m.state.hasCredHash(g.ID, credID) {
 			m.state.markCandidateHealthy(g.ID, credID, now())
+			m.state.clearCandidateFailed(g.ID, st.MountPath, credID)
 		}
 	}
+}
+
+func (m *Manager) beginCandidateRecovery(groupID, mount string) bool {
+	key := groupID + "\x00" + mount
+	m.recoveryMu.Lock()
+	defer m.recoveryMu.Unlock()
+	n := time.Now()
+	if last := m.recoveryLast[key]; !last.IsZero() && n.Sub(last) < candidateRecoveryCooldown {
+		return false
+	}
+	m.recoveryLast[key] = n
+	return true
+}
+
+// recoverKnownCandidates tries already-held alternatives once, in deterministic
+// order, after a token dies. It never refreshes on a timer: each candidate is
+// attempted at most once per mount per cooldown window, then a pull waits for a
+// peer to publish a genuinely newer credential.
+func (m *Manager) recoverKnownCandidates(groupID, mount, failedHash string) {
+	if !m.beginCandidateRecovery(groupID, mount) {
+		return
+	}
+	changed := false
+	for _, candidate := range m.state.recoveryCandidates(groupID, mount, failedHash) {
+		if !m.credentialAuthorized(candidate) {
+			continue
+		}
+		attempted, ok := m.applyCredRecordToMount(candidate, mount)
+		if !attempted {
+			continue
+		}
+		if ok {
+			return
+		}
+		m.state.markCandidateFailed(groupID, mount, candidate.CredHash, now())
+		changed = true
+	}
+	if changed {
+		m.persist()
+	}
+	m.pullGroup(groupID)
 }
 
 // pullGroup asks peers for the latest credential of a group.
@@ -587,40 +653,53 @@ func (m *Manager) applyCredRecord(r *credRecord) {
 	if !ok {
 		return
 	}
-	ctx := context.Background()
 	for _, mp := range g.mountsForNode(m.id.NodeID) {
+		m.applyCredRecordToMount(r, mp)
+	}
+}
+
+// applyCredRecordToMount adopts one candidate on one local mount. It returns
+// whether a re-initialization was attempted and whether it completed with a
+// working storage; recovery uses that distinction to quarantine only candidates
+// that actually failed on this node.
+func (m *Manager) applyCredRecordToMount(r *credRecord, mp string) (attempted, success bool) {
+	if r == nil || !m.cfgStore.get().ApplyRemote || m.state.candidateFailed(r.GroupID, mp, r.CredHash) {
+		return false, false
+	}
+	ctx := context.Background()
+	{
 		lock := m.recoveryLock(mp)
 		lock.Lock()
-		func() {
-			defer lock.Unlock()
-			d, err := op.GetStorageByMountPath(mp)
-			if err != nil {
-				return
-			}
-			st := *d.GetStorage() // copy; preserve ID/Status/local fields
-			if r.OriginDriver != "" && st.Driver != r.OriginDriver {
-				utils.Log.Warnf("[cluster] skip applying %s creds to %s: driver mismatch (%s != %s)",
-					r.GroupID, mp, st.Driver, r.OriginDriver)
-				return
-			}
-			if st.Status == op.WORK {
-				// A peer's newer Lamport value is a recovery candidate, not authority
-				// to overwrite credentials this mount has already proved locally.
-				return
-			}
-			newAdd, changed := applyCreds(st.Addition, r.Payload)
-			if !changed {
-				return // already has these credentials — no churn, no re-init
-			}
-			st.Addition = newAdd
-			if err := op.UpdateStorage(ctx, st); err != nil {
-				utils.Log.Warnf("[cluster] apply creds to %s failed: %v", mp, err)
-				return
-			}
-			m.recordEvent("apply", r.GroupID, fmt.Sprintf("%s adopted credentials from %s", mp, shortNode(r.Origin)))
-			utils.Log.Infof("[cluster] applied group %s credentials to %s (v%d from %s)", r.GroupID, mp, r.Version, r.Origin)
-		}()
+		defer lock.Unlock()
+		d, err := op.GetStorageByMountPath(mp)
+		if err != nil {
+			return false, false
+		}
+		st := *d.GetStorage() // copy; preserve ID/Status/local fields
+		if r.OriginDriver != "" && st.Driver != r.OriginDriver {
+			utils.Log.Warnf("[cluster] skip applying %s creds to %s: driver mismatch (%s != %s)",
+				r.GroupID, mp, st.Driver, r.OriginDriver)
+			return false, false
+		}
+		if st.Status == op.WORK {
+			// A peer's newer Lamport value is a recovery candidate, not authority
+			// to overwrite credentials this mount has already proved locally.
+			return false, false
+		}
+		newAdd, changed := applyCreds(st.Addition, r.Payload)
+		if !changed {
+			return false, false // already has these credentials — no churn, no re-init
+		}
+		st.Addition = newAdd
+		if err := op.UpdateStorage(ctx, st); err != nil {
+			utils.Log.Warnf("[cluster] apply creds to %s failed: %v", mp, err)
+			return true, false
+		}
+		m.recordEvent("apply", r.GroupID, fmt.Sprintf("%s adopted credentials from %s", mp, shortNode(r.Origin)))
+		utils.Log.Infof("[cluster] applied group %s credentials to %s (v%d from %s)", r.GroupID, mp, r.Version, r.Origin)
+		return true, true
 	}
+	return false, false
 }
 
 // ---- absorb (merge) helpers ----
@@ -661,6 +740,24 @@ func (m *Manager) absorbCreds(recs []*credRecord) []*credRecord {
 		if m.state.mergeCred(r) {
 			merged = append(merged, r)
 			m.applyCredRecord(r)
+		}
+	}
+	if len(merged) > 0 {
+		m.persist()
+	}
+	return merged
+}
+
+func (m *Manager) absorbRevocations(revs []*credRevocation) []*credRevocation {
+	var merged []*credRevocation
+	for _, rev := range revs {
+		if !credentialRevocationAuthorizedByGroups(m.state.groupList(), rev) {
+			continue
+		}
+		if m.state.mergeRevocation(rev) {
+			merged = append(merged, rev)
+			m.recordEvent("revoke", rev.GroupID,
+				fmt.Sprintf("%s revoked candidate from %s", rev.OriginMount, shortNode(rev.Origin)))
 		}
 	}
 	if len(merged) > 0 {
@@ -752,8 +849,9 @@ func (m *Manager) buildReply(in *syncMessage) *syncMessage {
 			appendCred(cur)
 		}
 	}
+	reply.Revocations = m.state.revocationSnapshot()
 
-	if reply.Groups == nil && len(reply.Creds) == 0 && len(reply.Wants) == 0 {
+	if reply.Groups == nil && len(reply.Creds) == 0 && len(reply.Revocations) == 0 && len(reply.Wants) == 0 {
 		return nil
 	}
 	return reply
@@ -858,6 +956,12 @@ func (m *Manager) handleFrame(c *peerConn, data []byte) {
 	if m.absorbGroups(msg.Groups) {
 		gd := m.state.groupDoc()
 		relay.Groups = &gd
+		relayHas = true
+	}
+	// Candidate tombstones must converge before credentials: otherwise a relay
+	// can briefly resurrect an old signed token while a revocation is in flight.
+	if revoked := m.absorbRevocations(msg.Revocations); len(revoked) > 0 {
+		relay.Revocations = revoked
 		relayHas = true
 	}
 	// Credentials.

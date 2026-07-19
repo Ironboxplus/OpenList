@@ -138,12 +138,18 @@ func NotifyStorageTokenHealthy(storage driver.Driver) {
 // propagating the broken token. Drivers may call this when an API call fails with
 // an unrecoverable auth error.
 func NotifyStorageTokenInvalid(storage driver.Driver) {
-	storageTokenStatusMu.Lock()
-	changed := markStorageTokenInvalidStatus(storage)
-	storageTokenStatusMu.Unlock()
-	if changed {
-		go callStorageHooks("token-invalid", storage)
+	st := storage.GetStorage()
+	if st == nil || st.Disabled {
+		return
 	}
+	storageTokenStatusMu.Lock()
+	_ = markStorageTokenInvalidStatus(storage)
+	storageTokenStatusMu.Unlock()
+	// Persisting status is edge-triggered, but recovery is not. A newly adopted
+	// remote candidate can fail while this mount is already marked invalid; that
+	// failure must still reach cluster recovery, which performs its own per-mount
+	// cooldown and candidate de-duplication.
+	go callStorageHooks("token-invalid", storage)
 }
 
 func markStorageTokenInvalidStatus(storage driver.Driver) bool {

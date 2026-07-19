@@ -210,6 +210,53 @@ func (r *credRecord) dominates(other *credRecord) bool {
 	return r.CredHash > other.CredHash
 }
 
+// credRevocation is a signed tombstone for one source mount's credential
+// candidate. It is intentionally separate from a credential record: a relay
+// must retain and forward the tombstone after it has discarded the secret, or
+// an old signed credential can be replayed back to its source.
+type credRevocation struct {
+	GroupID     string `json:"group_id"`
+	Origin      string `json:"origin"`
+	OriginPub   []byte `json:"origin_pub"`
+	OriginMount string `json:"origin_mount"`
+	CredHash    string `json:"cred_hash"`
+	Version     uint64 `json:"version"`
+	UpdatedAt   int64  `json:"updated_at"`
+	Sig         []byte `json:"sig"`
+}
+
+func (r *credRevocation) signingBytes() []byte {
+	var b []byte
+	b = append(b, "openlist/cluster/credential-revocation/v1\x00"...)
+	b = append(b, r.GroupID...)
+	b = append(b, 0)
+	b = append(b, r.OriginMount...)
+	b = append(b, 0)
+	b = append(b, r.CredHash...)
+	b = append(b, 0)
+	v := make([]byte, 8)
+	for i := 0; i < 8; i++ {
+		v[i] = byte(r.Version >> (8 * uint(i)))
+	}
+	b = append(b, v...)
+	b = append(b, 0)
+	b = append(b, r.Origin...)
+	return b
+}
+
+func (r *credRevocation) verify() bool {
+	return r != nil && r.GroupID != "" && r.OriginMount != "" && r.CredHash != "" &&
+		r.Version > 0 && nodeIDFromPub(r.OriginPub) == r.Origin &&
+		verifySig(r.OriginPub, r.signingBytes(), r.Sig)
+}
+
+func (r *credRevocation) dominates(other *credRevocation) bool {
+	if other == nil || r.Version != other.Version {
+		return other == nil || r.Version > other.Version
+	}
+	return r.CredHash > other.CredHash
+}
+
 // credDigest is the compact (no-secret) advert of a held credential record.
 type credDigest struct {
 	GroupID     string `json:"group_id"`
@@ -276,6 +323,13 @@ type store struct {
 	// own current candidate, keyed by the signing origin and mount; Lamport
 	// ordering only resolves successive credentials from the same source mount.
 	creds map[string]map[string]*credRecord // group id -> (origin, mount) -> candidate
+	// revocations are source-signed tombstones. They prevent a relay from
+	// reintroducing a credential after that source proved it invalid.
+	revocations map[string]map[string]*credRevocation // group id -> (origin, mount) -> tombstone
+	// failedCandidates is node-local only: a candidate may be valid on its origin
+	// yet unusable from this node. Persisting the quarantine avoids a restart
+	// repeatedly refreshing the exact token that just failed here.
+	failedCandidates map[string]map[string]map[string]int64 // group id -> local mount -> credential hash -> failed unix second
 	// candidateHealth is an in-memory proof that this node has actually used a
 	// credential successfully. It is deliberately not persisted: a restart must
 	// prove the credential again instead of trusting a stale WORK status.
@@ -288,9 +342,11 @@ const candidateLeaseSec int64 = 15 * 60
 
 func newStore() *store {
 	return &store{
-		creds:           make(map[string]map[string]*credRecord),
-		candidateHealth: make(map[string]map[string]int64),
-		inventory:       make(map[string]*nodeInfo),
+		creds:            make(map[string]map[string]*credRecord),
+		revocations:      make(map[string]map[string]*credRevocation),
+		failedCandidates: make(map[string]map[string]map[string]int64),
+		candidateHealth:  make(map[string]map[string]int64),
+		inventory:        make(map[string]*nodeInfo),
 	}
 }
 
@@ -402,6 +458,23 @@ func credentialAuthorizedByGroups(groups []group, r *credRecord) bool {
 		return false
 	}
 	return r.signatureKind() != credentialSignatureLegacy || membersForOrigin == 1
+}
+
+func credentialRevocationAuthorizedByGroups(groups []group, rev *credRevocation) bool {
+	if !rev.verify() {
+		return false
+	}
+	for _, g := range groups {
+		if g.ID != rev.GroupID {
+			continue
+		}
+		for _, member := range g.Members {
+			if member.NodeID == rev.Origin && member.MountPath == rev.OriginMount {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ---- creds ----
@@ -557,6 +630,9 @@ func (s *store) mergeCred(r *credRecord) bool {
 		s.creds[r.GroupID] = byOrigin
 	}
 	key := candidateKey(r.Origin, r.OriginMount)
+	if rev := s.revocations[r.GroupID][key]; rev != nil && rev.Version >= r.Version {
+		return false // a source-signed tombstone blocks relay replay of this version
+	}
 	cur, ok := byOrigin[key]
 	if ok {
 		if cur.CredHash == r.CredHash {
@@ -571,26 +647,126 @@ func (s *store) mergeCred(r *credRecord) bool {
 	return true
 }
 
-// dropOwnCred removes our own-authored credential record for a group. It is used
-// when the local token is found invalid: a dead/stale credential must not linger
-// as a dominating record (its Lamport version could otherwise out-rank a peer's
-// genuinely-valid credential and block recovery). Returns true if a record was
-// removed. Peer-authored records are never touched here.
+// dropOwnCred removes this source mount's local candidate without revoking it.
+// It is used for uncertain startup failures (for example a transient TLS
+// timeout), where this node must stop advertising the candidate but must not
+// globally invalidate a credential that may still work on its origin.
 func (s *store) dropOwnCred(groupID, selfID, mount string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if byOrigin := s.creds[groupID]; byOrigin != nil {
-		key := candidateKey(selfID, mount)
-		if _, ok := byOrigin[key]; !ok {
-			return false
-		}
-		delete(byOrigin, key)
-		if len(byOrigin) == 0 {
-			delete(s.creds, groupID)
-		}
-		return true
+	byOrigin := s.creds[groupID]
+	if byOrigin == nil {
+		return false
 	}
-	return false
+	key := candidateKey(selfID, mount)
+	if _, ok := byOrigin[key]; !ok {
+		return false
+	}
+	delete(byOrigin, key)
+	if len(byOrigin) == 0 {
+		delete(s.creds, groupID)
+	}
+	return true
+}
+
+// revokeOwnCred removes a source candidate only after the provider has
+// explicitly declared it invalid. Unlike dropOwnCred, this emits a signed
+// tombstone so relays cannot replay the candidate back to its origin.
+func (s *store) revokeOwnCred(id *identity, groupID, mount string, at int64) (*credRevocation, bool) {
+	if id == nil || at <= 0 {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	byOrigin := s.creds[groupID]
+	if byOrigin == nil {
+		return nil, false
+	}
+	key := candidateKey(id.NodeID, mount)
+	current := byOrigin[key]
+	if current == nil {
+		return nil, false
+	}
+	s.lamport++
+	rev := &credRevocation{
+		GroupID:     groupID,
+		Origin:      id.NodeID,
+		OriginPub:   id.Pub,
+		OriginMount: mount,
+		CredHash:    current.CredHash,
+		Version:     s.lamport,
+		UpdatedAt:   at,
+	}
+	rev.Sig = id.sign(rev.signingBytes())
+	byRevocation := s.revocations[groupID]
+	if byRevocation == nil {
+		byRevocation = make(map[string]*credRevocation)
+		s.revocations[groupID] = byRevocation
+	}
+	byRevocation[key] = rev
+	delete(byOrigin, key)
+	if len(byOrigin) == 0 {
+		delete(s.creds, groupID)
+	}
+	cp := *rev
+	return &cp, true
+}
+
+func (s *store) revocationSnapshot() []*credRevocation {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []*credRevocation
+	for _, bySource := range s.revocations {
+		for _, rev := range bySource {
+			if !rev.verify() {
+				continue
+			}
+			cp := *rev
+			out = append(out, &cp)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].GroupID != out[j].GroupID {
+			return out[i].GroupID < out[j].GroupID
+		}
+		if out[i].Origin != out[j].Origin {
+			return out[i].Origin < out[j].Origin
+		}
+		return out[i].OriginMount < out[j].OriginMount
+	})
+	return out
+}
+
+// mergeRevocation applies a verified tombstone and removes any same-source
+// candidate that it supersedes. A later credential from the source remains
+// allowed because it must carry a strictly greater Lamport version.
+func (s *store) mergeRevocation(rev *credRevocation) bool {
+	if rev == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.observe(rev.Version)
+	key := candidateKey(rev.Origin, rev.OriginMount)
+	byRevocation := s.revocations[rev.GroupID]
+	if byRevocation == nil {
+		byRevocation = make(map[string]*credRevocation)
+		s.revocations[rev.GroupID] = byRevocation
+	}
+	if current := byRevocation[key]; current != nil && !rev.dominates(current) {
+		return false
+	}
+	cp := *rev
+	byRevocation[key] = &cp
+	if byOrigin := s.creds[rev.GroupID]; byOrigin != nil {
+		if current := byOrigin[key]; current != nil && current.Version <= rev.Version {
+			delete(byOrigin, key)
+			if len(byOrigin) == 0 {
+				delete(s.creds, rev.GroupID)
+			}
+		}
+	}
+	return true
 }
 
 // pruneCreds drops credential records for groups that no longer exist.
@@ -605,6 +781,16 @@ func (s *store) pruneCreds() {
 		if _, ok := live[id]; !ok {
 			delete(s.creds, id)
 			delete(s.candidateHealth, id)
+		}
+	}
+	for id := range s.revocations {
+		if _, ok := live[id]; !ok {
+			delete(s.revocations, id)
+		}
+	}
+	for id := range s.failedCandidates {
+		if _, ok := live[id]; !ok {
+			delete(s.failedCandidates, id)
 		}
 	}
 }
@@ -644,6 +830,63 @@ func (s *store) candidateHealthy(groupID, hash string, at int64) bool {
 	provenAt := s.candidateHealth[groupID][hash]
 	s.mu.RUnlock()
 	return provenAt > 0 && at >= provenAt && at-provenAt <= candidateLeaseSec
+}
+
+func (s *store) markCandidateFailed(groupID, mount, hash string, at int64) {
+	if groupID == "" || mount == "" || hash == "" || at <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	byMount := s.failedCandidates[groupID]
+	if byMount == nil {
+		byMount = make(map[string]map[string]int64)
+		s.failedCandidates[groupID] = byMount
+	}
+	byHash := byMount[mount]
+	if byHash == nil {
+		byHash = make(map[string]int64)
+		byMount[mount] = byHash
+	}
+	byHash[hash] = at
+}
+
+func (s *store) clearCandidateFailed(groupID, mount, hash string) {
+	if groupID == "" || mount == "" || hash == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	byMount := s.failedCandidates[groupID]
+	byHash := byMount[mount]
+	delete(byHash, hash)
+	if len(byHash) == 0 {
+		delete(byMount, mount)
+	}
+	if len(byMount) == 0 {
+		delete(s.failedCandidates, groupID)
+	}
+}
+
+func (s *store) candidateFailed(groupID, mount, hash string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.failedCandidates[groupID][mount][hash] > 0
+}
+
+// recoveryCandidates returns persisted alternatives for one local mount. The
+// current failed credential and any locally quarantined candidate are excluded;
+// the order is deterministic so a recovery attempt is bounded and reproducible.
+func (s *store) recoveryCandidates(groupID, mount, failedHash string) []*credRecord {
+	candidates := s.credsForGroup(groupID)
+	out := make([]*credRecord, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.CredHash == failedHash || s.candidateFailed(groupID, mount, candidate.CredHash) {
+			continue
+		}
+		out = append(out, candidate)
+	}
+	return out
 }
 
 // ---- inventory ----
@@ -702,10 +945,21 @@ func (s *store) dialableAddrs(selfID string) []string {
 // ---- persistence ----
 
 type persistedState struct {
-	Lamport   uint64        `json:"lamport"`
-	Groups    groupDoc      `json:"groups"`
-	Creds     []*credRecord `json:"creds"`
-	Inventory []*nodeInfo   `json:"inventory"`
+	Lamport          uint64             `json:"lamport"`
+	Groups           groupDoc           `json:"groups"`
+	Creds            []*credRecord      `json:"creds"`
+	Revocations      []*credRevocation  `json:"revocations,omitempty"`
+	FailedCandidates []candidateFailure `json:"failed_candidates,omitempty"`
+	Inventory        []*nodeInfo        `json:"inventory"`
+}
+
+// candidateFailure is local-only recovery metadata; it deliberately contains no
+// credential payload, only the already-public credential hash.
+type candidateFailure struct {
+	GroupID  string `json:"group_id"`
+	Mount    string `json:"mount"`
+	CredHash string `json:"cred_hash"`
+	FailedAt int64  `json:"failed_at"`
 }
 
 func (s *store) export() persistedState {
@@ -715,6 +969,22 @@ func (s *store) export() persistedState {
 	for _, byOrigin := range s.creds {
 		for _, r := range byOrigin {
 			ps.Creds = append(ps.Creds, r)
+		}
+	}
+	for _, bySource := range s.revocations {
+		for _, rev := range bySource {
+			if rev.verify() {
+				ps.Revocations = append(ps.Revocations, rev)
+			}
+		}
+	}
+	for groupID, byMount := range s.failedCandidates {
+		for mount, byHash := range byMount {
+			for hash, failedAt := range byHash {
+				ps.FailedCandidates = append(ps.FailedCandidates, candidateFailure{
+					GroupID: groupID, Mount: mount, CredHash: hash, FailedAt: failedAt,
+				})
+			}
 		}
 	}
 	for _, n := range s.inventory {
@@ -733,9 +1003,33 @@ func (s *store) load(ps persistedState) {
 		s.groups = groupDoc{}
 	}
 	s.creds = make(map[string]map[string]*credRecord)
+	s.revocations = make(map[string]map[string]*credRevocation)
 	s.candidateHealth = make(map[string]map[string]int64)
+	s.failedCandidates = make(map[string]map[string]map[string]int64)
+	for _, rev := range ps.Revocations {
+		if !credentialRevocationAuthorizedByGroups(s.groups.Groups, rev) {
+			continue
+		}
+		bySource := s.revocations[rev.GroupID]
+		if bySource == nil {
+			bySource = make(map[string]*credRevocation)
+			s.revocations[rev.GroupID] = bySource
+		}
+		key := candidateKey(rev.Origin, rev.OriginMount)
+		if current := bySource[key]; current == nil || rev.dominates(current) {
+			cp := *rev
+			bySource[key] = &cp
+		}
+		if rev.Version > s.lamport {
+			s.lamport = rev.Version
+		}
+	}
 	for _, r := range ps.Creds {
 		if !credentialAuthorizedByGroups(s.groups.Groups, r) {
+			continue
+		}
+		key := candidateKey(r.Origin, r.OriginMount)
+		if rev := s.revocations[r.GroupID][key]; rev != nil && rev.Version >= r.Version {
 			continue
 		}
 		byOrigin := s.creds[r.GroupID]
@@ -743,13 +1037,30 @@ func (s *store) load(ps persistedState) {
 			byOrigin = make(map[string]*credRecord)
 			s.creds[r.GroupID] = byOrigin
 		}
-		key := candidateKey(r.Origin, r.OriginMount)
 		if cur, ok := byOrigin[key]; !ok || r.dominates(cur) {
 			cp := *r
 			byOrigin[key] = &cp
 		}
 		if r.Version > s.lamport {
 			s.lamport = r.Version
+		}
+	}
+	for _, failed := range ps.FailedCandidates {
+		if failed.GroupID == "" || failed.Mount == "" || failed.CredHash == "" || failed.FailedAt <= 0 {
+			continue
+		}
+		byMount := s.failedCandidates[failed.GroupID]
+		if byMount == nil {
+			byMount = make(map[string]map[string]int64)
+			s.failedCandidates[failed.GroupID] = byMount
+		}
+		byHash := byMount[failed.Mount]
+		if byHash == nil {
+			byHash = make(map[string]int64)
+			byMount[failed.Mount] = byHash
+		}
+		if failed.FailedAt > byHash[failed.CredHash] {
+			byHash[failed.CredHash] = failed.FailedAt
 		}
 	}
 	s.inventory = make(map[string]*nodeInfo, len(ps.Inventory))

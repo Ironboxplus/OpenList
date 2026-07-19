@@ -88,6 +88,32 @@ func TestNotifyStorageTokenInvalidMarksStatusAndPersists(t *testing.T) {
 	}
 }
 
+func TestNotifyStorageTokenInvalidDispatchesRecoveryWhenAlreadyInvalid(t *testing.T) {
+	d := &tokenValidStorageDriver{Storage: model.Storage{
+		Driver:    "TokenInvalidTest",
+		MountPath: "/token-invalid-repeat",
+		Status:    "token invalid",
+		Addition:  "{}",
+	}}
+	called := make(chan struct{}, 1)
+	op.RegisterStorageHook(func(typ string, got driver.Driver) {
+		if typ != "token-invalid" || got != d {
+			return
+		}
+		select {
+		case called <- struct{}{}:
+		default:
+		}
+	})
+
+	op.NotifyStorageTokenInvalid(d)
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("an already-invalid storage must still dispatch recovery")
+	}
+}
+
 func TestNotifyStorageTokenHealthyDoesNotChangeLifecycleStatus(t *testing.T) {
 	d := &tokenValidStorageDriver{Storage: model.Storage{Status: op.WORK}}
 	called := make(chan struct{}, 1)

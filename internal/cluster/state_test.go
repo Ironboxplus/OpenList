@@ -419,6 +419,97 @@ func TestDropOwnCred(t *testing.T) {
 	}
 }
 
+// A source that has proved one of its credentials invalid must be able to
+// prevent an old signed copy held by a relay from entering its state again.
+// Without this, the source drops its own candidate, sends a pull, and a hub
+// immediately returns the exact same stale candidate as a peer record.
+func TestDroppedOwnCredentialRejectsStaleRelayReplay(t *testing.T) {
+	source, _ := newIdentity()
+	s := newStore()
+	payload := map[string]json.RawMessage{
+		"access_token":  json.RawMessage(`"dead-access"`),
+		"refresh_token": json.RawMessage(`"dead-refresh"`),
+	}
+	record, ok := s.localCredChange(source, "g1", "115 Open", "/storage/115", payload, 1)
+	if !ok {
+		t.Fatal("source candidate was not recorded")
+	}
+	if rev, ok := s.revokeOwnCred(source, "g1", "/storage/115", 2); !ok || !rev.verify() {
+		t.Fatal("source candidate was not revoked after invalidation")
+	}
+
+	if s.mergeCred(record) {
+		t.Fatal("stale signed candidate from a relay was accepted after source invalidation")
+	}
+	if _, ok := s.getCredForSource("g1", source.NodeID, "/storage/115"); ok {
+		t.Fatal("revoked source candidate re-entered state")
+	}
+}
+
+func TestRecoveryCandidatesSkipCurrentAndQuarantinedCredentials(t *testing.T) {
+	idA, _ := newIdentity()
+	idB, _ := newIdentity()
+	idC, _ := newIdentity()
+	s := newStore()
+	for _, tc := range []struct {
+		id      *identity
+		mount   string
+		payload map[string]json.RawMessage
+	}{
+		{idA, "/a", map[string]json.RawMessage{"access_token": json.RawMessage(`"A"`)}},
+		{idB, "/b", map[string]json.RawMessage{"access_token": json.RawMessage(`"B"`)}},
+		{idC, "/c", map[string]json.RawMessage{"access_token": json.RawMessage(`"C"`)}},
+	} {
+		if _, ok := s.localCredChange(tc.id, "g1", "115 Open", tc.mount, tc.payload, 1); !ok {
+			t.Fatalf("candidate %s was not recorded", tc.mount)
+		}
+	}
+	failedHash := credHash(map[string]json.RawMessage{"access_token": json.RawMessage(`"A"`)})
+	currentHash := credHash(map[string]json.RawMessage{"access_token": json.RawMessage(`"B"`)})
+	s.markCandidateFailed("g1", "/local", failedHash, 2)
+
+	candidates := s.recoveryCandidates("g1", "/local", currentHash)
+	if len(candidates) != 1 || candidates[0].CredHash != credHash(map[string]json.RawMessage{"access_token": json.RawMessage(`"C"`)}) {
+		t.Fatalf("recovery candidates = %#v, want only remaining C candidate", candidates)
+	}
+}
+
+func TestSignedRevocationRemovesRelayCopyButAllowsNewerRotation(t *testing.T) {
+	source, _ := newIdentity()
+	relay := newStore()
+	sourceState := newStore()
+	payloadA := map[string]json.RawMessage{"access_token": json.RawMessage(`"old"`)}
+	old, ok := sourceState.localCredChange(source, "g1", "115 Open", "/storage/115", payloadA, 1)
+	if !ok {
+		t.Fatal("source candidate was not recorded")
+	}
+	if !relay.mergeCred(old) {
+		t.Fatal("relay did not accept initial source candidate")
+	}
+	rev, ok := sourceState.revokeOwnCred(source, "g1", "/storage/115", 2)
+	if !ok || !rev.verify() {
+		t.Fatal("source revocation was not signed")
+	}
+	if !relay.mergeRevocation(rev) {
+		t.Fatal("relay did not accept source revocation")
+	}
+	if _, ok := relay.getCredForSource("g1", source.NodeID, "/storage/115"); ok {
+		t.Fatal("relay retained revoked candidate")
+	}
+	if relay.mergeCred(old) {
+		t.Fatal("relay accepted revoked candidate replay")
+	}
+
+	payloadB := map[string]json.RawMessage{"access_token": json.RawMessage(`"rotated"`)}
+	newer, ok := sourceState.localCredChange(source, "g1", "115 Open", "/storage/115", payloadB, 3)
+	if !ok || newer.Version <= rev.Version {
+		t.Fatalf("source rotation did not advance beyond revocation: %#v", newer)
+	}
+	if !relay.mergeCred(newer) {
+		t.Fatal("relay rejected newer credential rotation after revocation")
+	}
+}
+
 // canOfferCred requires a local health proof for this node's own candidates.
 // A signed, group-authorized peer candidate remains relayable: the hub need not
 // overwrite a healthy local mount merely to forward NAT peers' recovery path.
