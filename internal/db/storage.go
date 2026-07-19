@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/pkg/errors"
@@ -25,6 +26,20 @@ func UpdateStorage(storage *model.Storage) error {
 // UpdateStorageStatus just updates storage status in database.
 func UpdateStorageStatus(id uint, status string) error {
 	return errors.WithStack(db.Model(&model.Storage{}).Where("id = ?", id).Update("status", status).Error)
+}
+
+// UpdateStorageStatusIfModified updates a lifecycle status only if the row is
+// still the storage generation observed by the caller. This is used for auth
+// callbacks: an old in-flight request must not mark a newly reconfigured token
+// invalid after UpdateStorage has advanced Modified.
+func UpdateStorageStatusIfModified(id uint, modified time.Time, status string) (bool, error) {
+	tx := db.Model(&model.Storage{}).
+		Where("id = ? AND modified = ?", id, modified).
+		Update("status", status)
+	if tx.Error != nil {
+		return false, errors.WithStack(tx.Error)
+	}
+	return tx.RowsAffected > 0, nil
 }
 
 // DeleteStorageById just delete storage from database by id

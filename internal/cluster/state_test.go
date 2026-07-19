@@ -1,12 +1,20 @@
 package cluster
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
+	"time"
 
 	open115 "github.com/OpenListTeam/OpenList/v4/drivers/115_open"
+	_ "github.com/OpenListTeam/OpenList/v4/drivers/local"
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
 )
 
 // ---- credential extraction ----
@@ -157,6 +165,7 @@ func TestOnlyTokenValidMayPublishStoragePair(t *testing.T) {
 		Members: []member{{NodeID: id.NodeID, MountPath: "/storage/115"}},
 	}}, 1)
 	m := &Manager{
+		dir:      t.TempDir(),
 		id:       id,
 		state:    s,
 		conns:    newConnRegistry(),
@@ -174,9 +183,44 @@ func TestOnlyTokenValidMayPublishStoragePair(t *testing.T) {
 		t.Fatalf("ordinary update published %d credential record(s), want 0", got)
 	}
 
-	m.onStorageHook("token-valid", d)
+	m.onStorageCredential("token-valid", op.StorageCredentialEvent{Storage: d, Addition: d.GetStorage().Addition})
 	if got := len(s.credsForGroup("g1")); got != 1 {
 		t.Fatalf("token-valid published %d credential record(s), want 1", got)
+	}
+}
+
+// An authentication result belongs to the pair sent with that request, not to
+// whatever happens to be mounted when its goroutine finally runs. This uses the
+// real 115 driver type and exercises the manager's generation guard without
+// fabricating a driver implementation.
+func TestLateCredentialEventCannotRevokeReplacementPair(t *testing.T) {
+	id, _ := newIdentity()
+	s := newStore()
+	s.setGroups(id, []group{{
+		ID:      "g1",
+		Members: []member{{NodeID: id.NodeID, MountPath: "/storage/115"}},
+	}}, 1)
+	newPair := `{"access_token":"new-access","refresh_token":"new-refresh"}`
+	d := &open115.Open115{Storage: model.Storage{
+		MountPath: "/storage/115",
+		Driver:    "115 Open",
+		Status:    op.WORK,
+		Addition:  newPair,
+	}}
+	m := &Manager{
+		dir:      t.TempDir(),
+		id:       id,
+		state:    s,
+		conns:    newConnRegistry(),
+		cfgStore: &configStore{cfg: Config{Enabled: true, Key: "test-key", ApplyRemote: true}},
+	}
+	oldPair := `{"access_token":"old-access","refresh_token":"old-refresh"}`
+	m.onStorageCredential("token-invalid", op.StorageCredentialEvent{Storage: d, Addition: oldPair})
+	if d.GetStorage().Status != op.WORK {
+		t.Fatalf("late old-pair 401 changed replacement status to %q", d.GetStorage().Status)
+	}
+	if got := len(s.revocationSnapshot()); got != 0 {
+		t.Fatalf("late old-pair 401 wrote %d revocations", got)
 	}
 }
 
@@ -658,9 +702,9 @@ func TestSignedRevocationRemovesRelayCopyButAllowsNewerRotation(t *testing.T) {
 	}
 }
 
-// canOfferCred requires a local health proof for every candidate. A signature
-// proves provenance only; an unvalidated relay must not advertise a pair as a
-// recoverable credential.
+// A signed candidate is relayable even when the relay has no local health proof.
+// Otherwise a hub between two NAT'd nodes black-holes a good source's pair and
+// recovery cannot converge. Local health remains required only for activation.
 func TestCanOfferCred(t *testing.T) {
 	id1, _ := newIdentity() // self
 	id2, _ := newIdentity() // peer
@@ -676,7 +720,7 @@ func TestCanOfferCred(t *testing.T) {
 		t.Fatal("a nil record is never offerable")
 	}
 
-	// A peer-authored candidate with no local proof is catalog data only.
+	// A peer-authored signed candidate must traverse this node unchanged.
 	payload := map[string]json.RawMessage{"refresh_token": json.RawMessage(`"peer"`)}
 	peer := &credRecord{
 		GroupID:      "g1",
@@ -689,8 +733,8 @@ func TestCanOfferCred(t *testing.T) {
 		OriginMount:  "/peer",
 	}
 	peer.Sig = id2.sign(peer.signingBytes())
-	if m.canOfferCred(peer) {
-		t.Fatal("an unvalidated peer candidate must not be advertised for recovery")
+	if !m.canOfferCred(peer) {
+		t.Fatal("an authorized peer candidate must be relayed without local proof")
 	}
 
 	// our own record, but no group/healthy mount -> not offerable.
@@ -698,6 +742,94 @@ func TestCanOfferCred(t *testing.T) {
 	if m.canOfferCred(own) {
 		t.Fatal("our own record must NOT be offered when the token is not proven healthy")
 	}
+}
+
+// This is an end-to-end backend regression for the exact missed transition:
+// a peer candidate may arrive after the local mount is already invalid. It uses
+// the registered production Local driver, real op storage persistence, and the
+// same isolated probe + UpdateStorage path used in production -- not a mock
+// driver or a mocked callback. The 115-specific three-node acceptance remains
+// a separate live test because it must use a real operator-provided pair.
+func TestReceivedCandidateRecoversInvalidMountWithRealDriver(t *testing.T) {
+	dbName := fmt.Sprintf("file:cluster-recovery-%d?mode=memory&cache=shared", time.Now().UnixNano())
+	database, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	db.Init(database)
+
+	oldRoot := t.TempDir()
+	mount := fmt.Sprintf("/cluster-recovery-%d", time.Now().UnixNano())
+	storage := model.Storage{
+		Driver:    "Local",
+		MountPath: mount,
+		Addition:  fmt.Sprintf(`{"root_folder_path":%q}`, oldRoot),
+	}
+	id, err := op.CreateStorage(context.Background(), storage)
+	if err != nil {
+		t.Fatalf("create real local storage: %v", err)
+	}
+	t.Cleanup(func() { _ = op.DeleteStorageById(context.Background(), id) })
+
+	local, _ := newIdentity()
+	peer, _ := newIdentity()
+	admin, _ := newIdentity()
+	state := newStore()
+	state.setGroups(admin, []group{{
+		ID: "g1",
+		Members: []member{
+			{NodeID: local.NodeID, MountPath: mount},
+			{NodeID: peer.NodeID, MountPath: "/peer"},
+		},
+	}}, 1)
+	manager := &Manager{
+		dir:      t.TempDir(),
+		id:       local,
+		state:    state,
+		conns:    newConnRegistry(),
+		cfgStore: &configStore{cfg: Config{Enabled: true, Key: "test-key", ApplyRemote: true}},
+	}
+
+	d, err := op.GetStorageByMountPath(mount)
+	if err != nil {
+		t.Fatalf("get created storage: %v", err)
+	}
+	// Model the persisted outcome of a real 401 before a peer has a replacement.
+	d.GetStorage().SetStatus("token invalid")
+	payload := map[string]json.RawMessage{"access_token": json.RawMessage(`"peer-pair"`)}
+	candidate := &credRecord{
+		GroupID:      "g1",
+		OriginDriver: "Local",
+		Fields:       []string{"access_token"},
+		Payload:      payload,
+		CredHash:     credHash(payload),
+		Version:      1,
+		Origin:       peer.NodeID,
+		OriginPub:    peer.Pub,
+		OriginMount:  "/peer",
+		UpdatedAt:    now(),
+	}
+	candidate.Sig = peer.sign(candidate.signingBytes())
+	candidate.MountSig = peer.sign(candidate.mountSigningBytes())
+	if merged := manager.absorbCreds([]*credRecord{candidate}); len(merged) != 1 {
+		t.Fatalf("candidate merge = %#v, want one accepted record", merged)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		current, getErr := op.GetStorageByMountPath(mount)
+		if getErr == nil && current.GetStorage().Status == op.WORK && state.candidateHealthy("g1", candidate.CredHash, now()) {
+			for _, event := range manager.eventList() {
+				if event.Kind == "apply" && event.GroupID == "g1" {
+					return
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	current, _ := op.GetStorageByMountPath(mount)
+	t.Fatalf("received candidate did not activate invalid mount: %#v", current.GetStorage())
 }
 
 func TestAbsorbCredsRejectsUnauthorizedOriginMount(t *testing.T) {
@@ -709,7 +841,7 @@ func TestAbsorbCredsRejectsUnauthorizedOriginMount(t *testing.T) {
 		ID:      "g1",
 		Members: []member{{NodeID: memberID.NodeID, MountPath: "/115"}},
 	}}, 1)
-	m := &Manager{id: localID, state: s, cfgStore: &configStore{cfg: Config{ApplyRemote: false}}}
+	m := &Manager{dir: t.TempDir(), id: localID, state: s, cfgStore: &configStore{cfg: Config{ApplyRemote: false}}}
 
 	payload := map[string]json.RawMessage{"refresh_token": json.RawMessage(`"candidate"`)}
 	bad := &credRecord{

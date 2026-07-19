@@ -30,10 +30,6 @@ const (
 	peerLivenessSec = 130
 	// maxEvents bounds the in-memory activity log surfaced to the UI.
 	maxEvents = 60
-	// candidateRecoveryCooldown prevents an invalid mount from cycling through
-	// every persisted credential on each caller retry. A new credential push is
-	// still applied immediately; this only bounds local fallback attempts.
-	candidateRecoveryCooldown = 5 * time.Minute
 )
 
 // Manager is the running cluster credential-sync engine for this node.
@@ -47,9 +43,9 @@ type Manager struct {
 
 	persistMu sync.Mutex
 
-	recoveryMu    sync.Mutex
-	recoveryLocks map[string]*sync.Mutex // per local mount: serialize credential adoption
-	recoveryLast  map[string]time.Time
+	recoveryMu     sync.Mutex
+	recoveryLocks  map[string]*sync.Mutex // per local mount: serialize credential adoption
+	recoveryQueues map[string]*recoveryQueue
 
 	dialMu  sync.Mutex
 	dialing map[string]bool // peer URLs with an in-flight/live outbound dial
@@ -62,6 +58,15 @@ type Manager struct {
 
 	stopCh chan struct{}
 	once   sync.Once
+}
+
+// recoveryQueue is one mount's event-driven recovery mailbox. It deliberately
+// contains no timer: a pair is enqueued by an observed 401, a newly received
+// signed candidate, or startup reconstruction. The source of truth remains the
+// durable candidate/tombstone state, so a crash can safely rebuild this queue.
+type recoveryQueue struct {
+	running bool
+	pending map[string]*credRecord // credential hash -> immutable signed candidate
 }
 
 // Default is the process-wide manager, set by Init. It is nil when cluster sync
@@ -80,16 +85,16 @@ func Init(dataDir string) (*Manager, error) {
 		return nil, err
 	}
 	m := &Manager{
-		dir:           dir,
-		id:            id,
-		cfgStore:      newConfigStore(dir),
-		state:         newStore(),
-		replay:        newReplayCache(replayWindowSec),
-		conns:         newConnRegistry(),
-		dialing:       make(map[string]bool),
-		recoveryLocks: make(map[string]*sync.Mutex),
-		recoveryLast:  make(map[string]time.Time),
-		stopCh:        make(chan struct{}),
+		dir:            dir,
+		id:             id,
+		cfgStore:       newConfigStore(dir),
+		state:          newStore(),
+		replay:         newReplayCache(replayWindowSec),
+		conns:          newConnRegistry(),
+		dialing:        make(map[string]bool),
+		recoveryLocks:  make(map[string]*sync.Mutex),
+		recoveryQueues: make(map[string]*recoveryQueue),
+		stopCh:         make(chan struct{}),
 	}
 	if _, err := m.cfgStore.loadOrInit(); err != nil {
 		return nil, err
@@ -97,7 +102,8 @@ func Init(dataDir string) (*Manager, error) {
 	m.loadState()
 
 	op.RegisterStorageHook(m.onStorageHook)
-	op.RegisterStorageHealthHook(m.onStorageHealthy)
+	op.RegisterStorageCredentialHook(m.onStorageCredential)
+	op.RegisterStorageCredentialHealthHook(m.onStorageCredentialHealthy)
 	Default = m
 	return m, nil
 }
@@ -128,23 +134,26 @@ func (m *Manager) loadState() {
 	}
 }
 
-func (m *Manager) persist() {
+func (m *Manager) persist() error {
 	m.persistMu.Lock()
 	defer m.persistMu.Unlock()
 	ps := m.state.export()
 	b, err := json.MarshalIndent(ps, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
 	if err := os.MkdirAll(m.dir, 0o700); err != nil {
-		return
+		return err
 	}
 	tmp := m.statePath() + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		utils.Log.Warnf("[cluster] failed to persist state: %v", err)
-		return
+		return err
 	}
-	_ = os.Rename(tmp, m.statePath())
+	if err := os.Rename(tmp, m.statePath()); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ---- config access ----
@@ -208,7 +217,9 @@ func (m *Manager) SetGroups(specs []GroupSpec) error {
 	}
 	d := m.state.setGroups(m.id, groups, now())
 	m.state.pruneCreds()
-	m.persist()
+	if err := m.persist(); err != nil {
+		return fmt.Errorf("persist groups: %w", err)
+	}
 	m.recordEvent("groups", "", fmt.Sprintf("updated to %d group(s)", len(groups)))
 	gd := d
 	m.broadcast(&syncMessage{Type: "push", Groups: &gd})
@@ -347,10 +358,11 @@ func (m *Manager) announceLoop() {
 
 // ---- credential seeding / hooks ----
 
-// seedLocalCreds only asks peers for catalog candidates after startup or a group
+// seedLocalCreds reconciles every locally failed mount after startup or a group
 // change. A persisted Storage.Status=WORK is not proof that its credential pair
-// is still accepted by the provider, so startup must never mint or broadcast a
-// candidate from it.
+// is still accepted by the provider, so startup never mints a fresh candidate
+// from it; however, a persisted non-WORK mount must retry durable peer
+// candidates even when they arrived before this process started.
 func (m *Manager) seedLocalCreds() {
 	cfg := m.cfgStore.get()
 	if !cfg.active() {
@@ -364,6 +376,9 @@ func (m *Manager) seedLocalCreds() {
 			continue
 		}
 		for _, g := range groups {
+			if st.Status != op.WORK {
+				m.enqueueKnownCandidates(g.ID, st.MountPath, credHash(extractCreds(st.Addition)))
+			}
 			m.pullGroup(g.ID)
 		}
 	}
@@ -377,38 +392,51 @@ func (m *Manager) revokeOwnCandidate(groupID, mount string) (*credRevocation, bo
 	return m.state.revokeOwnCred(m.id, groupID, mount, now())
 }
 
-// onStorageHook reacts to local storage lifecycle/credential changes.
+// onStorageHook only tracks lifecycle/inventory changes. Authentication events
+// are intentionally handled by onStorageCredential because they need the
+// immutable Addition snapshot of the request that produced them.
 func (m *Manager) onStorageHook(typ string, d driver.Driver) {
-	cfg := m.cfgStore.get()
-	if !cfg.active() {
+	if !m.cfgStore.get().active() || d == nil || d.GetStorage() == nil {
 		return
 	}
-	st := d.GetStorage()
-	// Any storage change may alter our inventory (added/removed mount, status).
+	if typ == "token-valid" || typ == "token-invalid" {
+		return
+	}
 	go m.refreshInventory()
+}
 
-	selfID := m.id.NodeID
-	groups := m.state.groupsForMount(selfID, st.MountPath)
+// onStorageCredential consumes a real provider result bound to the exact
+// Addition used on the wire. It is the sole authority for publishing a pair or
+// writing its group-wide 401 tombstone; ordinary storage update hooks are never
+// authentication evidence.
+func (m *Manager) onStorageCredential(typ string, event op.StorageCredentialEvent) {
+	if !m.cfgStore.get().active() || event.Storage == nil {
+		return
+	}
+	st := event.Storage.GetStorage()
+	if st == nil || st.Addition != event.Addition || !st.Modified.Equal(event.Modified) {
+		return // late result from an old client generation
+	}
+	go m.refreshInventory()
+	groups := m.state.groupsForMount(m.id.NodeID, st.MountPath)
 	if len(groups) == 0 {
 		return
 	}
+
 	switch typ {
 	case "token-valid":
-		// "token-valid" is fired when an authenticated request just proved the
-		// token good — (re)share it so peers converge on the working credential.
 		if st.Status != op.WORK {
-			// Health gating: never propagate a broken/expired token. Try to recover
-			// a good one from peers instead.
 			for _, g := range groups {
 				m.pullGroup(g.ID)
 			}
 			return
 		}
-		creds := extractCreds(st.Addition)
+		creds := extractCreds(event.Addition)
 		credID := credHash(creds)
 		var dirty bool
+		var shares []*credRecord
 		for _, g := range groups {
-			if m.state.hasCredForSource(g.ID, selfID, st.MountPath, credID) {
+			if m.state.hasCredForSource(g.ID, m.id.NodeID, st.MountPath, credID) {
 				m.state.markCandidateHealthy(g.ID, credID, now())
 				continue
 			}
@@ -416,67 +444,68 @@ func (m *Manager) onStorageHook(typ string, d driver.Driver) {
 				m.state.markCandidateHealthy(g.ID, rec.CredHash, now())
 				dirty = true
 				m.recordEvent("share", g.ID, fmt.Sprintf("%s refreshed credentials", st.MountPath))
-				m.broadcast(&syncMessage{Type: "push", Creds: []*credRecord{rec}})
+				shares = append(shares, rec)
 			}
 		}
 		if dirty {
-			m.persist()
+			if err := m.persist(); err != nil {
+				utils.Log.Errorf("[cluster] not sharing unpersisted credential for %s: %v", st.MountPath, err)
+				return
+			}
 		}
-	case "add", "update":
-		// Storage lifecycle updates are not provider-authentication evidence.
-		// In particular, UpdateStorage after staging a peer candidate must never
-		// turn that pair into a newly authored local credential record.
-		return
-	case "del":
-		// A mount was removed locally. We keep the group's credential record (other
-		// members still rely on it); only our inventory changes (handled above).
+		if len(shares) > 0 {
+			m.broadcast(&syncMessage{Type: "push", Creds: shares})
+		}
+
 	case "token-invalid":
-		if st.Status == op.WORK {
-			// Hooks are asynchronous. A later successful request may already have
-			// restored this storage, so an older invalid event must not revoke the
-			// healthy candidate it would otherwise overwrite.
+		// This event is generation-bound. Any 401xxxxx invalidates the precise
+		// access/refresh pair used by the request even if another asynchronous
+		// success would otherwise leave Storage.Status as WORK.
+		credID := credHash(extractCreds(event.Addition))
+		if credID == "" {
 			return
 		}
-		// Our token died. Drop our own (now-stale) credential record so its Lamport
-		// version can't out-rank a peer's valid one, then pull a fresh credential
-		// from a healthy peer. The currently-used credential is quarantined for
-		// this mount even when it originated on a peer: that prevents a restart
-		// from immediately retrying the exact 40140125/26 candidate.
-		var changed bool
-		credID := credHash(extractCreds(st.Addition))
+		var revocations []*credRevocation
 		for _, g := range groups {
 			m.state.forgetCandidateHealth(g.ID, credID)
 			m.state.markCandidateFailed(g.ID, st.MountPath, credID, now())
-			changed = true
 			if rev, ok := m.state.revokePair(m.id, g.ID, st.MountPath, credID, now()); ok {
 				m.recordEvent("invalidate", g.ID,
 					fmt.Sprintf("%s token invalid — dropped local cred, pulling from peers", st.MountPath))
-				m.broadcast(&syncMessage{Type: "push", Revocations: []*credRevocation{rev}})
+				revocations = append(revocations, rev)
 			} else {
 				m.recordEvent("invalidate", g.ID,
 					fmt.Sprintf("%s token invalid — quarantined failed peer candidate", st.MountPath))
 			}
-			go m.recoverKnownCandidates(g.ID, st.MountPath, credID)
 		}
-		if changed {
-			m.persist()
+		// The pair-wide 401 fact must survive a crash before a recovery worker
+		// can touch any alternative. This makes Revoked(P) durable-before-apply.
+		if err := m.persist(); err != nil {
+			utils.Log.Errorf("[cluster] not recovering after unpersisted 401 for %s: %v", st.MountPath, err)
+			return
+		}
+		if len(revocations) > 0 {
+			m.broadcast(&syncMessage{Type: "push", Revocations: revocations})
+		}
+		for _, g := range groups {
+			m.enqueueKnownCandidates(g.ID, st.MountPath, credID)
+			m.pullGroup(g.ID)
 		}
 	}
 }
 
-// onStorageHealthy renews only the in-memory proof for an already working
-// credential. It deliberately does not write the database, broadcast a record,
-// or emit a storage lifecycle event; ordinary successful requests therefore keep
-// a candidate usable without causing token-refresh or cluster-sync churn.
-func (m *Manager) onStorageHealthy(d driver.Driver) {
-	if !m.cfgStore.get().active() {
+// onStorageCredentialHealthy renews in-memory proof only for the exact pair
+// that received a successful provider response. It cannot accidentally mark a
+// newer pair healthy after an old request returns late.
+func (m *Manager) onStorageCredentialHealthy(event op.StorageCredentialEvent) {
+	if !m.cfgStore.get().active() || event.Storage == nil {
 		return
 	}
-	st := d.GetStorage()
-	if st == nil || st.Status != op.WORK {
+	st := event.Storage.GetStorage()
+	if st == nil || st.Status != op.WORK || st.Addition != event.Addition || !st.Modified.Equal(event.Modified) {
 		return
 	}
-	credID := credHash(extractCreds(st.Addition))
+	credID := credHash(extractCreds(event.Addition))
 	if credID == "" {
 		return
 	}
@@ -488,51 +517,104 @@ func (m *Manager) onStorageHealthy(d driver.Driver) {
 	}
 }
 
-func (m *Manager) beginCandidateRecovery(groupID, mount string) bool {
-	key := groupID + "\x00" + mount
-	m.recoveryMu.Lock()
-	defer m.recoveryMu.Unlock()
-	n := time.Now()
-	if last := m.recoveryLast[key]; !last.IsZero() && n.Sub(last) < candidateRecoveryCooldown {
-		return false
+// enqueueKnownCandidates rebuilds a failed mount's durable recovery work. It is
+// used after a local 401 and after restart; it never creates candidates or
+// refreshes a token.
+func (m *Manager) enqueueKnownCandidates(groupID, mount, failedHash string) {
+	for _, candidate := range m.state.recoveryCandidates(groupID, mount, failedHash) {
+		m.enqueueCandidate(candidate, mount)
 	}
-	m.recoveryLast[key] = n
-	return true
 }
 
-// recoverKnownCandidates tries already-held alternatives once, in deterministic
-// order, after a token dies. It never refreshes on a timer: each candidate is
-// attempted at most once per mount per cooldown window, then a pull waits for a
-// peer to publish a genuinely newer credential.
-func (m *Manager) recoverKnownCandidates(groupID, mount, failedHash string) {
-	if !m.beginCandidateRecovery(groupID, mount) {
+// enqueueCandidate queues one newly learned, signed candidate for one local
+// mount. A queue is keyed by credential hash, so duplicate frames and relay
+// paths cannot create probe storms. The worker is per (group, mount), making
+// activation deterministic and serial with storage replacement.
+func (m *Manager) enqueueCandidate(candidate *credRecord, mount string) {
+	if candidate == nil || mount == "" || !m.credentialAuthorized(candidate) {
 		return
 	}
-	changed := false
-	for _, candidate := range m.state.recoveryCandidates(groupID, mount, failedHash) {
+	key := candidate.GroupID + "\x00" + mount
+	m.recoveryMu.Lock()
+	if m.recoveryQueues == nil {
+		m.recoveryQueues = make(map[string]*recoveryQueue)
+	}
+	queue := m.recoveryQueues[key]
+	if queue == nil {
+		queue = &recoveryQueue{pending: make(map[string]*credRecord)}
+		m.recoveryQueues[key] = queue
+	}
+	if _, exists := queue.pending[candidate.CredHash]; !exists {
+		cp := *candidate
+		queue.pending[candidate.CredHash] = &cp
+	}
+	if queue.running {
+		m.recoveryMu.Unlock()
+		return
+	}
+	queue.running = true
+	m.recoveryMu.Unlock()
+	go m.runCandidateRecovery(key, candidate.GroupID, mount)
+}
+
+func (m *Manager) takeCandidate(key string) *credRecord {
+	m.recoveryMu.Lock()
+	defer m.recoveryMu.Unlock()
+	queue := m.recoveryQueues[key]
+	if queue == nil {
+		return nil
+	}
+	if len(queue.pending) == 0 {
+		queue.running = false
+		delete(m.recoveryQueues, key)
+		return nil
+	}
+	hashes := make([]string, 0, len(queue.pending))
+	for hash := range queue.pending {
+		hashes = append(hashes, hash)
+	}
+	sort.Strings(hashes)
+	candidate := queue.pending[hashes[0]]
+	delete(queue.pending, hashes[0])
+	return candidate
+}
+
+func (m *Manager) finishCandidateRecovery(key string) {
+	m.recoveryMu.Lock()
+	defer m.recoveryMu.Unlock()
+	delete(m.recoveryQueues, key)
+}
+
+// runCandidateRecovery is the only place a received candidate may become the
+// mount's active storage. A successful probe stops the queue; a provider 401
+// emits a durable group-wide tombstone before the next candidate is attempted.
+func (m *Manager) runCandidateRecovery(key, groupID, mount string) {
+	for {
+		candidate := m.takeCandidate(key)
+		if candidate == nil {
+			return
+		}
 		if !m.credentialAuthorized(candidate) {
 			continue
 		}
-		attempted, ok, terminal := m.applyCredRecordToMount(candidate, mount)
-		if !attempted {
-			continue
-		}
-		if ok {
+		attempted, success, terminal := m.applyCredRecordToMount(candidate, mount)
+		if success {
+			m.finishCandidateRecovery(key)
 			return
 		}
-		if terminal {
-			if rev, revoked := m.state.revokePair(m.id, groupID, mount, candidate.CredHash, now()); revoked {
-				m.recordEvent("invalidate", groupID,
-					fmt.Sprintf("%s rejected candidate %s with provider 401", mount, shortHash(candidate.CredHash)))
-				m.broadcast(&syncMessage{Type: "push", Revocations: []*credRevocation{rev}})
-				changed = true
+		if !attempted || !terminal {
+			continue
+		}
+		if rev, revoked := m.state.revokePair(m.id, groupID, mount, candidate.CredHash, now()); revoked {
+			m.recordEvent("invalidate", groupID,
+				fmt.Sprintf("%s rejected candidate %s with provider 401", mount, shortHash(candidate.CredHash)))
+			if err := m.persist(); err != nil {
+				utils.Log.Errorf("[cluster] not relaying unpersisted candidate rejection for %s: %v", mount, err)
+				return
 			}
+			m.broadcast(&syncMessage{Type: "push", Revocations: []*credRevocation{rev}})
 		}
 	}
-	if changed {
-		m.persist()
-	}
-	m.pullGroup(groupID)
 }
 
 // pullGroup asks peers for the latest credential of a group.
@@ -573,19 +655,20 @@ func (m *Manager) hasHealthyLocalCandidate(r *credRecord) bool {
 	return false
 }
 
-// canOfferCred reports whether this node may advertise a credential candidate.
-// A remote candidate is authenticated by its signature and the signed group
-// document, and must remain relayable through an accept-only/NAT hub. This
-// node's own candidate additionally needs a recent local health proof so stale
-// credentials from its state.json are never reintroduced after a restart.
+// canOfferCred reports whether this node may relay a credential candidate. A
+// valid member signature is the authority for transport: a relay does not need
+// to prove the pair locally before forwarding it. Local proof only controls
+// whether this node activates a pair on one of its mounts. Keeping those two
+// facts separate is essential for NAT/accept-only topologies, where a healthy
+// source and an invalid target may never have a direct connection.
 func (m *Manager) canOfferCred(r *credRecord) bool {
-	if !m.credentialAuthorized(r) {
-		return false
-	}
-	return m.hasHealthyLocalCandidate(r)
+	return m.credentialAuthorized(r)
 }
 
-// offerableDigests is credDigests() filtered to records this node may advertise.
+// offerableDigests is the signed, non-revoked candidate inventory that may be
+// relayed during anti-entropy. It is deliberately independent of local mount
+// health; otherwise a hub that did not itself mount 115 would black-hole a
+// healthy source's credential record.
 func (m *Manager) offerableDigests() []credDigest {
 	var out []credDigest
 	for _, r := range m.state.credSnapshot() {
@@ -740,7 +823,10 @@ func (m *Manager) absorbGroups(d *groupDoc) bool {
 	}
 	if m.state.mergeGroups(d) {
 		m.state.pruneCreds()
-		m.persist()
+		if err := m.persist(); err != nil {
+			utils.Log.Errorf("[cluster] not relaying unpersisted groups: %v", err)
+			return false
+		}
 		m.recordEvent("groups", "", fmt.Sprintf("received %d group(s) from %s", len(d.Groups), shortNode(d.Origin)))
 		go m.seedLocalCreds()
 		return true
@@ -759,7 +845,22 @@ func (m *Manager) absorbCreds(recs []*credRecord) []*credRecord {
 		}
 	}
 	if len(merged) > 0 {
-		m.persist()
+		if err := m.persist(); err != nil {
+			utils.Log.Errorf("[cluster] not activating unpersisted received credentials: %v", err)
+			return nil
+		}
+		for _, r := range merged {
+			// A record newly arriving after a local 401 must wake recovery even if
+			// the earlier empty-candidate scan already completed. The queue itself
+			// deduplicates the pair and serializes the real driver probe.
+			g, ok := m.state.groupByID(r.GroupID)
+			if !ok {
+				continue
+			}
+			for _, mount := range g.mountsForNode(m.id.NodeID) {
+				m.enqueueCandidate(r, mount)
+			}
+		}
 	}
 	return merged
 }
@@ -777,7 +878,10 @@ func (m *Manager) absorbRevocations(revs []*credRevocation) []*credRevocation {
 		}
 	}
 	if len(merged) > 0 {
-		m.persist()
+		if err := m.persist(); err != nil {
+			utils.Log.Errorf("[cluster] not relaying unpersisted revocations: %v", err)
+			return nil
+		}
 	}
 	return merged
 }

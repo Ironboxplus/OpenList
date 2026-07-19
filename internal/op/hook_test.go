@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	open115 "github.com/OpenListTeam/OpenList/v4/drivers/115_open"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -85,6 +86,73 @@ func TestNotifyStorageTokenInvalidMarksStatusAndPersists(t *testing.T) {
 	}
 	if got.Status == op.WORK {
 		t.Fatal("token-invalid must persist a non-work status before peer recovery")
+	}
+}
+
+// An old client's 401 must be ignored after cluster recovery has installed a
+// different pair. This uses the real 115 driver storage type plus real SQLite
+// persistence; no test driver or callback mock is involved.
+func TestNotifyStorageTokenInvalidWithStaleAdditionKeepsReplacementWorking(t *testing.T) {
+	newAddition := `{"access_token":"new","refresh_token":"new"}`
+	storage := model.Storage{
+		Driver:    "115 Open",
+		MountPath: "/token-invalid-stale-addition",
+		Status:    op.WORK,
+		Addition:  newAddition,
+	}
+	if err := db.CreateStorage(&storage); err != nil {
+		t.Fatalf("CreateStorage failed: %v", err)
+	}
+	d := &open115.Open115{Storage: storage}
+	op.NotifyStorageTokenInvalidWithAddition(d, `{"access_token":"old","refresh_token":"old"}`)
+	if d.GetStorage().Status != op.WORK {
+		t.Fatalf("stale invalidation changed in-memory status to %q", d.GetStorage().Status)
+	}
+	got, err := db.GetStorageById(storage.ID)
+	if err != nil {
+		t.Fatalf("GetStorageById failed: %v", err)
+	}
+	if got.Status != op.WORK {
+		t.Fatalf("stale invalidation changed persisted status to %q", got.Status)
+	}
+}
+
+// Addition equality alone is not enough: UpdateStorage can replace a row while
+// an old client's callback is racing. The durable Modified generation is the
+// compare-and-swap guard that prevents that callback from touching the new row.
+func TestNotifyStorageTokenInvalidWithStaleGenerationKeepsReplacementWorking(t *testing.T) {
+	oldAddition := `{"access_token":"old","refresh_token":"old"}`
+	storage := model.Storage{
+		Driver:    "115 Open",
+		MountPath: "/token-invalid-stale-generation",
+		Status:    op.WORK,
+		Addition:  oldAddition,
+		Modified:  time.Now().Add(-time.Minute),
+	}
+	if err := db.CreateStorage(&storage); err != nil {
+		t.Fatalf("CreateStorage failed: %v", err)
+	}
+	oldGeneration := storage.Modified
+	newStorage := storage
+	newStorage.Addition = `{"access_token":"new","refresh_token":"new"}`
+	newStorage.Modified = time.Now()
+	if err := db.UpdateStorage(&newStorage); err != nil {
+		t.Fatalf("UpdateStorage replacement failed: %v", err)
+	}
+
+	// d deliberately models the old client object whose request began before
+	// the durable replacement. It is a real 115 driver value, not a fake.
+	d := &open115.Open115{Storage: storage}
+	op.NotifyStorageTokenInvalidWithSnapshot(d, oldAddition, oldGeneration)
+	if d.GetStorage().Status != op.WORK {
+		t.Fatalf("stale generation changed old in-memory status to %q", d.GetStorage().Status)
+	}
+	got, err := db.GetStorageById(storage.ID)
+	if err != nil {
+		t.Fatalf("GetStorageById failed: %v", err)
+	}
+	if got.Addition != newStorage.Addition || got.Status != op.WORK {
+		t.Fatalf("stale generation changed replacement row: %#v", got)
 	}
 }
 

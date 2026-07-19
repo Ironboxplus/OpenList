@@ -57,6 +57,11 @@ func (d *Open115) GetAddition() driver.Additional {
 }
 
 func (d *Open115) Init(ctx context.Context) error {
+	// This client generation can finish an old request after cluster recovery has
+	// replaced the storage. Bind auth callbacks to the Addition that configured
+	// this client so an old 401 cannot revoke the newly installed pair.
+	observedAddition := d.Storage.Addition
+	observedModified := d.Storage.Modified
 	d.client = new115SDKClient(sdk.WithRefreshToken(d.Addition.RefreshToken),
 		sdk.WithAccessToken(d.Addition.AccessToken),
 		sdk.WithOnRefreshToken(func(s1, s2 string) {
@@ -71,14 +76,14 @@ func (d *Open115) Init(ctx context.Context) error {
 			// A successful authenticated request renews the cluster's in-memory
 			// proof only. This avoids a periodic refresh/push while preventing a
 			// working credential from ageing out of recovery advertisement.
-			op.NotifyStorageTokenHealthy(d)
+			op.NotifyStorageTokenHealthyWithSnapshot(d, observedAddition, observedModified)
 			if d.shouldNotifyTokenValid() {
-				op.NotifyStorageTokenValid(d)
+				op.NotifyStorageTokenValidWithSnapshot(d, observedAddition, observedModified)
 			}
 		}),
 		sdk.WithOnTokenInvalid(func() {
 			if d.tokenInvalid.CompareAndSwap(false, true) {
-				op.NotifyStorageTokenInvalid(d)
+				op.NotifyStorageTokenInvalidWithSnapshot(d, observedAddition, observedModified)
 			}
 		}))
 	applySDKProxyIfConfigured(d.client)
