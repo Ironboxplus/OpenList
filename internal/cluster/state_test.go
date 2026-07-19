@@ -3,6 +3,10 @@ package cluster
 import (
 	"encoding/json"
 	"testing"
+
+	open115 "github.com/OpenListTeam/OpenList/v4/drivers/115_open"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 )
 
 // ---- credential extraction ----
@@ -57,6 +61,122 @@ func TestExtractAndApplyCreds(t *testing.T) {
 	// Re-applying identical creds is a no-op (idempotent — no churn).
 	if _, changed := applyCreds(out, newCreds); changed {
 		t.Fatal("re-applying identical creds must not report a change")
+	}
+}
+
+// A complete credential pair has one group-wide identity. Seeing the same pair
+// on another member must not turn it into a newer, independently revocable
+// candidate, and a provider-auth rejection must suppress every replay of it.
+func TestPairIdentityPreventsReauthoringAndBlocksReplayAfterRejection(t *testing.T) {
+	a, _ := newIdentity()
+	b, _ := newIdentity()
+	s := newStore()
+	pair := map[string]json.RawMessage{
+		"access_token":  json.RawMessage(`"access-A"`),
+		"refresh_token": json.RawMessage(`"refresh-A"`),
+	}
+
+	first, ok := s.localCredChange(a, "g1", "115 Open", "/storage/115", pair, 1)
+	if !ok {
+		t.Fatal("first locally proven pair should be recorded")
+	}
+	if _, ok := s.localCredChange(b, "g1", "115 Open", "/storage/115", pair, 2); ok {
+		t.Fatal("an imported pair must retain its original provenance, not be re-authored by another node")
+	}
+	if got := len(s.credsForGroup("g1")); got != 1 {
+		t.Fatalf("same pair must have one catalog entry, got %d", got)
+	}
+
+	rev, ok := s.revokePair(a, "g1", "/storage/115", first.CredHash, 3)
+	if !ok {
+		t.Fatal("provider-auth rejection must create a pair-level tombstone")
+	}
+	if got := len(s.credsForGroup("g1")); got != 0 {
+		t.Fatalf("pair tombstone must remove every copy, got %d", got)
+	}
+	if s.mergeCred(first) {
+		t.Fatal("a rejected pair must not be replayed by its original signer")
+	}
+	if _, ok := s.localCredChange(b, "g1", "115 Open", "/storage/115", pair, 4); ok {
+		t.Fatal("a rejected pair must not re-enter under another node identity")
+	}
+	if !s.mergeRevocation(rev) {
+		// A locally created tombstone is already present; repeated delivery must
+		// be a harmless no-op rather than changing catalog state.
+		if got := len(s.credsForGroup("g1")); got != 0 {
+			t.Fatalf("replayed tombstone changed catalog to %d entries", got)
+		}
+	}
+}
+
+// A legacy peer may already have re-authored a pair before v2 reaches every
+// node. Receiving that second signature must not recreate duplicate authority.
+func TestMergeCredRejectsPeerReauthoringOfExistingPair(t *testing.T) {
+	a, _ := newIdentity()
+	b, _ := newIdentity()
+	s := newStore()
+	pair := map[string]json.RawMessage{
+		"access_token":  json.RawMessage(`"access-A"`),
+		"refresh_token": json.RawMessage(`"refresh-A"`),
+	}
+	first, ok := s.localCredChange(a, "g1", "115 Open", "/storage/115", pair, 1)
+	if !ok {
+		t.Fatal("first pair should be recorded")
+	}
+	reauthored := &credRecord{
+		GroupID:      first.GroupID,
+		OriginDriver: first.OriginDriver,
+		Fields:       first.Fields,
+		CredHash:     first.CredHash,
+		Payload:      first.Payload,
+		Version:      first.Version + 100,
+		Origin:       b.NodeID,
+		OriginPub:    b.Pub,
+		OriginMount:  "/storage/115",
+		UpdatedAt:    2,
+	}
+	reauthored.Sig = b.sign(reauthored.signingBytes())
+	reauthored.MountSig = b.sign(reauthored.mountSigningBytes())
+	if s.mergeCred(reauthored) {
+		t.Fatal("same pair from another origin must not be accepted as a newer candidate")
+	}
+	if got := len(s.credsForGroup("g1")); got != 1 {
+		t.Fatalf("re-authored pair created %d catalog records, want 1", got)
+	}
+}
+
+// Storage updates are not credential-validation events. In particular,
+// UpdateStorage after receiving an imported pair must not re-sign and publish it
+// from the receiving node. This uses the real 115 driver type and real manager
+// state; no test driver or callback mock is involved.
+func TestOnlyTokenValidMayPublishStoragePair(t *testing.T) {
+	id, _ := newIdentity()
+	s := newStore()
+	s.setGroups(id, []group{{
+		ID:      "g1",
+		Members: []member{{NodeID: id.NodeID, MountPath: "/storage/115"}},
+	}}, 1)
+	m := &Manager{
+		id:       id,
+		state:    s,
+		conns:    newConnRegistry(),
+		cfgStore: &configStore{cfg: Config{Enabled: true, Key: "test-key", ApplyRemote: true}},
+	}
+	d := &open115.Open115{Storage: model.Storage{
+		MountPath: "/storage/115",
+		Driver:    "115 Open",
+		Status:    op.WORK,
+		Addition:  `{"access_token":"access-A","refresh_token":"refresh-A"}`,
+	}}
+
+	m.onStorageHook("update", d)
+	if got := len(s.credsForGroup("g1")); got != 0 {
+		t.Fatalf("ordinary update published %d credential record(s), want 0", got)
+	}
+
+	m.onStorageHook("token-valid", d)
+	if got := len(s.credsForGroup("g1")); got != 1 {
+		t.Fatalf("token-valid published %d credential record(s), want 1", got)
 	}
 }
 
@@ -510,9 +630,9 @@ func TestSignedRevocationRemovesRelayCopyButAllowsNewerRotation(t *testing.T) {
 	}
 }
 
-// canOfferCred requires a local health proof for this node's own candidates.
-// A signed, group-authorized peer candidate remains relayable: the hub need not
-// overwrite a healthy local mount merely to forward NAT peers' recovery path.
+// canOfferCred requires a local health proof for every candidate. A signature
+// proves provenance only; an unvalidated relay must not advertise a pair as a
+// recoverable credential.
 func TestCanOfferCred(t *testing.T) {
 	id1, _ := newIdentity() // self
 	id2, _ := newIdentity() // peer
@@ -528,8 +648,7 @@ func TestCanOfferCred(t *testing.T) {
 		t.Fatal("a nil record is never offerable")
 	}
 
-	// The hub may relay a peer-authored candidate without first applying it to a
-	// working local mount; its signature and group membership authorize that.
+	// A peer-authored candidate with no local proof is catalog data only.
 	payload := map[string]json.RawMessage{"refresh_token": json.RawMessage(`"peer"`)}
 	peer := &credRecord{
 		GroupID:      "g1",
@@ -542,8 +661,8 @@ func TestCanOfferCred(t *testing.T) {
 		OriginMount:  "/peer",
 	}
 	peer.Sig = id2.sign(peer.signingBytes())
-	if !m.canOfferCred(peer) {
-		t.Fatal("an authorized peer candidate must remain relayable")
+	if m.canOfferCred(peer) {
+		t.Fatal("an unvalidated peer candidate must not be advertised for recovery")
 	}
 
 	// our own record, but no group/healthy mount -> not offerable.

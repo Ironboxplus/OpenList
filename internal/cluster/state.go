@@ -596,7 +596,24 @@ func (s *store) localCredChange(id *identity, groupID, driver, mount string, pay
 		byOrigin = make(map[string]*credRecord)
 		s.creds[groupID] = byOrigin
 	}
-	if cur, ok := byOrigin[candidateKey(id.NodeID, mount)]; ok && cur.CredHash == h && cur.signatureKind() == credentialSignatureMountBound {
+	if s.pairRevokedLocked(groupID, h) {
+		return nil, false
+	}
+	key := candidateKey(id.NodeID, mount)
+	// Pair identity is group-wide. A node that adopted an existing peer pair
+	// must keep that pair's original provenance; re-signing it under another
+	// origin would let one 401 tombstone leave duplicate live copies behind.
+	for existingKey, existing := range byOrigin {
+		if existingKey == key && existing.CredHash == h && existing.signatureKind() != credentialSignatureMountBound {
+			// Preserve the rolling-compatible upgrade path for a record that this
+			// exact source had already authored under a legacy signature.
+			continue
+		}
+		if existing.CredHash == h {
+			return nil, false
+		}
+	}
+	if cur, ok := byOrigin[key]; ok && cur.CredHash == h && cur.signatureKind() == credentialSignatureMountBound {
 		return nil, false // this source mount has not changed
 	}
 	s.lamport++
@@ -614,7 +631,7 @@ func (s *store) localCredChange(id *identity, groupID, driver, mount string, pay
 	}
 	r.Sig = id.sign(r.signingBytes())
 	r.MountSig = id.sign(r.mountSigningBytes())
-	byOrigin[candidateKey(id.NodeID, mount)] = r
+	byOrigin[key] = r
 	return r, true
 }
 
@@ -624,15 +641,22 @@ func (s *store) mergeCred(r *credRecord) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.observe(r.Version)
+	if s.pairRevokedLocked(r.GroupID, r.CredHash) {
+		return false // a provider-auth tombstone is terminal for this complete pair
+	}
 	byOrigin := s.creds[r.GroupID]
+	for _, existing := range byOrigin {
+		if existing.CredHash == r.CredHash {
+			// A signature proves who observed the pair, not that this observer is
+			// entitled to mint a second authority record for it.
+			return false
+		}
+	}
 	if byOrigin == nil {
 		byOrigin = make(map[string]*credRecord)
 		s.creds[r.GroupID] = byOrigin
 	}
 	key := candidateKey(r.Origin, r.OriginMount)
-	if rev := s.revocations[r.GroupID][key]; rev != nil && rev.Version >= r.Version {
-		return false // a source-signed tombstone blocks relay replay of this version
-	}
 	cur, ok := byOrigin[key]
 	if ok {
 		if cur.CredHash == r.CredHash {
@@ -703,13 +727,69 @@ func (s *store) revokeOwnCred(id *identity, groupID, mount string, at int64) (*c
 		byRevocation = make(map[string]*credRevocation)
 		s.revocations[groupID] = byRevocation
 	}
-	byRevocation[key] = rev
-	delete(byOrigin, key)
+	byRevocation[rev.CredHash] = rev
+	for sourceKey, candidate := range byOrigin {
+		if candidate.CredHash == rev.CredHash {
+			delete(byOrigin, sourceKey)
+		}
+	}
 	if len(byOrigin) == 0 {
 		delete(s.creds, groupID)
 	}
 	cp := *rev
 	return &cp, true
+}
+
+// revokePair records a provider-auth rejection for a complete credential pair.
+// Unlike revokeOwnCred, the reporter need not be the pair's original publisher:
+// a 401 is about the pair itself, and must suppress every re-authored or relayed
+// copy in the group.
+func (s *store) revokePair(id *identity, groupID, mount, hash string, at int64) (*credRevocation, bool) {
+	if id == nil || groupID == "" || mount == "" || hash == "" || at <= 0 {
+		return nil, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pairRevokedLocked(groupID, hash) {
+		return nil, false
+	}
+	s.lamport++
+	rev := &credRevocation{
+		GroupID:     groupID,
+		Origin:      id.NodeID,
+		OriginPub:   id.Pub,
+		OriginMount: mount,
+		CredHash:    hash,
+		Version:     s.lamport,
+		UpdatedAt:   at,
+	}
+	rev.Sig = id.sign(rev.signingBytes())
+	byRevocation := s.revocations[groupID]
+	if byRevocation == nil {
+		byRevocation = make(map[string]*credRevocation)
+		s.revocations[groupID] = byRevocation
+	}
+	byRevocation[hash] = rev
+	if byOrigin := s.creds[groupID]; byOrigin != nil {
+		for sourceKey, candidate := range byOrigin {
+			if candidate.CredHash == hash {
+				delete(byOrigin, sourceKey)
+			}
+		}
+		if len(byOrigin) == 0 {
+			delete(s.creds, groupID)
+		}
+	}
+	cp := *rev
+	return &cp, true
+}
+
+func (s *store) pairRevokedLocked(groupID, hash string) bool {
+	if hash == "" {
+		return false
+	}
+	_, ok := s.revocations[groupID][hash]
+	return ok
 }
 
 func (s *store) revocationSnapshot() []*credRevocation {
@@ -737,9 +817,9 @@ func (s *store) revocationSnapshot() []*credRevocation {
 	return out
 }
 
-// mergeRevocation applies a verified tombstone and removes any same-source
-// candidate that it supersedes. A later credential from the source remains
-// allowed because it must carry a strictly greater Lamport version.
+// mergeRevocation applies a verified provider-auth tombstone. A tombstone is
+// keyed by complete pair hash, not by its reporting source: the same pair may
+// have been observed by several nodes, but one 401 makes every copy unusable.
 func (s *store) mergeRevocation(rev *credRevocation) bool {
 	if rev == nil {
 		return false
@@ -747,23 +827,24 @@ func (s *store) mergeRevocation(rev *credRevocation) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.observe(rev.Version)
-	key := candidateKey(rev.Origin, rev.OriginMount)
 	byRevocation := s.revocations[rev.GroupID]
 	if byRevocation == nil {
 		byRevocation = make(map[string]*credRevocation)
 		s.revocations[rev.GroupID] = byRevocation
 	}
-	if current := byRevocation[key]; current != nil && !rev.dominates(current) {
+	if current := byRevocation[rev.CredHash]; current != nil && !rev.dominates(current) {
 		return false
 	}
 	cp := *rev
-	byRevocation[key] = &cp
+	byRevocation[rev.CredHash] = &cp
 	if byOrigin := s.creds[rev.GroupID]; byOrigin != nil {
-		if current := byOrigin[key]; current != nil && current.Version <= rev.Version {
-			delete(byOrigin, key)
-			if len(byOrigin) == 0 {
-				delete(s.creds, rev.GroupID)
+		for sourceKey, candidate := range byOrigin {
+			if candidate.CredHash == rev.CredHash {
+				delete(byOrigin, sourceKey)
 			}
+		}
+		if len(byOrigin) == 0 {
+			delete(s.creds, rev.GroupID)
 		}
 	}
 	return true

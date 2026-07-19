@@ -3,6 +3,7 @@ package cluster
 import (
 	"context"
 	"encoding/json"
+	stderrors "errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,7 +11,9 @@ import (
 	"sync"
 	"time"
 
+	sdk "github.com/OpenListTeam/115-sdk-go"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
@@ -344,66 +347,25 @@ func (m *Manager) announceLoop() {
 
 // ---- credential seeding / hooks ----
 
-// seedLocalCreds records credentials for local healthy mounts that belong to a
-// group, pulls for member-groups we have no credential for yet, and re-applies
-// any held credential to local mounts (e.g. after a groups change).
+// seedLocalCreds only asks peers for catalog candidates after startup or a group
+// change. A persisted Storage.Status=WORK is not proof that its credential pair
+// is still accepted by the provider, so startup must never mint or broadcast a
+// candidate from it.
 func (m *Manager) seedLocalCreds() {
 	cfg := m.cfgStore.get()
 	if !cfg.active() {
 		return
 	}
 	selfID := m.id.NodeID
-	var changed bool
 	for _, d := range op.GetAllStorages() {
 		st := d.GetStorage()
 		groups := m.state.groupsForMount(selfID, st.MountPath)
 		if len(groups) == 0 {
 			continue
 		}
-		if st.Status != op.WORK {
-			// Unhealthy mount (e.g. token dead at boot): drop our own stale cred so
-			// it can't dominate a peer's valid one. Persisted peer candidates are
-			// tried before a network pull so restart recovery also works offline.
-			for _, g := range groups {
-				if rev, ok := m.revokeOwnCandidate(g.ID, st.MountPath); ok {
-					changed = true
-					m.broadcast(&syncMessage{Type: "push", Revocations: []*credRevocation{rev}})
-				}
-				for _, candidate := range m.state.credsForGroup(g.ID) {
-					m.applyCredRecord(candidate)
-				}
-				if d.GetStorage().Status != op.WORK {
-					m.pullGroup(g.ID)
-				}
-			}
-			continue
-		}
-		creds := extractCreds(st.Addition)
-		credID := credHash(creds)
 		for _, g := range groups {
-			if m.state.hasCredForSource(g.ID, selfID, st.MountPath, credID) {
-				m.state.markCandidateHealthy(g.ID, credID, now())
-				continue // keep the original peer signature when the token is identical
-			}
-			if rec, ok := m.state.localCredChange(m.id, g.ID, st.Driver, st.MountPath, creds, now()); ok {
-				m.state.markCandidateHealthy(g.ID, rec.CredHash, now())
-				changed = true
-				m.recordEvent("share", g.ID, fmt.Sprintf("%s shared %d credential field(s)", st.MountPath, len(rec.Fields)))
-				m.broadcast(&syncMessage{Type: "push", Creds: []*credRecord{rec}})
-			}
-		}
-	}
-	// member-groups we hold no credential for: ask peers.
-	for _, g := range m.state.groupList() {
-		if len(g.mountsForNode(selfID)) == 0 {
-			continue
-		}
-		if len(m.state.credsForGroup(g.ID)) == 0 {
 			m.pullGroup(g.ID)
 		}
-	}
-	if changed {
-		m.persist()
 	}
 }
 
@@ -431,7 +393,7 @@ func (m *Manager) onStorageHook(typ string, d driver.Driver) {
 		return
 	}
 	switch typ {
-	case "add", "update", "token-valid":
+	case "token-valid":
 		// "token-valid" is fired when an authenticated request just proved the
 		// token good — (re)share it so peers converge on the working credential.
 		if st.Status != op.WORK {
@@ -460,6 +422,11 @@ func (m *Manager) onStorageHook(typ string, d driver.Driver) {
 		if dirty {
 			m.persist()
 		}
+	case "add", "update":
+		// Storage lifecycle updates are not provider-authentication evidence.
+		// In particular, UpdateStorage after staging a peer candidate must never
+		// turn that pair into a newly authored local credential record.
+		return
 	case "del":
 		// A mount was removed locally. We keep the group's credential record (other
 		// members still rely on it); only our inventory changes (handled above).
@@ -481,7 +448,7 @@ func (m *Manager) onStorageHook(typ string, d driver.Driver) {
 			m.state.forgetCandidateHealth(g.ID, credID)
 			m.state.markCandidateFailed(g.ID, st.MountPath, credID, now())
 			changed = true
-			if rev, ok := m.revokeOwnCandidate(g.ID, st.MountPath); ok {
+			if rev, ok := m.state.revokePair(m.id, g.ID, st.MountPath, credID, now()); ok {
 				m.recordEvent("invalidate", g.ID,
 					fmt.Sprintf("%s token invalid — dropped local cred, pulling from peers", st.MountPath))
 				m.broadcast(&syncMessage{Type: "push", Revocations: []*credRevocation{rev}})
@@ -546,15 +513,21 @@ func (m *Manager) recoverKnownCandidates(groupID, mount, failedHash string) {
 		if !m.credentialAuthorized(candidate) {
 			continue
 		}
-		attempted, ok := m.applyCredRecordToMount(candidate, mount)
+		attempted, ok, terminal := m.applyCredRecordToMount(candidate, mount)
 		if !attempted {
 			continue
 		}
 		if ok {
 			return
 		}
-		m.state.markCandidateFailed(groupID, mount, candidate.CredHash, now())
-		changed = true
+		if terminal {
+			if rev, revoked := m.state.revokePair(m.id, groupID, mount, candidate.CredHash, now()); revoked {
+				m.recordEvent("invalidate", groupID,
+					fmt.Sprintf("%s rejected candidate %s with provider 401", mount, shortHash(candidate.CredHash)))
+				m.broadcast(&syncMessage{Type: "push", Revocations: []*credRevocation{rev}})
+				changed = true
+			}
+		}
 	}
 	if changed {
 		m.persist()
@@ -609,9 +582,6 @@ func (m *Manager) canOfferCred(r *credRecord) bool {
 	if !m.credentialAuthorized(r) {
 		return false
 	}
-	if r.Origin != m.id.NodeID {
-		return true
-	}
 	return m.hasHealthyLocalCandidate(r)
 }
 
@@ -659,12 +629,12 @@ func (m *Manager) applyCredRecord(r *credRecord) {
 }
 
 // applyCredRecordToMount adopts one candidate on one local mount. It returns
-// whether a re-initialization was attempted and whether it completed with a
-// working storage; recovery uses that distinction to quarantine only candidates
-// that actually failed on this node.
-func (m *Manager) applyCredRecordToMount(r *credRecord, mp string) (attempted, success bool) {
+// whether a probe was attempted, whether activation completed, and whether the
+// probe received an exact provider-auth 401. Candidate payloads are verified by
+// a temporary real driver before production storage is changed.
+func (m *Manager) applyCredRecordToMount(r *credRecord, mp string) (attempted, success, terminal bool) {
 	if r == nil || !m.cfgStore.get().ApplyRemote || m.state.candidateFailed(r.GroupID, mp, r.CredHash) {
-		return false, false
+		return false, false, false
 	}
 	ctx := context.Background()
 	{
@@ -673,33 +643,69 @@ func (m *Manager) applyCredRecordToMount(r *credRecord, mp string) (attempted, s
 		defer lock.Unlock()
 		d, err := op.GetStorageByMountPath(mp)
 		if err != nil {
-			return false, false
+			return false, false, false
 		}
-		st := *d.GetStorage() // copy; preserve ID/Status/local fields
+		before := *d.GetStorage() // preserve a local LKG for rollback
+		st := before
 		if r.OriginDriver != "" && st.Driver != r.OriginDriver {
 			utils.Log.Warnf("[cluster] skip applying %s creds to %s: driver mismatch (%s != %s)",
 				r.GroupID, mp, st.Driver, r.OriginDriver)
-			return false, false
+			return false, false, false
 		}
 		if st.Status == op.WORK {
 			// A peer's newer Lamport value is a recovery candidate, not authority
 			// to overwrite credentials this mount has already proved locally.
-			return false, false
+			return false, false, false
 		}
 		newAdd, changed := applyCreds(st.Addition, r.Payload)
 		if !changed {
-			return false, false // already has these credentials — no churn, no re-init
+			return false, false, false // already has these credentials — no churn, no re-init
+		}
+		if err := probeCredential(ctx, st, newAdd); err != nil {
+			utils.Log.Warnf("[cluster] probe candidate %s for %s failed: %v", shortHash(r.CredHash), mp, err)
+			return true, false, isProvider401(err)
 		}
 		st.Addition = newAdd
 		if err := op.UpdateStorage(ctx, st); err != nil {
 			utils.Log.Warnf("[cluster] apply creds to %s failed: %v", mp, err)
-			return true, false
+			// UpdateStorage persists before it initializes. Restore the complete
+			// previous storage record rather than leaving an unproven pair behind.
+			if rollbackErr := op.UpdateStorage(ctx, before); rollbackErr != nil {
+				utils.Log.Errorf("[cluster] rollback %s after failed candidate commit: %v", mp, rollbackErr)
+			}
+			return true, false, false
 		}
+		m.state.markCandidateHealthy(r.GroupID, r.CredHash, now())
 		m.recordEvent("apply", r.GroupID, fmt.Sprintf("%s adopted credentials from %s", mp, shortNode(r.Origin)))
 		utils.Log.Infof("[cluster] applied group %s credentials to %s (v%d from %s)", r.GroupID, mp, r.Version, r.Origin)
-		return true, true
+		return true, true, false
 	}
-	return false, false
+	return false, false, false
+}
+
+// probeCredential constructs the registered production driver in isolation. It
+// runs that driver's actual Init path (115 Open performs UserInfo) without
+// registering it in op's storage map or writing SQLite. A failed candidate thus
+// never replaces the mount's active/LKG pair.
+func probeCredential(ctx context.Context, storage model.Storage, addition string) error {
+	constructor, err := op.GetDriver(storage.Driver)
+	if err != nil {
+		return err
+	}
+	temporary := constructor()
+	storage.Addition = addition
+	temporary.SetStorage(storage)
+	if err := utils.Json.UnmarshalFromString(storage.Addition, temporary.GetAddition()); err != nil {
+		return err
+	}
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	return temporary.Init(probeCtx)
+}
+
+func isProvider401(err error) bool {
+	var authErr *sdk.Error
+	return stderrors.As(err, &authErr) && sdk.Is401Started(authErr.Code)
 }
 
 // ---- absorb (merge) helpers ----
@@ -739,7 +745,6 @@ func (m *Manager) absorbCreds(recs []*credRecord) []*credRecord {
 		}
 		if m.state.mergeCred(r) {
 			merged = append(merged, r)
-			m.applyCredRecord(r)
 		}
 	}
 	if len(merged) > 0 {
