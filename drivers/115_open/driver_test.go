@@ -16,13 +16,16 @@ import (
 
 	sdk "github.com/OpenListTeam/115-sdk-go"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	driverpkg "github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+	"github.com/glebarez/sqlite"
 	"golang.org/x/time/rate"
+	"gorm.io/gorm"
 )
 
 type recordedRequest struct {
@@ -311,6 +314,107 @@ func TestOpen115InitRateLimitsAuthAndRootInfo(t *testing.T) {
 	minGap := time.Duration(float64(time.Second) / limitRate * 0.7)
 	if gap < minGap {
 		t.Fatalf("Init SDK requests were too close (%v), expected at least %v; auth/root-info calls are not both rate-limited", gap, minGap)
+	}
+}
+
+func TestOpen115RefreshRestoresErrorStateAndPublishesNewPair(t *testing.T) {
+	database, err := gorm.Open(sqlite.Open("file:open115-refresh-recovery?mode=memory&cache=shared"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	db.Init(database)
+
+	var refreshCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open/refreshToken":
+			refreshCount++
+			writeSDKResponse(t, w, map[string]any{
+				"state": 1,
+				"code":  0,
+				"data": map[string]any{
+					"access_token":  "fresh-access",
+					"refresh_token": "fresh-refresh",
+					"expires_in":    7200,
+				},
+			})
+		case "/open/user/info":
+			if r.Header.Get("Authorization") != "Bearer fresh-access" {
+				writeSDKError(t, w, 40140125, "access_token invalid")
+				return
+			}
+			writeSDKSuccess(t, w, map[string]any{})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	target, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("Parse server URL failed: %v", err)
+	}
+	oldNewClient := new115SDKClient
+	t.Cleanup(func() { new115SDKClient = oldNewClient })
+	new115SDKClient = func(opts ...sdk.Option) *sdk.Client {
+		client := sdk.New(opts...)
+		client.SetHttpClient(&http.Client{Transport: &rewriteTransport{target: target, base: http.DefaultTransport}})
+		return client
+	}
+
+	driver := &Open115{Addition: Addition{
+		RootID:       driverpkg.RootID{RootFolderID: "0"},
+		AccessToken:  "expired-access",
+		RefreshToken: "live-refresh",
+	}}
+	storage := model.Storage{
+		Driver:    "115 Open",
+		MountPath: "/refresh-recovery",
+		Status:    "code: 40140125, message: access_token invalid",
+		Addition:  `{"access_token":"expired-access","refresh_token":"live-refresh"}`,
+	}
+	if err := db.CreateStorage(&storage); err != nil {
+		t.Fatalf("CreateStorage failed: %v", err)
+	}
+	driver.Storage = storage
+	proof := make(chan op.StorageCredentialEvent, 1)
+	op.RegisterStorageCredentialHook(func(typ string, event op.StorageCredentialEvent) {
+		if typ != "token-valid" || event.Storage != driver {
+			return
+		}
+		select {
+		case proof <- event:
+		default:
+		}
+	})
+
+	if err := driver.Init(context.Background()); err != nil {
+		t.Fatalf("Init after access-token expiry failed: %v", err)
+	}
+	if refreshCount != 1 {
+		t.Fatalf("refresh count = %d, want exactly 1", refreshCount)
+	}
+	if driver.Addition.AccessToken != "fresh-access" || driver.Addition.RefreshToken != "fresh-refresh" {
+		t.Fatalf("refreshed pair was not installed: access=%q refresh=%q", driver.Addition.AccessToken, driver.Addition.RefreshToken)
+	}
+	if driver.Storage.Status != op.WORK {
+		t.Fatalf("refreshed mount status = %q, want WORK", driver.Storage.Status)
+	}
+	persisted, err := db.GetStorageById(storage.ID)
+	if err != nil {
+		t.Fatalf("GetStorageById failed: %v", err)
+	}
+	if persisted.Status != op.WORK || !strings.Contains(persisted.Addition, "fresh-access") {
+		t.Fatalf("refreshed storage was not durably recovered: %#v", persisted)
+	}
+	select {
+	case event := <-proof:
+		if !strings.Contains(event.Addition, "fresh-access") || !strings.Contains(event.Addition, "fresh-refresh") {
+			t.Fatalf("published stale credential generation: %s", event.Addition)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("refreshed and proven pair was not published")
 	}
 }
 

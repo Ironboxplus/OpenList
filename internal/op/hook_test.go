@@ -63,6 +63,37 @@ func TestNotifyStorageTokenValidRestoresStatus(t *testing.T) {
 		t.Fatalf("persisted status = %q, want %q", got.Status, op.WORK)
 	}
 }
+
+func TestNotifyStorageTokenValidPublishesProvenPairWhileAlreadyWork(t *testing.T) {
+	d := &open115.Open115{Storage: model.Storage{
+		Driver:    "115 Open",
+		MountPath: "/token-valid-rotated-pair",
+		Status:    op.WORK,
+		Addition:  `{"access_token":"fresh","refresh_token":"rotated"}`,
+	}}
+	proof := make(chan op.StorageCredentialEvent, 1)
+	op.RegisterStorageCredentialHook(func(typ string, event op.StorageCredentialEvent) {
+		if typ != "token-valid" || event.Storage != d {
+			return
+		}
+		select {
+		case proof <- event:
+		default:
+		}
+	})
+
+	op.NotifyStorageTokenValidWithSnapshot(d, d.Storage.Addition, d.Storage.Modified)
+
+	select {
+	case event := <-proof:
+		if event.Addition != d.Storage.Addition || !event.Modified.Equal(d.Storage.Modified) {
+			t.Fatalf("credential proof used the wrong generation: %#v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a proven rotated pair was not published while status was already WORK")
+	}
+}
+
 func TestNotifyStorageTokenInvalidMarksStatusAndPersists(t *testing.T) {
 	storage := model.Storage{
 		Driver:    "TokenInvalidTest",

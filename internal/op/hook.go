@@ -293,11 +293,14 @@ func NotifyStorageTokenValidWithSnapshot(storage driver.Driver, addition string,
 	storageTokenStatusMu.Unlock()
 	if changed {
 		go callStorageHooks("token-valid", storage)
-		event := StorageCredentialEvent{Storage: storage, Addition: addition, Modified: modified}
-		for _, hook := range storageCredentialHooks {
-			hook := hook
-			go hook("token-valid", event)
-		}
+	}
+	// Credential proof is distinct from lifecycle status. A successful refresh
+	// rotates the pair while the mount may remain WORK; cluster sync must still
+	// receive and publish that newly proven generation.
+	event := StorageCredentialEvent{Storage: storage, Addition: addition, Modified: modified}
+	for _, hook := range storageCredentialHooks {
+		hook := hook
+		go hook("token-valid", event)
 	}
 }
 

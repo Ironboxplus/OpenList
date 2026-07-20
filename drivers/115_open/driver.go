@@ -62,6 +62,7 @@ func (d *Open115) Init(ctx context.Context) error {
 	// this client so an old 401 cannot revoke the newly installed pair.
 	observedAddition := d.Storage.Addition
 	observedModified := d.Storage.Modified
+	observedAccessToken := d.Addition.AccessToken
 	d.client = new115SDKClient(sdk.WithRefreshToken(d.Addition.RefreshToken),
 		sdk.WithAccessToken(d.Addition.AccessToken),
 		sdk.WithOnRefreshToken(func(s1, s2 string) {
@@ -72,13 +73,22 @@ func (d *Open115) Init(ctx context.Context) error {
 		// Cluster token-validity protocol: a node only shares a token it has
 		// proven valid, and pulls a fresh one from a healthy peer when its own
 		// dies. Edge-triggered so the cluster only reacts to real transitions.
-		sdk.WithOnTokenValid(func() {
+		sdk.WithOnAccessTokenValid(func(accessToken string) {
+			st := d.GetStorage()
+			if st == nil || d.Addition.AccessToken != accessToken {
+				return
+			}
+			currentAddition := st.Addition
+			currentModified := st.Modified
 			// A successful authenticated request renews the cluster's in-memory
 			// proof only. This avoids a periodic refresh/push while preventing a
 			// working credential from ageing out of recovery advertisement.
-			op.NotifyStorageTokenHealthyWithSnapshot(d, observedAddition, observedModified)
-			if d.shouldNotifyTokenValid() {
-				op.NotifyStorageTokenValidWithSnapshot(d, observedAddition, observedModified)
+			op.NotifyStorageTokenHealthyWithSnapshot(d, currentAddition, currentModified)
+			// A refresh creates a new credential generation even when the mount
+			// never left WORK. Publish that generation after the retried request
+			// proves it, and also recover any pre-existing error status.
+			if accessToken != observedAccessToken || d.shouldNotifyTokenValid() {
+				op.NotifyStorageTokenValidWithSnapshot(d, currentAddition, currentModified)
 			}
 		}),
 		sdk.WithOnTokenInvalid(func() {
