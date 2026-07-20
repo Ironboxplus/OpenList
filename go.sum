@@ -27,6 +27,8 @@ github.com/Ironboxplus/115-sdk-go v0.2.13 h1:B815N2mOq2lF2QDyANnkZW3mpmFM7xrBJrq
 github.com/Ironboxplus/115-sdk-go v0.2.13/go.mod h1:cfvitk2lwe6036iNi2h+iNxwxWDifKZsSvNtrur5BqU=
 github.com/Ironboxplus/115-sdk-go v0.2.14 h1:BN1FjRDbJ/UQiwWwO6mbfoU52L9/46l5oHbyEcWDhSI=
 github.com/Ironboxplus/115-sdk-go v0.2.14/go.mod h1:cfvitk2lwe6036iNi2h+iNxwxWDifKZsSvNtrur5BqU=
+github.com/Ironboxplus/115-sdk-go v0.2.15 h1:GEFamzPCINsB2aRxjcQyvsqC0SmXuQ6H417Ga7BKUII=
+github.com/Ironboxplus/115-sdk-go v0.2.15/go.mod h1:cfvitk2lwe6036iNi2h+iNxwxWDifKZsSvNtrur5BqU=
 github.com/KirCute/zip v1.0.1 h1:L/tVZglOiDVKDi9Ud+fN49htgKdQ3Z0H80iX8OZk13c=
 github.com/KirCute/zip v1.0.1/go.mod h1:xhF7dCB+Bjvy+5a56lenYCKBsH+gxDNPZSy5Cp+nlXk=
 github.com/Masterminds/semver/v3 v3.2.0 h1:3MEsd0SM6jqZojhjLWWeBY+Kcjy9i6MQAeY7YgDP83g=

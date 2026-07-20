@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -326,6 +327,7 @@ func TestOpen115RefreshRestoresErrorStateAndPublishesNewPair(t *testing.T) {
 	db.Init(database)
 
 	var refreshCount int
+	var rejectFresh atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/open/refreshToken":
@@ -342,6 +344,10 @@ func TestOpen115RefreshRestoresErrorStateAndPublishesNewPair(t *testing.T) {
 		case "/open/user/info":
 			if r.Header.Get("Authorization") != "Bearer fresh-access" {
 				writeSDKError(t, w, 40140125, "access_token invalid")
+				return
+			}
+			if rejectFresh.Load() {
+				writeSDKError(t, w, 40140120, "refresh token error")
 				return
 			}
 			writeSDKSuccess(t, w, map[string]any{})
@@ -415,6 +421,24 @@ func TestOpen115RefreshRestoresErrorStateAndPublishesNewPair(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("refreshed and proven pair was not published")
+	}
+
+	// The same long-lived driver may fail hours after refreshing. The invalid
+	// callback must bind to fresh-access, not the pre-refresh generation that
+	// configured the client.
+	rejectFresh.Store(true)
+	if _, err := driver.client.UserInfo(context.Background()); err == nil {
+		t.Fatal("expected the refreshed generation to become invalid")
+	}
+	if driver.Storage.Status == op.WORK {
+		t.Fatal("refreshed generation 401 did not invalidate the mounted storage")
+	}
+	persisted, err = db.GetStorageById(storage.ID)
+	if err != nil {
+		t.Fatalf("GetStorageById after invalidation failed: %v", err)
+	}
+	if persisted.Status == op.WORK {
+		t.Fatal("refreshed generation 401 was not persisted for peer recovery")
 	}
 }
 
