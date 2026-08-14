@@ -30,6 +30,9 @@ const (
 	peerLivenessSec = 130
 	// maxEvents bounds the in-memory activity log surfaced to the UI.
 	maxEvents = 60
+	// defaultCandidateRetryDelay matches the SDK refresh cooldown. A provider throttle
+	// must not be retried immediately by a fresh probe client.
+	defaultCandidateRetryDelay = 5 * time.Minute
 )
 
 // Manager is the running cluster credential-sync engine for this node.
@@ -43,9 +46,12 @@ type Manager struct {
 
 	persistMu sync.Mutex
 
-	recoveryMu     sync.Mutex
-	recoveryLocks  map[string]*sync.Mutex // per local mount: serialize credential adoption
-	recoveryQueues map[string]*recoveryQueue
+	recoveryMu          sync.Mutex
+	recoveryLocks       map[string]*sync.Mutex // per local mount: serialize credential adoption
+	recoveryQueues      map[string]*recoveryQueue
+	recoveryRetries     map[string]struct{} // (group, mount, credential) delayed retries
+	candidateRetryDelay time.Duration
+	probeCredentialFn   func(context.Context, model.Storage, string) error
 
 	dialMu  sync.Mutex
 	dialing map[string]bool // peer URLs with an in-flight/live outbound dial
@@ -85,16 +91,17 @@ func Init(dataDir string) (*Manager, error) {
 		return nil, err
 	}
 	m := &Manager{
-		dir:            dir,
-		id:             id,
-		cfgStore:       newConfigStore(dir),
-		state:          newStore(),
-		replay:         newReplayCache(replayWindowSec),
-		conns:          newConnRegistry(),
-		dialing:        make(map[string]bool),
-		recoveryLocks:  make(map[string]*sync.Mutex),
-		recoveryQueues: make(map[string]*recoveryQueue),
-		stopCh:         make(chan struct{}),
+		dir:             dir,
+		id:              id,
+		cfgStore:        newConfigStore(dir),
+		state:           newStore(),
+		replay:          newReplayCache(replayWindowSec),
+		conns:           newConnRegistry(),
+		dialing:         make(map[string]bool),
+		recoveryLocks:   make(map[string]*sync.Mutex),
+		recoveryQueues:  make(map[string]*recoveryQueue),
+		recoveryRetries: make(map[string]struct{}),
+		stopCh:          make(chan struct{}),
 	}
 	if _, err := m.cfgStore.loadOrInit(); err != nil {
 		return nil, err
@@ -585,9 +592,67 @@ func (m *Manager) finishCandidateRecovery(key string) {
 	delete(m.recoveryQueues, key)
 }
 
+// scheduleCandidateRetry keeps one delayed retry per credential and mount.
+// 40140117 is a provider cooldown, so retrying immediately with a new SDK
+// client would only extend the throttle; dropping the work item would leave a
+// still-valid catalogued pair dormant until restart.
+func (m *Manager) scheduleCandidateRetry(candidate *credRecord, mount string) {
+	if candidate == nil || mount == "" {
+		return
+	}
+	retryKey := candidate.GroupID + "\x00" + mount + "\x00" + candidate.CredHash
+	m.recoveryMu.Lock()
+	if m.recoveryRetries == nil {
+		m.recoveryRetries = make(map[string]struct{})
+	}
+	if _, exists := m.recoveryRetries[retryKey]; exists {
+		m.recoveryMu.Unlock()
+		return
+	}
+	m.recoveryRetries[retryKey] = struct{}{}
+	delay := m.candidateRetryDelay
+	if delay <= 0 {
+		delay = defaultCandidateRetryDelay
+	}
+	stopCh := m.stopCh
+	cp := *candidate
+	m.recoveryMu.Unlock()
+
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-stopCh:
+			m.recoveryMu.Lock()
+			delete(m.recoveryRetries, retryKey)
+			m.recoveryMu.Unlock()
+			return
+		}
+		m.recoveryMu.Lock()
+		delete(m.recoveryRetries, retryKey)
+		m.recoveryMu.Unlock()
+		select {
+		case <-stopCh:
+			return
+		default:
+		}
+		if !m.state.hasCredHash(cp.GroupID, cp.CredHash) || m.state.candidateFailed(cp.GroupID, mount, cp.CredHash) {
+			return
+		}
+		storage, err := op.GetStorageByMountPath(mount)
+		if err != nil || storage.GetStorage().Status == op.WORK {
+			return
+		}
+		m.enqueueCandidate(&cp, mount)
+	}()
+}
+
 // runCandidateRecovery is the only place a received candidate may become the
-// mount's active storage. A successful probe stops the queue; a provider 401
-// emits a durable group-wide tombstone before the next candidate is attempted.
+// mount's active storage. A successful probe stops the queue; a terminal
+// provider 401 emits a durable group-wide tombstone before the next candidate
+// is attempted. A 40140117 refresh throttle is retryable and must keep the
+// candidate catalogued.
 func (m *Manager) runCandidateRecovery(key, groupID, mount string) {
 	for {
 		candidate := m.takeCandidate(key)
@@ -597,10 +662,14 @@ func (m *Manager) runCandidateRecovery(key, groupID, mount string) {
 		if !m.credentialAuthorized(candidate) {
 			continue
 		}
-		attempted, success, terminal := m.applyCredRecordToMount(candidate, mount)
+		attempted, success, terminal, retryable := m.applyCredRecordToMount(candidate, mount)
 		if success {
 			m.finishCandidateRecovery(key)
 			return
+		}
+		if retryable {
+			m.scheduleCandidateRetry(candidate, mount)
+			continue
 		}
 		if !attempted || !terminal {
 			continue
@@ -712,12 +781,13 @@ func (m *Manager) applyCredRecord(r *credRecord) {
 }
 
 // applyCredRecordToMount adopts one candidate on one local mount. It returns
-// whether a probe was attempted, whether activation completed, and whether the
-// probe received an exact provider-auth 401. Candidate payloads are verified by
-// a temporary real driver before production storage is changed.
-func (m *Manager) applyCredRecordToMount(r *credRecord, mp string) (attempted, success, terminal bool) {
+// whether a probe was attempted, whether activation completed, whether the
+// probe received a terminal provider-auth 401, and whether it received the
+// retryable 40140117 throttle. Candidate payloads are verified by a temporary
+// real driver before production storage is changed.
+func (m *Manager) applyCredRecordToMount(r *credRecord, mp string) (attempted, success, terminal, retryable bool) {
 	if r == nil || !m.cfgStore.get().ApplyRemote || m.state.candidateFailed(r.GroupID, mp, r.CredHash) {
-		return false, false, false
+		return false, false, false, false
 	}
 	ctx := context.Background()
 	{
@@ -726,27 +796,31 @@ func (m *Manager) applyCredRecordToMount(r *credRecord, mp string) (attempted, s
 		defer lock.Unlock()
 		d, err := op.GetStorageByMountPath(mp)
 		if err != nil {
-			return false, false, false
+			return false, false, false, false
 		}
 		before := *d.GetStorage() // preserve a local LKG for rollback
 		st := before
 		if r.OriginDriver != "" && st.Driver != r.OriginDriver {
 			utils.Log.Warnf("[cluster] skip applying %s creds to %s: driver mismatch (%s != %s)",
 				r.GroupID, mp, st.Driver, r.OriginDriver)
-			return false, false, false
+			return false, false, false, false
 		}
 		if st.Status == op.WORK {
 			// A peer's newer Lamport value is a recovery candidate, not authority
 			// to overwrite credentials this mount has already proved locally.
-			return false, false, false
+			return false, false, false, false
 		}
 		newAdd, changed := applyCreds(st.Addition, r.Payload)
 		if !changed {
-			return false, false, false // already has these credentials — no churn, no re-init
+			return false, false, false, false // already has these credentials — no churn, no re-init
 		}
-		if err := probeCredential(ctx, st, newAdd); err != nil {
+		probe := m.probeCredentialFn
+		if probe == nil {
+			probe = probeCredential
+		}
+		if err := probe(ctx, st, newAdd); err != nil {
 			utils.Log.Warnf("[cluster] probe candidate %s for %s failed: %v", shortHash(r.CredHash), mp, err)
-			return true, false, isProvider401(err)
+			return true, false, isProvider401(err), isProviderRefreshThrottle(err)
 		}
 		st.Addition = newAdd
 		if err := op.UpdateStorage(ctx, st); err != nil {
@@ -756,14 +830,13 @@ func (m *Manager) applyCredRecordToMount(r *credRecord, mp string) (attempted, s
 			if rollbackErr := op.UpdateStorage(ctx, before); rollbackErr != nil {
 				utils.Log.Errorf("[cluster] rollback %s after failed candidate commit: %v", mp, rollbackErr)
 			}
-			return true, false, false
+			return true, false, false, false
 		}
 		m.state.markCandidateHealthy(r.GroupID, r.CredHash, now())
 		m.recordEvent("apply", r.GroupID, fmt.Sprintf("%s adopted credentials from %s", mp, shortNode(r.Origin)))
 		utils.Log.Infof("[cluster] applied group %s credentials to %s (v%d from %s)", r.GroupID, mp, r.Version, r.Origin)
-		return true, true, false
+		return true, true, false, false
 	}
-	return false, false, false
 }
 
 // probeCredential constructs the registered production driver in isolation. It
@@ -799,7 +872,12 @@ func newProbeStorage(live model.Storage, addition string) model.Storage {
 
 func isProvider401(err error) bool {
 	var authErr *sdk.Error
-	return stderrors.As(err, &authErr) && sdk.Is401Started(authErr.Code)
+	return stderrors.As(err, &authErr) && authErr.Code != sdk.CodeRefreshFrequently && sdk.Is401Started(authErr.Code)
+}
+
+func isProviderRefreshThrottle(err error) bool {
+	var authErr *sdk.Error
+	return stderrors.As(err, &authErr) && authErr.Code == sdk.CodeRefreshFrequently
 }
 
 // ---- absorb (merge) helpers ----

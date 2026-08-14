@@ -311,6 +311,6 @@ replace github.com/ProtonMail/go-proton-api => github.com/henrybear327/go-proton
 
 replace github.com/cronokirby/saferith => github.com/Da3zKi7/saferith v0.33.0-fixed
 
-replace github.com/OpenListTeam/115-sdk-go => github.com/Ironboxplus/115-sdk-go v0.2.15
+replace github.com/OpenListTeam/115-sdk-go => github.com/Ironboxplus/115-sdk-go v0.2.17
 
 replace github.com/KarpelesLab/reflink => github.com/OpenListTeam/reflink v0.0.0-20260520031008-ed3c0dbe8009

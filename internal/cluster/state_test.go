@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	sdk "github.com/OpenListTeam/115-sdk-go"
 	open115 "github.com/OpenListTeam/OpenList/v4/drivers/115_open"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/local"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -16,6 +18,32 @@ import (
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 )
+
+func TestProvider401ClassificationKeepsRefreshThrottleRetryable(t *testing.T) {
+	tests := []struct {
+		name     string
+		code     int64
+		terminal bool
+	}{
+		{name: "refresh throttle", code: sdk.CodeRefreshFrequently, terminal: false},
+		{name: "dead refresh token", code: sdk.CodeRefreshTokenError, terminal: true},
+		{name: "invalid access after refresh", code: 40140126, terminal: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isProvider401(&sdk.Error{Code: tt.code, Message: tt.name})
+			if got != tt.terminal {
+				t.Fatalf("isProvider401(%d) = %v, want %v", tt.code, got, tt.terminal)
+			}
+		})
+	}
+	if !isProviderRefreshThrottle(&sdk.Error{Code: sdk.CodeRefreshFrequently}) {
+		t.Fatal("40140117 was not classified for delayed retry")
+	}
+	if isProviderRefreshThrottle(&sdk.Error{Code: sdk.CodeRefreshTokenError}) {
+		t.Fatal("40140120 was incorrectly classified as retryable")
+	}
+}
 
 // ---- credential extraction ----
 
@@ -830,6 +858,94 @@ func TestReceivedCandidateRecoversInvalidMountWithRealDriver(t *testing.T) {
 	}
 	current, _ := op.GetStorageByMountPath(mount)
 	t.Fatalf("received candidate did not activate invalid mount: %#v", current.GetStorage())
+}
+
+func TestRefreshThrottleRequeuesCandidateAfterCooldown(t *testing.T) {
+	dbName := fmt.Sprintf("file:cluster-throttle-retry-%d?mode=memory&cache=shared", time.Now().UnixNano())
+	database, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	db.Init(database)
+
+	mount := fmt.Sprintf("/cluster-throttle-retry-%d", time.Now().UnixNano())
+	id, err := op.CreateStorage(context.Background(), model.Storage{
+		Driver:    "Local",
+		MountPath: mount,
+		Addition:  fmt.Sprintf(`{"root_folder_path":%q}`, t.TempDir()),
+	})
+	if err != nil {
+		t.Fatalf("create real local storage: %v", err)
+	}
+	t.Cleanup(func() { _ = op.DeleteStorageById(context.Background(), id) })
+
+	local, _ := newIdentity()
+	peer, _ := newIdentity()
+	admin, _ := newIdentity()
+	state := newStore()
+	state.setGroups(admin, []group{{
+		ID: "g1",
+		Members: []member{
+			{NodeID: local.NodeID, MountPath: mount},
+			{NodeID: peer.NodeID, MountPath: "/peer"},
+		},
+	}}, 1)
+	var probes atomic.Int32
+	manager := &Manager{
+		dir:                 t.TempDir(),
+		id:                  local,
+		state:               state,
+		conns:               newConnRegistry(),
+		cfgStore:            &configStore{cfg: Config{Enabled: true, Key: "test-key", ApplyRemote: true}},
+		stopCh:              make(chan struct{}),
+		candidateRetryDelay: 20 * time.Millisecond,
+		probeCredentialFn: func(context.Context, model.Storage, string) error {
+			if probes.Add(1) == 1 {
+				return &sdk.Error{Code: sdk.CodeRefreshFrequently, Message: "refresh frequently"}
+			}
+			return nil
+		},
+	}
+	t.Cleanup(manager.Stop)
+
+	d, err := op.GetStorageByMountPath(mount)
+	if err != nil {
+		t.Fatalf("get created storage: %v", err)
+	}
+	d.GetStorage().SetStatus("token invalid")
+	payload := map[string]json.RawMessage{"access_token": json.RawMessage(`"peer-pair"`)}
+	candidate := &credRecord{
+		GroupID:      "g1",
+		OriginDriver: "Local",
+		Fields:       []string{"access_token"},
+		Payload:      payload,
+		CredHash:     credHash(payload),
+		Version:      1,
+		Origin:       peer.NodeID,
+		OriginPub:    peer.Pub,
+		OriginMount:  "/peer",
+		UpdatedAt:    now(),
+	}
+	candidate.Sig = peer.sign(candidate.signingBytes())
+	candidate.MountSig = peer.sign(candidate.mountSigningBytes())
+	if merged := manager.absorbCreds([]*credRecord{candidate}); len(merged) != 1 {
+		t.Fatalf("candidate merge = %#v, want one accepted record", merged)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		current, getErr := op.GetStorageByMountPath(mount)
+		if getErr == nil && current.GetStorage().Status == op.WORK && probes.Load() >= 2 {
+			if got := len(state.revocationSnapshot()); got != 0 {
+				t.Fatalf("retryable throttle created %d revocation(s)", got)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	current, _ := op.GetStorageByMountPath(mount)
+	t.Fatalf("throttled candidate was not retried: probes=%d storage=%#v", probes.Load(), current.GetStorage())
 }
 
 func TestAbsorbCredsRejectsUnauthorizedOriginMount(t *testing.T) {
