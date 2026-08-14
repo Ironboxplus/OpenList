@@ -1,4 +1,5 @@
 name: Beta Release (Docker)
+
 on:
   workflow_dispatch:
     inputs:
@@ -20,29 +21,26 @@ on:
     branches:
       - feat/dynamic-frontend
 
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  GHCR_ORG_NAME: ${{ vars.GHCR_ORG_NAME || 'ironboxplus' }} # 👈 最好改成你的用户名，防止推错地方
+  GHCR_ORG_NAME: ${{ vars.GHCR_ORG_NAME || 'ironboxplus' }}
   FRONTEND_REPO: ${{ github.event.inputs.frontend_repo || vars.FRONTEND_REPO || 'Ironboxplus/OpenList-Frontend' }}
   REGISTRY: ghcr.io
-  ARTIFACT_NAME_PREFIX: 'binaries_docker_release'
-  # 👇 关键修改：只保留 linux/amd64，删掉后面一长串
   RELEASE_PLATFORMS: 'linux/amd64'
-  # 👇 关键修改：强制允许推送，不用管是不是 push 事件
-  IMAGE_PUSH: 'true'
-  # 👇 使用默认的前端仓库 (Ironboxplus/OpenList-Frontend)
-  # FRONTEND_REPO: 'Ironboxplus/OpenList-Frontend'
 
 jobs:
-  build_binary:
-    name: Build Binaries (x64, front-${{ matrix.frontend_channel }})
+  release_docker:
+    name: Build and release GHCR images (x64, front-${{ matrix.frontend_channel }})
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     strategy:
+      fail-fast: false
       matrix:
         frontend_channel: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.frontend_channel == 'both' && fromJSON('["rolling","latest"]') || fromJSON(format('["{0}"]', github.event.inputs.frontend_channel))) || fromJSON('["rolling"]') }}
     steps:
@@ -53,115 +51,23 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version: '1.25.0'
-          cache: true
-          cache-dependency-path: go.sum
+          cache: false
 
-      - name: Get Frontend Cache Version
-        id: frontend-cache
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          WEB_VERSION: ${{ matrix.frontend_channel }}
-        run: |
-          frontend_repo="${{ env.FRONTEND_REPO }}"
-          web_version="$WEB_VERSION"
-          github_auth_args=()
-
-          if [ -n "$GH_TOKEN" ]; then
-            github_auth_args=(-H "Authorization: Bearer $GH_TOKEN")
-          fi
-
-          if [ "$web_version" = "latest" ]; then
-            frontend_version=$(curl -fsSL "${github_auth_args[@]}" "https://api.github.com/repos/$frontend_repo/releases/latest" | jq -r '.tag_name')
-          else
-            # For rolling/dev channels, resolve the actual commit to bust stale caches
-            release_json=$(curl -fsSL "${github_auth_args[@]}" "https://api.github.com/repos/$frontend_repo/releases/tags/$web_version" 2>/dev/null || echo '{}')
-            asset_name=$(echo "$release_json" | jq -r '.assets[0].name // empty')
-            frontend_version="${web_version}-${asset_name:-unknown}"
-          fi
-
-          echo "repo=$frontend_repo" >> "$GITHUB_OUTPUT"
-          echo "version=$frontend_version" >> "$GITHUB_OUTPUT"
-          echo "Frontend repo: $frontend_repo"
-          echo "Frontend cache version: $frontend_version"
-
-      - name: Cache Frontend
-        id: cache-frontend
-        uses: actions/cache@v5
-        with:
-          path: public/dist
-          key: frontend-${{ steps.frontend-cache.outputs.repo }}-${{ steps.frontend-cache.outputs.version }}
-          restore-keys: |
-            frontend-${{ steps.frontend-cache.outputs.repo }}-
-
-      - name: Cache Musl
-        id: cache-musl
-        uses: actions/cache@v5
-        with:
-          path: build/musl-libs
-          key: docker-musl-libs-v2
-
-      - name: Download Musl Library
-        if: steps.cache-musl.outputs.cache-hit != 'true'
+      - name: Download musl toolchain
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash build.sh prepare docker-multiplatform
 
-      - name: Build go binary
-        run: bash build.sh beta docker-multiplatform
+      - name: Build Go binary
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WEB_VERSION: ${{ matrix.frontend_channel }}
           FRONTEND_REPO: ${{ env.FRONTEND_REPO }}
-          SKIP_FRONTEND_FETCH: ${{ steps.cache-frontend.outputs.cache-hit == 'true' && 'true' || 'false' }}
+        run: bash build.sh beta docker-multiplatform
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ env.ARTIFACT_NAME_PREFIX }}-${{ matrix.frontend_channel }}
-          overwrite: true
-          path: build/linux/amd64/openlist
-
-  release_docker:
-    needs: build_binary
-    name: Release Docker (x64, front-${{ matrix.frontend_channel }})
-    runs-on: ubuntu-latest
-    permissions:
-      packages: write
-    strategy:
-      matrix:
-        frontend_channel: ${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.frontend_channel == 'both' && fromJSON('["rolling","latest"]') || fromJSON(format('["{0}"]', github.event.inputs.frontend_channel))) || fromJSON('["rolling"]') }}
-        # 四种变体，各自独立 image 名（推送到独立 GHCR repo）
-        image: ["latest", "ffmpeg", "aria2", "aio"]
-        include:
-          - image: "latest"
-            base_image_tag: "base"
-            build_arg: ""
-            image_name: "openlist"
-          - image: "ffmpeg"
-            base_image_tag: "ffmpeg"
-            build_arg: INSTALL_FFMPEG=true
-            image_name: "openlist-ffmpeg"
-          - image: "aria2"
-            base_image_tag: "aria2"
-            build_arg: INSTALL_ARIA2=true
-            image_name: "openlist-aria2"
-          - image: "aio"
-            base_image_tag: "aio"
-            build_arg: |
-              INSTALL_FFMPEG=true
-              INSTALL_ARIA2=true
-            image_name: "openlist-aio"
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-      - uses: actions/download-artifact@v7
-        with:
-          name: ${{ env.ARTIFACT_NAME_PREFIX }}-${{ matrix.frontend_channel }}
-          path: 'build/linux/amd64'
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 👇 只保留 GitHub 登录，删除了 DockerHub 登录
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -169,27 +75,41 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: |
-            ${{ env.REGISTRY }}/${{ env.GHCR_ORG_NAME }}/${{ matrix.image_name }}
-          tags: |
-            type=raw,value=front-${{ matrix.frontend_channel }}
-            type=raw,value=latest,enable=${{ matrix.frontend_channel == 'latest' }}
+      - name: Build and push GHCR images
+        shell: bash
+        env:
+          FRONTEND_CHANNEL: ${{ matrix.frontend_channel }}
+        run: |
+          set -euo pipefail
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile.ci
-          push: true
-          build-args: |
-            BASE_IMAGE_TAG=${{ matrix.base_image_tag }}
-            ${{ matrix.build_arg }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          platforms: ${{ env.RELEASE_PLATFORMS }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.GHCR_ORG_NAME }}/${{ matrix.image_name }}:buildcache-front-${{ matrix.frontend_channel }}
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.GHCR_ORG_NAME }}/${{ matrix.image_name }}:buildcache-front-${{ matrix.frontend_channel }},mode=max
+          push_image() {
+            local image_name="$1"
+            local base_image_tag="$2"
+            shift 2
+
+            local image="${REGISTRY}/${GHCR_ORG_NAME}/${image_name}"
+            local -a tags=(--tag "${image}:front-${FRONTEND_CHANNEL}")
+            if [ "${FRONTEND_CHANNEL}" = "latest" ]; then
+              tags+=(--tag "${image}:latest")
+            fi
+
+            docker buildx build \
+              --file Dockerfile.ci \
+              --platform "${RELEASE_PLATFORMS}" \
+              --build-arg "BASE_IMAGE_TAG=${base_image_tag}" \
+              --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+              --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+              "$@" \
+              "${tags[@]}" \
+              --push \
+              .
+          }
+
+          push_image openlist base
+          push_image openlist-ffmpeg ffmpeg \
+            --build-arg INSTALL_FFMPEG=true
+          push_image openlist-aria2 aria2 \
+            --build-arg INSTALL_ARIA2=true
+          push_image openlist-aio aio \
+            --build-arg INSTALL_FFMPEG=true \
+            --build-arg INSTALL_ARIA2=true
