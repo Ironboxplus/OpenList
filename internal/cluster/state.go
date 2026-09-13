@@ -539,6 +539,24 @@ func (s *store) hasCredForSource(groupID, origin, mount, hash string) bool {
 	return ok && r.CredHash == hash
 }
 
+// credByHash returns the cataloged record matching a mount's current
+// credential hash, so a caller can compare its Version against an incoming
+// candidate before adopting it (see applyCredRecordToMount's regression
+// guard).
+func (s *store) credByHash(groupID, hash string) (*credRecord, bool) {
+	if hash == "" {
+		return nil, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, r := range s.creds[groupID] {
+		if r.CredHash == hash {
+			return r, true
+		}
+	}
+	return nil, false
+}
+
 func (s *store) credSnapshot() []*credRecord {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

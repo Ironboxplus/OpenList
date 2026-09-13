@@ -34,10 +34,12 @@ type Open115 struct {
 	client     *sdk.Client
 	limiter    *rate.Limiter
 	parentPath string
-	// tokenInvalid is the edge-trigger latch for the cluster validity protocol:
-	// set once the refresh_token is found dead, cleared once a request succeeds
-	// again. It debounces the token-valid/invalid notifications down to real
-	// transitions instead of firing them on every request.
+	// tokenInvalid records that this driver instance most recently reported the
+	// token dead. It is consumed only by shouldNotifyTokenValid, to detect an
+	// invalid->valid recovery and force-publish the newly proven pair. The
+	// invalid-side notification itself is level-triggered off the storage's
+	// observable status (see WithOnAccessTokenInvalid below), not this flag, so
+	// a dropped first notification can never permanently silence every retry.
 	tokenInvalid atomic.Bool
 }
 
@@ -94,7 +96,18 @@ func (d *Open115) Init(ctx context.Context) error {
 			if st == nil || d.Addition.AccessToken != accessToken {
 				return
 			}
-			if d.tokenInvalid.CompareAndSwap(false, true) {
+			d.tokenInvalid.Store(true)
+			// Level-triggered on the observable status, not a one-shot latch: as
+			// long as this mount still reads WORK — the bad state cluster
+			// recovery needs to escape — every invalid callback must retry the
+			// notification. A CAS latch would go quiet forever if the one
+			// notification it allowed was itself dropped by
+			// NotifyStorageTokenInvalidWithSnapshot's own generation guard (a
+			// legitimate race against a concurrent storage replacement),
+			// permanently stranding the mount at WORK with cluster recovery
+			// never started. This naturally stops re-notifying once the status
+			// actually leaves WORK.
+			if st.Status == op.WORK {
 				op.NotifyStorageTokenInvalidWithSnapshot(d, st.Addition, st.Modified)
 			}
 		}))

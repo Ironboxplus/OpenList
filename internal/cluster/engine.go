@@ -805,10 +805,34 @@ func (m *Manager) applyCredRecordToMount(r *credRecord, mp string) (attempted, s
 				r.GroupID, mp, st.Driver, r.OriginDriver)
 			return false, false, false, false
 		}
-		if st.Status == op.WORK {
-			// A peer's newer Lamport value is a recovery candidate, not authority
-			// to overwrite credentials this mount has already proved locally.
+		if st.Status == op.WORK && r.Origin == m.id.NodeID {
+			// A self-authored record can only reach here via a relay echo
+			// (anti-entropy reply): it is never authority over itself, and
+			// applyCreds below reports changed=false once the payloads match
+			// anyway. Skip before paying for a probe.
 			return false, false, false, false
+		}
+		// WORK is not proof this mount's credential pair is still accepted by
+		// the provider: 115's refresh_token rotates on use, so a peer's
+		// successful refresh may already have killed this mount's own pair on
+		// the provider side before this node ever sees a local 401. A WORK
+		// mount must therefore be able to actively adopt a peer-authored
+		// candidate instead of waiting to fail on its own first — the
+		// temporary-driver probe below, not local status, is what proves a
+		// candidate live before it ever touches production storage.
+		//
+		// A live probe only proves the candidate works right now, not that it
+		// is newer: access_token carries its own TTL, so a pair that already
+		// lost a rotation race can still probe clean for a while even though
+		// its refresh_token was already consumed by whoever rotated past it.
+		// Reject a candidate whose version does not exceed what this node's
+		// own catalogue already has on record for the mount's current pair —
+		// otherwise a WORK mount could regress onto a dead refresh_token, and
+		// two WORK nodes could oscillate adopting each other's stale pairs.
+		if st.Status == op.WORK {
+			if current, ok := m.state.credByHash(r.GroupID, credHash(extractCreds(st.Addition))); ok && current.Version >= r.Version {
+				return false, false, false, false
+			}
 		}
 		newAdd, changed := applyCreds(st.Addition, r.Payload)
 		if !changed {

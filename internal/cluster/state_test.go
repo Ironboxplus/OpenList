@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -772,6 +773,207 @@ func TestCanOfferCred(t *testing.T) {
 	}
 }
 
+// additionField decodes one string field out of a storage's Addition JSON.
+// Windows temp-dir paths contain backslashes, which %q/json both escape, so a
+// plain strings.Contains(addition, rawPath) check is unreliable cross-platform
+// -- decode and compare the real value instead.
+func additionField(t *testing.T, additionJSON, key string) string {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(additionJSON), &m); err != nil {
+		t.Fatalf("decode addition JSON %q: %v", additionJSON, err)
+	}
+	v, _ := m[key].(string)
+	return v
+}
+
+// applyCredRecordToMount is the sole gate deciding whether a candidate may
+// touch production storage. A WORK mount is not proof its pair is still
+// accepted by the provider — 115's refresh_token rotates on use, so a peer's
+// successful refresh can kill this mount's own pair before this node ever
+// sees a local 401 — so WORK must not by itself block adoption of a
+// peer-authored candidate. It must still block a self-authored record
+// (reachable only via a relay echo) and must still require the temporary
+// driver probe to actually pass before committing anything.
+func TestApplyCredRecordToMountReturnValues(t *testing.T) {
+	dbName := fmt.Sprintf("file:apply-cred-matrix-%d?mode=memory&cache=shared", time.Now().UnixNano())
+	database, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	db.Init(database)
+
+	localID, _ := newIdentity()
+	peerID, _ := newIdentity()
+	adminID, _ := newIdentity()
+
+	type want struct{ attempted, success, terminal, retryable bool }
+	tests := []struct {
+		name string
+		// The Local driver's typed Addition struct has no credential-shaped
+		// field, so an injected "access_token" key never survives
+		// initStorage's marshal-through-the-typed-struct round trip (see
+		// op.saveDriverStorage) -- it is silently dropped on every commit,
+		// including the very first op.CreateStorage. "creds differ" is
+		// therefore modeled as a non-empty payload (applyCreds always reports
+		// changed=true for a brand new key), and "creds identical" as an
+		// empty payload (applyCreds short-circuits on an empty map before it
+		// ever looks at the current Addition). This keeps the case selection
+		// independent of that round-trip quirk while still exercising the
+		// exact changed/unchanged branch in applyCredRecordToMount.
+		initialWork  bool
+		selfOrigin   bool
+		emptyPayload bool
+		probeErr     error
+		want         want
+		wantProbes   int32
+	}{
+		{
+			name:        "WORK peer-origin differing creds probe succeeds adopts",
+			initialWork: true,
+			want:        want{true, true, false, false},
+			wantProbes:  1,
+		},
+		{
+			name:        "WORK self-origin differing creds blocked before probe",
+			initialWork: true,
+			selfOrigin:  true,
+			want:        want{false, false, false, false},
+			wantProbes:  0,
+		},
+		{
+			name:         "WORK peer-origin empty payload no churn",
+			initialWork:  true,
+			emptyPayload: true,
+			want:         want{false, false, false, false},
+			wantProbes:   0,
+		},
+		{
+			name:        "WORK peer-origin differing creds probe terminal 401",
+			initialWork: true,
+			probeErr:    &sdk.Error{Code: sdk.CodeRefreshTokenError, Message: "dead"},
+			want:        want{true, false, true, false},
+			wantProbes:  1,
+		},
+		{
+			name:        "WORK peer-origin differing creds probe throttle 40140117",
+			initialWork: true,
+			probeErr:    &sdk.Error{Code: sdk.CodeRefreshFrequently, Message: "slow down"},
+			want:        want{true, false, false, true},
+			wantProbes:  1,
+		},
+		{
+			name:       "non-WORK peer-origin differing creds probe succeeds adopts",
+			want:       want{true, true, false, false},
+			wantProbes: 1,
+		},
+		{
+			name:       "non-WORK peer-origin differing creds probe terminal 401",
+			probeErr:   &sdk.Error{Code: sdk.CodeRefreshTokenError, Message: "dead"},
+			want:       want{true, false, true, false},
+			wantProbes: 1,
+		},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mount := fmt.Sprintf("/apply-cred-matrix-%d-%d", time.Now().UnixNano(), i)
+			dir := t.TempDir()
+			id, err := op.CreateStorage(context.Background(), model.Storage{
+				Driver:    "Local",
+				MountPath: mount,
+				Addition:  fmt.Sprintf(`{"root_folder_path":%q}`, dir),
+			})
+			if err != nil {
+				t.Fatalf("create storage: %v", err)
+			}
+			t.Cleanup(func() { _ = op.DeleteStorageById(context.Background(), id) })
+
+			d, err := op.GetStorageByMountPath(mount)
+			if err != nil {
+				t.Fatalf("get storage: %v", err)
+			}
+			if !tc.initialWork {
+				d.GetStorage().SetStatus("token invalid")
+			}
+			beforeModified := d.GetStorage().Modified
+
+			state := newStore()
+			state.setGroups(adminID, []group{{
+				ID: "g1",
+				Members: []member{
+					{NodeID: localID.NodeID, MountPath: mount},
+					{NodeID: peerID.NodeID, MountPath: "/peer"},
+				},
+			}}, 1)
+
+			var probes atomic.Int32
+			manager := &Manager{
+				dir:      t.TempDir(),
+				id:       localID,
+				state:    state,
+				conns:    newConnRegistry(),
+				cfgStore: &configStore{cfg: Config{Enabled: true, Key: "test-key", ApplyRemote: true}},
+				probeCredentialFn: func(context.Context, model.Storage, string) error {
+					probes.Add(1)
+					return tc.probeErr
+				},
+			}
+
+			origin, originMount := peerID, "/peer"
+			if tc.selfOrigin {
+				origin, originMount = localID, mount
+			}
+			payload := map[string]json.RawMessage{"access_token": json.RawMessage(`"new-token"`)}
+			if tc.emptyPayload {
+				payload = map[string]json.RawMessage{}
+			}
+			candidate := &credRecord{
+				GroupID:      "g1",
+				OriginDriver: "Local",
+				Fields:       []string{"access_token"},
+				Payload:      payload,
+				CredHash:     credHash(payload),
+				Version:      1,
+				Origin:       origin.NodeID,
+				OriginPub:    origin.Pub,
+				OriginMount:  originMount,
+				UpdatedAt:    now(),
+			}
+
+			attempted, success, terminal, retryable := manager.applyCredRecordToMount(candidate, mount)
+			if attempted != tc.want.attempted || success != tc.want.success || terminal != tc.want.terminal || retryable != tc.want.retryable {
+				t.Fatalf("applyCredRecordToMount = (attempted=%v success=%v terminal=%v retryable=%v), want %+v",
+					attempted, success, terminal, retryable, tc.want)
+			}
+			if got := probes.Load(); got != tc.wantProbes {
+				t.Fatalf("probe called %d times, want %d", got, tc.wantProbes)
+			}
+
+			after, err := op.GetStorageByMountPath(mount)
+			if err != nil {
+				t.Fatalf("get storage after: %v", err)
+			}
+			afterModified := after.GetStorage().Modified
+			// op.UpdateStorage unconditionally stamps a fresh Modified on every
+			// commit, independent of which Addition fields the driver's typed
+			// struct happens to recognize -- a reliable, driver-agnostic signal
+			// for "was this row actually written."
+			if tc.want.success {
+				if !afterModified.After(beforeModified) {
+					t.Fatalf("successful adoption did not commit a new storage generation (Modified unchanged: %v)", afterModified)
+				}
+				if got := additionField(t, after.GetStorage().Addition, "root_folder_path"); got != dir {
+					t.Fatalf("successful adoption dropped the node-local root_folder_path: got %q, want %q", got, dir)
+				}
+			} else if !afterModified.Equal(beforeModified) {
+				t.Fatalf("unsuccessful/blocked attempt still committed a new storage generation: before=%v after=%v", beforeModified, afterModified)
+			}
+		})
+	}
+}
+
 // This is an end-to-end backend regression for the exact missed transition:
 // a peer candidate may arrive after the local mount is already invalid. It uses
 // the registered production Local driver, real op storage persistence, and the
@@ -844,10 +1046,14 @@ func TestReceivedCandidateRecoversInvalidMountWithRealDriver(t *testing.T) {
 		t.Fatalf("candidate merge = %#v, want one accepted record", merged)
 	}
 
+	// Poll the SQLite row, not op.GetStorageByMountPath's live driver.Driver:
+	// recovery replaces the mount from a background goroutine, so reading the
+	// shared *model.Storage from here is an unsynchronized read of state that
+	// production legitimately mutates concurrently.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		current, getErr := op.GetStorageByMountPath(mount)
-		if getErr == nil && current.GetStorage().Status == op.WORK && state.candidateHealthy("g1", candidate.CredHash, now()) {
+		current, getErr := db.GetStorageByMountPath(mount)
+		if getErr == nil && current.Status == op.WORK && state.candidateHealthy("g1", candidate.CredHash, now()) {
 			for _, event := range manager.eventList() {
 				if event.Kind == "apply" && event.GroupID == "g1" {
 					return
@@ -856,8 +1062,393 @@ func TestReceivedCandidateRecoversInvalidMountWithRealDriver(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	current, _ := op.GetStorageByMountPath(mount)
-	t.Fatalf("received candidate did not activate invalid mount: %#v", current.GetStorage())
+	current, _ := db.GetStorageByMountPath(mount)
+	t.Fatalf("received candidate did not activate invalid mount: %#v", current)
+}
+
+// A WORK mount must actively adopt a peer's newer credential through the same
+// full recovery pipeline (absorbCreds -> enqueueCandidate -> runCandidateRecovery)
+// used for an already-invalid mount, not just via a direct applyCredRecordToMount
+// call. This is the regression for Bug 2: node B never fails locally (its old
+// refresh_token still reads WORK), but A's rotation already killed it on the
+// provider side, and B must not wait for its own 401 before taking A's pair.
+// It uses the real Local driver and real op storage persistence, mirroring
+// TestReceivedCandidateRecoversInvalidMountWithRealDriver but starting the
+// mount at WORK. Node-local fields (root_folder_path) must survive the swap.
+func TestReceivedCandidateIsAdoptedByWorkMountWithRealDriver(t *testing.T) {
+	dbName := fmt.Sprintf("file:cluster-work-adopt-%d?mode=memory&cache=shared", time.Now().UnixNano())
+	database, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	db.Init(database)
+
+	oldRoot := t.TempDir()
+	mount := fmt.Sprintf("/cluster-work-adopt-%d", time.Now().UnixNano())
+	storage := model.Storage{
+		Driver:    "Local",
+		MountPath: mount,
+		Addition:  fmt.Sprintf(`{"root_folder_path":%q}`, oldRoot),
+	}
+	id, err := op.CreateStorage(context.Background(), storage)
+	if err != nil {
+		t.Fatalf("create real local storage: %v", err)
+	}
+	t.Cleanup(func() { _ = op.DeleteStorageById(context.Background(), id) })
+
+	// Confirm the fixture actually starts WORK — the whole point of this test.
+	d, err := op.GetStorageByMountPath(mount)
+	if err != nil {
+		t.Fatalf("get created storage: %v", err)
+	}
+	if d.GetStorage().Status != op.WORK {
+		t.Fatalf("fixture storage status = %q, want %q before the peer candidate arrives", d.GetStorage().Status, op.WORK)
+	}
+	beforeModified := d.GetStorage().Modified
+
+	local, _ := newIdentity()
+	peer, _ := newIdentity()
+	admin, _ := newIdentity()
+	state := newStore()
+	state.setGroups(admin, []group{{
+		ID: "g1",
+		Members: []member{
+			{NodeID: local.NodeID, MountPath: mount},
+			{NodeID: peer.NodeID, MountPath: "/peer"},
+		},
+	}}, 1)
+	manager := &Manager{
+		dir:      t.TempDir(),
+		id:       local,
+		state:    state,
+		conns:    newConnRegistry(),
+		cfgStore: &configStore{cfg: Config{Enabled: true, Key: "test-key", ApplyRemote: true}},
+	}
+
+	payload := map[string]json.RawMessage{"access_token": json.RawMessage(`"peer-rotated-pair"`)}
+	candidate := &credRecord{
+		GroupID:      "g1",
+		OriginDriver: "Local",
+		Fields:       []string{"access_token"},
+		Payload:      payload,
+		CredHash:     credHash(payload),
+		Version:      1,
+		Origin:       peer.NodeID,
+		OriginPub:    peer.Pub,
+		OriginMount:  "/peer",
+		UpdatedAt:    now(),
+	}
+	candidate.Sig = peer.sign(candidate.signingBytes())
+	candidate.MountSig = peer.sign(candidate.mountSigningBytes())
+	// absorbCreds is what a received "push"/"reply" sync message drives in
+	// production; it enqueues the candidate for every local mount in the group
+	// regardless of that mount's current status.
+	if merged := manager.absorbCreds([]*credRecord{candidate}); len(merged) != 1 {
+		t.Fatalf("candidate merge = %#v, want one accepted record", merged)
+	}
+
+	// The Local driver's typed Addition struct has no credential-shaped field,
+	// so "access_token" never survives initStorage's marshal-through-the-typed
+	// -struct round trip (see op.saveDriverStorage) -- adoption is observed
+	// the same way TestReceivedCandidateRecoversInvalidMountWithRealDriver
+	// observes it: a fresh storage generation (Modified advanced) plus the
+	// cluster's own proof that this exact candidate is now the healthy one.
+	//
+	// Polling reads db.GetStorageByMountPath (a fresh row from SQLite) rather
+	// than op.GetStorageByMountPath (the live driver.Driver pointer that the
+	// recovery goroutine concurrently mutates in place via SetStorage/
+	// MustSaveDriverStorage). Reading the live pointer here races under -race
+	// with that goroutine's write -- a pre-existing pattern shared by
+	// TestReceivedCandidateRecoversInvalidMountWithRealDriver, which is
+	// flaky under -race for the same reason (reproduced independently while
+	// verifying this change; not introduced by it).
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		current, getErr := db.GetStorageByMountPath(mount)
+		if getErr == nil && current.Status == op.WORK &&
+			current.Modified.After(beforeModified) &&
+			state.candidateHealthy("g1", candidate.CredHash, now()) {
+			if got := additionField(t, current.Addition, "root_folder_path"); got != oldRoot {
+				t.Fatalf("adoption dropped the node-local root_folder_path: got %q, want %q", got, oldRoot)
+			}
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	current, _ := db.GetStorageByMountPath(mount)
+	t.Fatalf("WORK mount did not adopt the peer's rotated credential: %#v", current)
+}
+
+// A candidate that fails the temporary-driver probe must never touch
+// production storage, even through the full async recovery queue (not just a
+// direct applyCredRecordToMount call). UpdateStorage persists before it
+// initializes, so a bug here would be a real durable corruption, not just a
+// returned error.
+func TestFailedProbeLeavesWorkMountStorageUntouched(t *testing.T) {
+	dbName := fmt.Sprintf("file:cluster-work-probe-fail-%d?mode=memory&cache=shared", time.Now().UnixNano())
+	database, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	db.Init(database)
+
+	oldRoot := t.TempDir()
+	mount := fmt.Sprintf("/cluster-work-probe-fail-%d", time.Now().UnixNano())
+	id, err := op.CreateStorage(context.Background(), model.Storage{
+		Driver:    "Local",
+		MountPath: mount,
+		Addition:  fmt.Sprintf(`{"root_folder_path":%q}`, oldRoot),
+	})
+	if err != nil {
+		t.Fatalf("create real local storage: %v", err)
+	}
+	t.Cleanup(func() { _ = op.DeleteStorageById(context.Background(), id) })
+
+	// initStorage round-trips Addition through the driver's own JSON
+	// marshaling (see op.saveDriverStorage), so the durable baseline for "was
+	// this row touched at all" is whatever actually landed after creation, not
+	// the hand-written literal passed above.
+	created, err := op.GetStorageByMountPath(mount)
+	if err != nil {
+		t.Fatalf("get created storage: %v", err)
+	}
+	originalAddition := created.GetStorage().Addition
+
+	local, _ := newIdentity()
+	peer, _ := newIdentity()
+	admin, _ := newIdentity()
+	state := newStore()
+	state.setGroups(admin, []group{{
+		ID: "g1",
+		Members: []member{
+			{NodeID: local.NodeID, MountPath: mount},
+			{NodeID: peer.NodeID, MountPath: "/peer"},
+		},
+	}}, 1)
+	manager := &Manager{
+		dir:      t.TempDir(),
+		id:       local,
+		state:    state,
+		conns:    newConnRegistry(),
+		cfgStore: &configStore{cfg: Config{Enabled: true, Key: "test-key", ApplyRemote: true}},
+		stopCh:   make(chan struct{}),
+		probeCredentialFn: func(context.Context, model.Storage, string) error {
+			return &sdk.Error{Code: sdk.CodeRefreshTokenError, Message: "dead pair"}
+		},
+	}
+	t.Cleanup(manager.Stop)
+
+	payload := map[string]json.RawMessage{"access_token": json.RawMessage(`"doomed-pair"`)}
+	candidate := &credRecord{
+		GroupID:      "g1",
+		OriginDriver: "Local",
+		Fields:       []string{"access_token"},
+		Payload:      payload,
+		CredHash:     credHash(payload),
+		Version:      1,
+		Origin:       peer.NodeID,
+		OriginPub:    peer.Pub,
+		OriginMount:  "/peer",
+		UpdatedAt:    now(),
+	}
+	candidate.Sig = peer.sign(candidate.signingBytes())
+	candidate.MountSig = peer.sign(candidate.mountSigningBytes())
+	if merged := manager.absorbCreds([]*credRecord{candidate}); len(merged) != 1 {
+		t.Fatalf("candidate merge = %#v, want one accepted record", merged)
+	}
+
+	// A terminal probe failure ends in a signed group-wide revocation of the
+	// candidate (runCandidateRecovery's terminal branch calls revokePair, not
+	// markCandidateFailed) — that tombstone is the queue's real termination
+	// signal; there is no separate "done" event for a doomed candidate.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(state.revocationSnapshot()) > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(state.revocationSnapshot()) == 0 {
+		t.Fatal("terminal probe failure did not revoke the doomed candidate")
+	}
+
+	current, err := op.GetStorageByMountPath(mount)
+	if err != nil {
+		t.Fatalf("get storage after failed probe: %v", err)
+	}
+	if current.GetStorage().Status != op.WORK {
+		t.Fatalf("failed probe changed a WORK mount's status to %q", current.GetStorage().Status)
+	}
+	// Exact equality (not just a substring check) proves the row was never
+	// touched at all -- not even rewritten back to an equivalent value.
+	if current.GetStorage().Addition != originalAddition {
+		t.Fatalf("failed probe mutated production storage: got %q, want unchanged %q",
+			current.GetStorage().Addition, originalAddition)
+	}
+	if strings.Contains(current.GetStorage().Addition, "doomed-pair") {
+		t.Fatal("failed probe committed the doomed candidate's payload")
+	}
+}
+
+// A live probe only proves a candidate is accepted by the provider right now;
+// it says nothing about whether the candidate is actually newer than what
+// this node already knows for the mount's current pair. 115's access_token
+// carries its own TTL, so a pair that already lost a refresh_token rotation
+// race can still probe clean for a while -- without a version check a WORK
+// mount could regress onto that dead pair, and two WORK nodes could
+// oscillate adopting each other's stale credentials. This exercises the
+// guard in applyCredRecordToMount: a candidate is rejected before ever
+// reaching the probe when this node's own catalogue already has an
+// equal-or-newer record for the mount's current credential hash, and is
+// otherwise let through unchanged (including when no catalog record exists
+// yet, where the guard has no regression information and must stay
+// permissive).
+func TestApplyCredRecordToMountRejectsVersionRegression(t *testing.T) {
+	dbName := fmt.Sprintf("file:apply-cred-regression-%d?mode=memory&cache=shared", time.Now().UnixNano())
+	database, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	db.Init(database)
+
+	localID, _ := newIdentity()
+	peerID, _ := newIdentity()
+	adminID, _ := newIdentity()
+
+	tests := []struct {
+		name             string
+		catalogVersion   uint64 // 0 = do not seed a matching catalog record
+		candidateVersion uint64
+		wantAttempted    bool
+		wantProbes       int32
+	}{
+		{
+			name:             "older candidate rejected before probe",
+			catalogVersion:   5,
+			candidateVersion: 3,
+			wantAttempted:    false,
+			wantProbes:       0,
+		},
+		{
+			name:             "equal version rejected before probe",
+			catalogVersion:   5,
+			candidateVersion: 5,
+			wantAttempted:    false,
+			wantProbes:       0,
+		},
+		{
+			name:             "newer candidate still probed and adopted",
+			catalogVersion:   5,
+			candidateVersion: 6,
+			wantAttempted:    true,
+			wantProbes:       1,
+		},
+		{
+			name:             "no catalog record permits candidate",
+			catalogVersion:   0,
+			candidateVersion: 1,
+			wantAttempted:    true,
+			wantProbes:       1,
+		},
+	}
+
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mount := fmt.Sprintf("/apply-cred-regression-%d-%d", time.Now().UnixNano(), i)
+			dir := t.TempDir()
+			id, err := op.CreateStorage(context.Background(), model.Storage{
+				Driver:    "Local",
+				MountPath: mount,
+				Addition:  fmt.Sprintf(`{"root_folder_path":%q}`, dir),
+			})
+			if err != nil {
+				t.Fatalf("create storage: %v", err)
+			}
+			t.Cleanup(func() { _ = op.DeleteStorageById(context.Background(), id) })
+
+			d, err := op.GetStorageByMountPath(mount)
+			if err != nil {
+				t.Fatalf("get storage: %v", err)
+			}
+			// Stamp a credential field directly onto the live storage's Addition.
+			// The Local driver's typed Addition struct has no credential-shaped
+			// field, so this could never survive an op.UpdateStorage round trip
+			// (see op.saveDriverStorage) -- but applyCredRecordToMount reads the
+			// storage struct as-is and never re-marshals it through the driver
+			// before the regression check, so a direct field write faithfully
+			// models what a real credentialed driver's Addition already contains.
+			currentAddition := fmt.Sprintf(`{"root_folder_path":%q,"access_token":"current-pair"}`, dir)
+			d.GetStorage().Addition = currentAddition
+
+			state := newStore()
+			state.setGroups(adminID, []group{{
+				ID: "g1",
+				Members: []member{
+					{NodeID: localID.NodeID, MountPath: mount},
+					{NodeID: peerID.NodeID, MountPath: "/peer"},
+				},
+			}}, 1)
+
+			currentHash := credHash(extractCreds(currentAddition))
+			if tc.catalogVersion != 0 {
+				if !state.mergeCred(&credRecord{
+					GroupID:      "g1",
+					OriginDriver: "Local",
+					Fields:       []string{"access_token"},
+					Payload:      map[string]json.RawMessage{"access_token": json.RawMessage(`"current-pair"`)},
+					CredHash:     currentHash,
+					Version:      tc.catalogVersion,
+					Origin:       localID.NodeID,
+					OriginPub:    localID.Pub,
+					OriginMount:  mount,
+					UpdatedAt:    now(),
+				}) {
+					t.Fatalf("seed catalog record: mergeCred rejected it")
+				}
+			}
+
+			var probes atomic.Int32
+			manager := &Manager{
+				dir:      t.TempDir(),
+				id:       localID,
+				state:    state,
+				conns:    newConnRegistry(),
+				cfgStore: &configStore{cfg: Config{Enabled: true, Key: "test-key", ApplyRemote: true}},
+				probeCredentialFn: func(context.Context, model.Storage, string) error {
+					probes.Add(1)
+					return nil
+				},
+			}
+
+			payload := map[string]json.RawMessage{"access_token": json.RawMessage(`"peer-pair"`)}
+			candidate := &credRecord{
+				GroupID:      "g1",
+				OriginDriver: "Local",
+				Fields:       []string{"access_token"},
+				Payload:      payload,
+				CredHash:     credHash(payload),
+				Version:      tc.candidateVersion,
+				Origin:       peerID.NodeID,
+				OriginPub:    peerID.Pub,
+				OriginMount:  "/peer",
+				UpdatedAt:    now(),
+			}
+
+			attempted, success, terminal, retryable := manager.applyCredRecordToMount(candidate, mount)
+			if attempted != tc.wantAttempted {
+				t.Fatalf("attempted = %v, want %v (success=%v terminal=%v retryable=%v)", attempted, tc.wantAttempted, success, terminal, retryable)
+			}
+			if got := probes.Load(); got != tc.wantProbes {
+				t.Fatalf("probe called %d times, want %d", got, tc.wantProbes)
+			}
+			if tc.wantAttempted && !success {
+				t.Fatalf("expected the newer/unknown-version candidate to be adopted, got success=false (terminal=%v retryable=%v)", terminal, retryable)
+			}
+		})
+	}
 }
 
 func TestRefreshThrottleRequeuesCandidateAfterCooldown(t *testing.T) {
@@ -933,10 +1524,12 @@ func TestRefreshThrottleRequeuesCandidateAfterCooldown(t *testing.T) {
 		t.Fatalf("candidate merge = %#v, want one accepted record", merged)
 	}
 
+	// Poll the SQLite row rather than the live driver.Driver — see the note in
+	// TestReceivedCandidateRecoversInvalidMountWithRealDriver.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		current, getErr := op.GetStorageByMountPath(mount)
-		if getErr == nil && current.GetStorage().Status == op.WORK && probes.Load() >= 2 {
+		current, getErr := db.GetStorageByMountPath(mount)
+		if getErr == nil && current.Status == op.WORK && probes.Load() >= 2 {
 			if got := len(state.revocationSnapshot()); got != 0 {
 				t.Fatalf("retryable throttle created %d revocation(s)", got)
 			}
@@ -944,8 +1537,8 @@ func TestRefreshThrottleRequeuesCandidateAfterCooldown(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	current, _ := op.GetStorageByMountPath(mount)
-	t.Fatalf("throttled candidate was not retried: probes=%d storage=%#v", probes.Load(), current.GetStorage())
+	current, _ := db.GetStorageByMountPath(mount)
+	t.Fatalf("throttled candidate was not retried: probes=%d storage=%#v", probes.Load(), current)
 }
 
 func TestAbsorbCredsRejectsUnauthorizedOriginMount(t *testing.T) {

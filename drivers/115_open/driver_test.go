@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -439,6 +440,153 @@ func TestOpen115RefreshRestoresErrorStateAndPublishesNewPair(t *testing.T) {
 	}
 	if persisted.Status == op.WORK {
 		t.Fatal("refreshed generation 401 was not persisted for peer recovery")
+	}
+}
+
+// The cluster validity protocol depends on every failed request re-announcing
+// invalidity while a mount is still WORK: 115's refresh_token rotates on use,
+// so a peer's successful refresh can silently kill this node's pair without
+// this node ever seeing a local success in between. A one-shot latch would
+// report the first failure and then go quiet forever if that first
+// NotifyStorageTokenInvalidWithSnapshot call happened to be dropped by its own
+// generation guard (a legitimate race, see internal/op/hook.go), permanently
+// stranding the mount at WORK with a dead token and never starting cluster
+// recovery. This drives the real SDK client's WithOnAccessTokenInvalid closure
+// through genuine failing requests (not a captured/replayed callback) to prove
+// the driver keeps re-announcing invalidity for as long as the storage is
+// observably still WORK, and stops once it is not.
+func TestOpen115AccessTokenInvalidCallbackIsLevelTriggered(t *testing.T) {
+	// A unique DB name and mount path per invocation: the shared in-memory
+	// sqlite handle otherwise outlives this test within the process, so a
+	// hardcoded name/path collides with a UNIQUE constraint on any repeat
+	// run (e.g. `go test -count>1`), a failure mode unrelated to what this
+	// test actually exercises.
+	suffix := time.Now().UnixNano()
+	dbName := fmt.Sprintf("file:open115-invalid-level-trigger-%d?mode=memory&cache=shared", suffix)
+	mountPath := fmt.Sprintf("/invalid-level-trigger-%d", suffix)
+	database, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	db.Init(database)
+
+	var failing atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/open/user/info":
+			if !failing.Load() {
+				writeSDKSuccess(t, w, map[string]any{})
+				return
+			}
+			writeSDKError(t, w, 40140125, "access_token invalid")
+		case "/open/refreshToken":
+			// The refresh_token is permanently dead: every refresh attempt is
+			// rejected terminally, exactly like the rotation scenario where a
+			// peer already consumed and replaced it. This endpoint decodes into
+			// AuthResp, whose State field is an int (not bool like the ordinary
+			// Resp used by writeSDKError/writeSDKSuccess) — passportRequest only
+			// consults Code/Message, so State is simply omitted here.
+			writeSDKResponse(t, w, map[string]any{
+				"code":    40140120,
+				"message": "refresh token error",
+			})
+		default:
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	target, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("Parse server URL failed: %v", err)
+	}
+	oldNewClient := new115SDKClient
+	t.Cleanup(func() { new115SDKClient = oldNewClient })
+	new115SDKClient = func(opts ...sdk.Option) *sdk.Client {
+		client := sdk.New(opts...)
+		client.SetHttpClient(&http.Client{Transport: &rewriteTransport{target: target, base: http.DefaultTransport}})
+		return client
+	}
+
+	driver := &Open115{Addition: Addition{
+		RootID:       driverpkg.RootID{RootFolderID: "0"},
+		AccessToken:  "fixed-access",
+		RefreshToken: "fixed-refresh",
+	}}
+	storage := model.Storage{
+		Driver:    "115 Open",
+		MountPath: mountPath,
+		Status:    op.WORK,
+		Addition:  `{"access_token":"fixed-access","refresh_token":"fixed-refresh"}`,
+	}
+	if err := db.CreateStorage(&storage); err != nil {
+		t.Fatalf("CreateStorage failed: %v", err)
+	}
+	driver.Storage = storage
+
+	notified := make(chan struct{}, 10)
+	op.RegisterStorageCredentialHook(func(typ string, event op.StorageCredentialEvent) {
+		if typ == "token-invalid" && event.Storage == driver {
+			notified <- struct{}{}
+		}
+	})
+
+	if err := driver.Init(context.Background()); err != nil {
+		t.Fatalf("Init against the healthy server failed: %v", err)
+	}
+	if driver.GetStorage().Status != op.WORK {
+		t.Fatalf("storage status = %q before the fault injection, want %q", driver.GetStorage().Status, op.WORK)
+	}
+	failing.Store(true)
+
+	waitNotified := func(step string) {
+		t.Helper()
+		select {
+		case <-notified:
+		case <-time.After(time.Second):
+			t.Fatalf("%s: expected a token-invalid notification while storage was WORK", step)
+		}
+	}
+	triggerInvalid := func(step string) {
+		t.Helper()
+		// SetRefreshToken with a changed value resets the SDK client's own
+		// refresh-dead gate (see 115-sdk-go client.go) so each call below is a
+		// fresh attempt instead of short-circuiting on the SDK's internal
+		// one-shot latch — that latch is a separate, already-tracked concern
+		// owned by the SDK package, not what this test exercises.
+		driver.client.SetRefreshToken(step)
+		if _, err := driver.client.UserInfo(context.Background()); err == nil {
+			t.Fatalf("%s: expected UserInfo to fail against the dead-pair server", step)
+		}
+	}
+
+	// First failure: WORK -> invalid, the ordinary transition.
+	triggerInvalid("call-1")
+	waitNotified("call-1")
+	if driver.GetStorage().Status == op.WORK {
+		t.Fatal("call-1: storage status was not marked invalid")
+	}
+
+	// Something external put the mount back at WORK (e.g. the local proof of a
+	// racing generation) without this driver's own latch ever being cleared. A
+	// CAS-latch bug silences every subsequent invalid callback forever here,
+	// even though the mount is observably WORK again with the same dead token.
+	driver.GetStorage().SetStatus(op.WORK)
+	triggerInvalid("call-2")
+	waitNotified("call-2")
+	if driver.GetStorage().Status == op.WORK {
+		t.Fatal("call-2: storage was WORK again but the repeat invalid callback did not re-notify")
+	}
+
+	// Third failure: storage is already "token invalid" (left over from call-2,
+	// not reset). The driver must not re-notify — that would be a goroutine/DB
+	// write storm on every failed request against an already-known-dead mount.
+	triggerInvalid("call-3")
+	select {
+	case <-notified:
+		t.Fatal("call-3: driver re-notified token-invalid while storage was already non-WORK")
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 
