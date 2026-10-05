@@ -16,6 +16,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/syncjob"
 	"github.com/glebarez/sqlite"
+	"github.com/rclone/rclone/fs/filter"
 	"gorm.io/gorm"
 )
 
@@ -319,5 +320,23 @@ func TestStartRejectsBadControls(t *testing.T) {
 		if _, err := m.Start(spec); err == nil {
 			t.Errorf("Start(%+v) accepted", spec)
 		}
+	}
+}
+
+func TestNewFilterOptUsesRcloneDefaults(t *testing.T) {
+	got := syncjob.NewFilterOpt([]string{"- *.tmp"})
+	if got.MinAge != filter.Opt.MinAge || got.MaxAge != filter.Opt.MaxAge {
+		t.Fatalf("ages = %v/%v, want rclone defaults %v/%v", got.MinAge, got.MaxAge, filter.Opt.MinAge, filter.Opt.MaxAge)
+	}
+	if len(got.FilterRule) != 1 {
+		t.Fatalf("FilterRule not set: %v", got.FilterRule)
+	}
+	if _, err := filter.NewFilter(&got); err != nil {
+		t.Fatal(err)
+	}
+	// The pre-fix zero value is what fails on clocks that tick between reads.
+	zero := filter.Options{}
+	if zero.MaxAge == filter.Opt.MaxAge {
+		t.Fatal("zero Options unexpectedly equals defaults")
 	}
 }

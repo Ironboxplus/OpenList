@@ -170,7 +170,8 @@ func (m *Manager) Start(spec Spec) (Snapshot, error) {
 	if spec.Transfers < 0 || spec.Checkers < 0 {
 		return Snapshot{}, fmt.Errorf("transfers and checkers can't be negative")
 	}
-	if _, err := filter.NewFilter(&filter.Options{RulesOpt: filter.RulesOpt{FilterRule: spec.Filters}}); err != nil {
+	fo := newFilterOpt(spec.Filters)
+	if _, err := filter.NewFilter(&fo); err != nil {
 		return Snapshot{}, fmt.Errorf("filters: %w", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -389,8 +390,7 @@ func run(ctx context.Context, spec Spec, src, dst fs.Fs) error {
 		ci.MaxDelete = *spec.MaxDelete
 	}
 
-	fopt := filter.Opt
-	fopt.FilterRule = spec.Filters
+	fopt := newFilterOpt(spec.Filters)
 	fi, err := filter.NewFilter(&fopt)
 	if err != nil {
 		return fmt.Errorf("filters: %w", err)
@@ -423,4 +423,13 @@ func run(ctx context.Context, spec Spec, src, dst fs.Fs) error {
 		})
 	}
 	return fmt.Errorf("unknown mode %q", spec.Mode)
+}
+
+// newFilterOpt copies rclone's default filter options (MinAge/MaxAge are
+// DurationOff there) instead of using the zero value, whose 0s/0s ages make
+// NewFilter fail whenever the two clock reads differ (e.g. on Linux).
+func newFilterOpt(rules []string) filter.Options {
+	fopt := filter.Opt
+	fopt.FilterRule = rules
+	return fopt
 }
