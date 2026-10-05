@@ -168,6 +168,15 @@ func admin(g *gin.RouterGroup) {
 	clusterGrp.GET("/status", handles.ClusterStatus)
 	clusterGrp.POST("/groups", handles.ClusterSetGroups)
 
+	syncGrp := g.Group("/sync")
+	syncGrp.POST("/run", handles.SyncRun)
+	syncGrp.GET("/get", handles.SyncGet)
+	syncGrp.GET("/list", handles.SyncList)
+	syncGrp.POST("/cancel", handles.SyncCancel)
+	syncGrp.GET("/history", handles.SyncHistory)
+	syncGrp.GET("/bwlimit", handles.SyncBwLimit)
+	syncGrp.POST("/bwlimit", handles.SyncBwLimit)
+
 	// Admin-only user operations (create/delete/role-affecting). The profile-edit
 	// endpoints (list/get/update) live in a separate group that also accepts a
 	// non-admin who has been delegated the "manage user info" permission.
