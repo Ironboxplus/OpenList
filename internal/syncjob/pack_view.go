@@ -52,6 +52,9 @@ type viewFs struct {
 	fs.Fs
 	features *fs.Features
 	hide     func(remote string, isDir bool) bool
+	// observe, when set, sees each listing before anything is hidden. The
+	// main pass lists concurrently, so it must be safe for that.
+	observe func(fs.DirEntries)
 }
 
 func newViewFs(ctx context.Context, inner fs.Fs, hide func(remote string, isDir bool) bool) *viewFs {
@@ -81,6 +84,9 @@ func (v *viewFs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	entries, err := v.Fs.List(ctx, dir)
 	if err != nil {
 		return nil, err
+	}
+	if v.observe != nil {
+		v.observe(entries)
 	}
 	out := entries[:0]
 	for _, e := range entries {

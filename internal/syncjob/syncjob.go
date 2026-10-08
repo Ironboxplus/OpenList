@@ -453,11 +453,40 @@ func run(ctx context.Context, spec Spec, src, dst fs.Fs) error {
 	ctx = filter.ReplaceConfig(ctx, fi)
 
 	var deferred error
-	if spec.Pack != nil {
-		setStage(ctx, "packing")
-		if src, dst, err = packUp(ctx, spec, src, dst); err != nil {
-			return err
+	// transfer is the main pass proper, on whatever views the stages left.
+	transfer := func(ctx context.Context, src, dst fs.Fs) error {
+		switch spec.Mode {
+		case ModeCopy:
+			return errors.Join(rsync.CopyDir(ctx, dst, src, true), deferred)
+		case ModeSync:
+			return errors.Join(rsync.Sync(ctx, dst, src, true), deferred)
+		case ModeCheck:
+			return operations.Check(ctx, &operations.CheckOpt{Fdst: dst, Fsrc: src})
+		case ModeBisync:
+			compare := "size,checksum"
+			if spec.SizeOnly {
+				compare = "size"
+			}
+			return bisync.Bisync(ctx, src, dst, &bisync.Options{
+				Resync:             spec.Resync,
+				DryRun:             spec.DryRun,
+				Force:              spec.Force,
+				CreateEmptySrcDirs: true,
+				MaxDelete:          bisync.DefaultMaxDelete,
+				CompareFlag:        compare,
+				Workdir:            filepath.Join(flags.DataDir, "bisync"),
+				// A run interrupted by a restart should pick up where it was
+				// instead of demanding a manual --resync.
+				Recover: true,
+			})
 		}
+		return fmt.Errorf("unknown mode %q", spec.Mode)
+	}
+	if spec.Pack != nil {
+		// Packing and the main pass run together; the pack line moves the
+		// stage on to transferring once its manifest is committed.
+		setStage(ctx, "packing")
+		return packAndTransfer(ctx, spec, src, dst, transfer)
 	}
 	if spec.Unpack {
 		setStage(ctx, "unpacking")
@@ -468,33 +497,7 @@ func run(ctx context.Context, spec Spec, src, dst fs.Fs) error {
 		src, dst, deferred = res.src, res.dst, res.deferred
 	}
 	setStage(ctx, "transferring")
-
-	switch spec.Mode {
-	case ModeCopy:
-		return errors.Join(rsync.CopyDir(ctx, dst, src, true), deferred)
-	case ModeSync:
-		return errors.Join(rsync.Sync(ctx, dst, src, true), deferred)
-	case ModeCheck:
-		return operations.Check(ctx, &operations.CheckOpt{Fdst: dst, Fsrc: src})
-	case ModeBisync:
-		compare := "size,checksum"
-		if spec.SizeOnly {
-			compare = "size"
-		}
-		return bisync.Bisync(ctx, src, dst, &bisync.Options{
-			Resync:             spec.Resync,
-			DryRun:             spec.DryRun,
-			Force:              spec.Force,
-			CreateEmptySrcDirs: true,
-			MaxDelete:          bisync.DefaultMaxDelete,
-			CompareFlag:        compare,
-			Workdir:            filepath.Join(flags.DataDir, "bisync"),
-			// A run interrupted by a restart should pick up where it was
-			// instead of demanding a manual --resync.
-			Recover: true,
-		})
-	}
-	return fmt.Errorf("unknown mode %q", spec.Mode)
+	return transfer(ctx, src, dst)
 }
 
 // NewFilter parses rclone filter rules ("- SPs/**", "+ *.mkv") into a filter,

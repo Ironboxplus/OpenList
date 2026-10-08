@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -22,54 +23,108 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// packUp is the packing stage of an upload. It walks src and brings the packs
-// and the manifest under "<dst>/.oppack/" up to date with every file below
-// the threshold. It returns views of src and dst for the main rclone pass: src
-// without any small file (they live in packs now), dst without the .oppack
-// directories, so the pass moves only the large files and neither re-uploads
-// the small ones nor (sync) deletes the packs as extras.
+// Test seams: wrapDst decorates dst, separately for the pack line and for the
+// main pass; packLineStart runs when the pack line begins, so a test can hold
+// it back.
+var (
+	wrapDst       func(f fs.Fs, packLine bool) fs.Fs
+	packLineStart func(context.Context)
+)
+
+// packAndTransfer is an upload with packing. It brings the packs and the
+// manifest under "<dst>/.oppack/" up to date with every file below the
+// threshold, while transfer moves everything else. transfer gets views of src
+// without any small file (they live in packs now) and of dst without the
+// .oppack directories and without the loose copies of packed files, so it
+// neither re-uploads the small ones nor (sync) deletes the packs and loose
+// copies as extras.
+//
+// Packing reads only src and the manifest, so what it asks of dst does not
+// depend on the number of directories. The dst view instead notes what the
+// transfer's own listings show: loose copies of packed files and version 1
+// per-directory packs. Both are dealt with once the manifest is committed.
 //
 // Packs are uploaded as soon as they are full; once all are up, the previous
 // manifest is saved as manifest.prev and the new manifest uploaded. That last
 // upload is the commit: a run that dies earlier leaves the old manifest valid
 // and some orphan packs that the next run numbers past and ignores.
-func packUp(ctx context.Context, spec Spec, src, dst fs.Fs) (fs.Fs, fs.Fs, error) {
+func packAndTransfer(ctx context.Context, spec Spec, src, dst fs.Fs, transfer func(context.Context, fs.Fs, fs.Fs) error) error {
+	mainDst := dst
+	if wrapDst != nil {
+		dst, mainDst = wrapDst(dst, true), wrapDst(dst, false)
+	}
 	stage, err := newStaging(ctx)
 	if err != nil {
-		return nil, nil, fmt.Errorf("pack: staging: %w", err)
+		return fmt.Errorf("pack: staging: %w", err)
 	}
 	defer stage.close()
 	p := &packer{
-		opts:      spec.Pack,
-		src:       src,
-		dst:       dst,
-		stage:     stage,
-		sync:      spec.Mode == ModeSync,
-		dry:       spec.DryRun,
-		hidden:    map[string]struct{}{},
-		hiddenDst: map[string]struct{}{},
-		present:   map[string]struct{}{},
-		visited:   map[string]struct{}{},
+		opts:    spec.Pack,
+		src:     src,
+		dst:     dst,
+		stage:   stage,
+		sync:    spec.Mode == ModeSync,
+		dry:     spec.DryRun,
+		hidden:  map[string]struct{}{},
+		present: map[string]struct{}{},
+		v1Dirs:  map[string]struct{}{},
+		loose:   map[string]fs.Object{},
 	}
-	if err := p.run(ctx); err != nil {
-		return nil, nil, err
+	if err := p.plan(ctx); err != nil {
+		return err
 	}
-	hidden, hiddenDst := p.hidden, p.hiddenDst
 	srcView := newViewFs(ctx, src, func(remote string, isDir bool) bool {
 		if isDir {
 			return isPackDir(remote)
 		}
-		_, ok := hidden[remote]
+		_, ok := p.hidden[remote]
 		return ok
 	})
-	dstView := newViewFs(ctx, dst, func(remote string, isDir bool) bool {
+	dstView := newViewFs(ctx, mainDst, func(remote string, isDir bool) bool {
 		if isDir {
 			return isPackDir(remote)
 		}
-		_, ok := hiddenDst[remote]
+		_, ok := p.packed[remote]
 		return ok
 	})
-	return srcView, dstView, nil
+	dstView.observe = p.observe
+
+	// The pack line and the transfer run side by side; either failing stops
+	// the other.
+	gctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var lineErr, xferErr error
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if lineErr = p.line(gctx); lineErr != nil {
+			cancel()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if xferErr = transfer(gctx, srcView, dstView); xferErr != nil {
+			cancel()
+		}
+	}()
+	wg.Wait()
+	// The one that was stopped by the other's failure is just noise.
+	if ctx.Err() == nil && lineErr != nil && xferErr != nil {
+		switch {
+		case errors.Is(xferErr, context.Canceled) && !errors.Is(lineErr, context.Canceled):
+			xferErr = nil
+		case errors.Is(lineErr, context.Canceled) && !errors.Is(xferErr, context.Canceled):
+			lineErr = nil
+		}
+	}
+	err = errors.Join(lineErr, xferErr)
+	if lineErr != nil {
+		// No commit: the manifest doesn't know the packed files, so what the
+		// transfer saw can't be judged.
+		return err
+	}
+	return errors.Join(err, p.tail(ctx))
 }
 
 type packer struct {
@@ -84,14 +139,25 @@ type packer struct {
 	mObj   fs.Object // the manifest object at dst, nil when there is none
 	oldRaw []byte    // its encoded bytes, saved as manifest.prev on commit
 
-	smalls  []fs.Object         // small files at src, in walk order
+	smalls  []fs.Object // small files at src, in walk order
+	small   map[string]fs.Object
 	hidden  map[string]struct{} // their remotes: kept from the main pass
 	present map[string]struct{} // src files that are not small
-	loose   []loosePair
-	visited map[string]struct{} // src directories walked
-	v1      []v1Dir             // version 1 per-directory packs found at dst
-	// hiddenDst are loose dst files the main pass must not touch.
-	hiddenDst map[string]struct{}
+
+	// What the decision step settled, for the pack line to carry out.
+	add      []fs.Object
+	compact  []string
+	obsolete []string
+	dirty    bool
+	// packed is every file the manifest will hold: dst's copies of them are
+	// hidden from the main pass.
+	packed map[string]struct{}
+
+	// Filled by the dst view while the main pass lists.
+	mu     sync.Mutex
+	loose  map[string]fs.Object // loose dst copies of packed files, by remote
+	v1Dirs map[string]struct{}  // directories with a version 1 .oppack
+	v1     []v1Dir
 }
 
 // v1Dir is a directory at dst packed the version 1 way (dir/.oppack/index.json).
@@ -109,49 +175,44 @@ type migrant struct {
 	e      fileEntry
 }
 
-// loosePair is a small file at src that also exists loose at dst.
-type loosePair struct{ src, dst fs.Object }
-
-func (p *packer) run(ctx context.Context) error {
+// plan reads the manifest and src and decides what the pack line has to do.
+// It is pure computation on top of those reads.
+func (p *packer) plan(ctx context.Context) error {
 	if err := p.loadManifest(ctx); err != nil {
 		return err
 	}
-	if err := walkDirs(ctx, p.src, func(dir string, files []fs.Object, _ []string) error {
-		return p.scan(ctx, dir, files)
+	if err := walkDirs(ctx, p.src, func(_ string, files []fs.Object, _ []string) error {
+		p.scan(files)
+		return nil
 	}); err != nil {
-		return err
-	}
-	if err := p.findOrphanV1(ctx); err != nil {
 		return err
 	}
 	addStats(ctx, func(s *PackStats) { s.SmallFiles = int64(len(p.smalls)) })
 
 	m := p.m
-	small := make(map[string]fs.Object, len(p.smalls))
+	p.small = make(map[string]fs.Object, len(p.smalls))
 	for _, o := range p.smalls {
-		small[o.Remote()] = o
+		p.small[o.Remote()] = o
 	}
-	dirty := false
 
 	// Entries whose file is no longer packable: still at src but no longer
 	// small (it goes up as an ordinary file), or gone from src. A deletion at
 	// src only reaches the manifest in sync mode; copy never deletes.
 	var dropped int64
 	for name := range m.Files {
-		if _, ok := small[name]; ok {
+		if _, ok := p.small[name]; ok {
 			continue
 		}
 		if _, there := p.present[name]; there || p.sync {
 			m.drop(name)
 			dropped++
-			dirty = true
+			p.dirty = true
 		}
 	}
-	var add []fs.Object
 	for _, o := range p.smalls {
 		e, ok := m.Files[o.Remote()]
 		if !ok {
-			add = append(add, o)
+			p.add = append(p.add, o)
 			continue
 		}
 		changed, touch := p.changed(ctx, o, e)
@@ -159,86 +220,86 @@ func (p *packer) run(ctx context.Context) error {
 		case changed:
 			m.drop(o.Remote())
 			dropped++
-			add = append(add, o)
+			p.add = append(p.add, o)
 		case touch:
 			e.MTime = formatMTime(o.ModTime(ctx))
 			m.Files[o.Remote()] = e
-			dirty = true
-		}
-	}
-
-	// v1 members that exist only in their v1 pack. When src still has the file
-	// it is repacked from there (it is missing from the job manifest); when it
-	// is gone, sync lets it go and copy keeps it, moved over as it is.
-	var migrants []migrant
-	for _, d := range p.v1 {
-		names := make([]string, 0, len(d.m.Files))
-		for name := range d.m.Files {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			remote := path.Join(d.dir, name)
-			_, packed := m.Files[remote]
-			_, isSmall := small[remote]
-			_, there := p.present[remote]
-			if packed || isSmall || there || p.sync {
-				continue
-			}
-			migrants = append(migrants, migrant{d, name, remote, d.m.Files[name]})
+			p.dirty = true
 		}
 	}
 
 	m.recount()
-	var compact, obsolete []string
 	for name, pk := range m.Packs {
 		switch {
 		case pk.Live == 0 && pk.Dead > 0:
-			obsolete = append(obsolete, name)
+			p.obsolete = append(p.obsolete, name)
 		case pk.Dead > pk.Live:
-			compact = append(compact, name)
+			p.compact = append(p.compact, name)
 		}
 	}
-	sort.Strings(compact)
-	sort.Strings(obsolete)
+	sort.Strings(p.compact)
+	sort.Strings(p.obsolete)
 	addStats(ctx, func(s *PackStats) { s.DeadRemoved += dropped })
 
+	p.packed = make(map[string]struct{}, len(m.Files)+len(p.add))
+	for name := range m.Files {
+		p.packed[name] = struct{}{}
+	}
+	for _, o := range p.add {
+		p.packed[o.Remote()] = struct{}{}
+	}
+	return nil
+}
+
+// line is the pack line: add, compact, finish, commit, drop the obsolete
+// packs. Once it has committed the stage turns to transferring, though the
+// main pass has been running all along.
+func (p *packer) line(ctx context.Context) error {
+	if packLineStart != nil {
+		packLineStart(ctx)
+	}
+	if err := p.build(ctx); err != nil {
+		return err
+	}
+	setStage(ctx, "transferring")
+	return nil
+}
+
+func (p *packer) build(ctx context.Context) error {
+	m := p.m
 	if p.dry {
-		addStats(ctx, func(s *PackStats) { s.V1MigratedDirs += int64(len(p.v1)) })
 		var n int64
-		for _, o := range add {
+		for _, o := range p.add {
 			n += o.Size()
 		}
 		addStats(ctx, func(s *PackStats) {
-			s.PackedFiles += int64(len(add))
+			s.PackedFiles += int64(len(p.add))
 			s.BytesIn += n
 			s.PacksTotal = int64(len(m.Packs))
 		})
 		return nil
 	}
-	if len(m.Files) == 0 && len(add) == 0 && len(migrants) == 0 {
+	if len(m.Files) == 0 && len(p.add) == 0 {
 		addStats(ctx, func(s *PackStats) { s.PacksTotal = 0 })
 		if p.mObj != nil {
 			// Nothing left to pack: the packs and manifests go.
 			if err := p.removeAll(ctx); err != nil {
 				return err
 			}
+			p.mObj, p.oldRaw = nil, nil
 		}
-		return p.removeV1(ctx)
+		return nil
 	}
 
-	changedAny := len(add) > 0 || len(migrants) > 0 || len(compact) > 0 || len(obsolete) > 0 || dirty || len(p.v1) > 0
-	if changedAny {
+	if len(p.add) > 0 || len(p.compact) > 0 || len(p.obsolete) > 0 || p.dirty {
 		b := &packBuilder{p: p, m: m}
-		for _, o := range add {
+		for _, o := range p.add {
 			if err := b.add(ctx, o); err != nil {
 				return fmt.Errorf("pack: %w", err)
 			}
 		}
-		if err := b.migrate(ctx, migrants); err != nil {
-			return fmt.Errorf("pack: migrate v1 packs: %w", err)
-		}
-		for _, name := range compact {
+		obsolete := p.obsolete
+		for _, name := range p.compact {
 			if err := b.compact(ctx, name); err != nil {
 				return fmt.Errorf("pack: compact %s: %w", name, err)
 			}
@@ -247,7 +308,7 @@ func (p *packer) run(ctx context.Context) error {
 		if err := b.finish(ctx); err != nil {
 			return fmt.Errorf("pack: %w", err)
 		}
-		addStats(ctx, func(s *PackStats) { s.CompactedPacks += int64(len(compact)) })
+		addStats(ctx, func(s *PackStats) { s.CompactedPacks += int64(len(p.compact)) })
 		for _, name := range obsolete {
 			delete(m.Packs, name)
 		}
@@ -264,10 +325,102 @@ func (p *packer) run(ctx context.Context) error {
 		}
 	}
 	addStats(ctx, func(s *PackStats) { s.PacksTotal = int64(len(m.Packs)) })
-	if err := p.removeV1(ctx); err != nil {
+	return nil
+}
+
+// observe is called with every listing the main pass makes of dst. It keeps
+// the loose copies of packed files and the version 1 pack directories (the
+// root's own is found with the job packs, see loadManifest).
+func (p *packer) observe(entries fs.DirEntries) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, e := range entries {
+		switch x := e.(type) {
+		case fs.Directory:
+			if isPackDir(x.Remote()) {
+				if dir := path.Dir(x.Remote()); dir != "." {
+					p.v1Dirs[dir] = struct{}{}
+				}
+			}
+		case fs.Object:
+			if _, ok := p.packed[x.Remote()]; ok {
+				p.loose[x.Remote()] = x
+			}
+		}
+	}
+}
+
+// tail deals with what the main pass showed of dst. It runs only after the
+// manifest is committed, because both the loose copies and the v1 members are
+// judged against it.
+func (p *packer) tail(ctx context.Context) error {
+	if err := p.retireLoose(ctx); err != nil {
 		return err
 	}
-	return p.retireLoose(ctx)
+	return p.migrateV1(ctx)
+}
+
+// migrateV1 folds the version 1 packs seen at dst into the job packs. Members
+// whose src file still exists are in the manifest already (they were added as
+// new). Those only the v1 pack has are moved over as they are, in a second
+// commit; then the v1 packs go.
+func (p *packer) migrateV1(ctx context.Context) error {
+	dirs := make([]string, 0, len(p.v1Dirs))
+	for dir := range p.v1Dirs {
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+	for _, dir := range dirs {
+		m, _, err := loadV1(ctx, p.dst, dir)
+		if err != nil {
+			return fmt.Errorf("pack %q: read v1 index: %w", dir, err)
+		}
+		if m != nil {
+			p.v1 = append(p.v1, v1Dir{dir, m})
+		}
+	}
+	if p.dry {
+		addStats(ctx, func(s *PackStats) { s.V1MigratedDirs += int64(len(p.v1)) })
+		return nil
+	}
+	if len(p.v1) == 0 {
+		return nil
+	}
+	// When src is gone, sync lets the member go and copy keeps it.
+	var migrants []migrant
+	for _, d := range p.v1 {
+		names := make([]string, 0, len(d.m.Files))
+		for name := range d.m.Files {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			remote := path.Join(d.dir, name)
+			_, packed := p.m.Files[remote]
+			_, isSmall := p.small[remote]
+			_, there := p.present[remote]
+			if packed || isSmall || there || p.sync {
+				continue
+			}
+			migrants = append(migrants, migrant{d, name, remote, d.m.Files[name]})
+		}
+	}
+	if len(migrants) > 0 {
+		b := &packBuilder{p: p, m: p.m}
+		if err := b.migrate(ctx, migrants); err != nil {
+			return fmt.Errorf("pack: migrate v1 packs: %w", err)
+		}
+		if err := b.finish(ctx); err != nil {
+			return fmt.Errorf("pack: %w", err)
+		}
+		p.m.Threshold = p.opts.Threshold
+		p.m.recount()
+		if err := p.commit(ctx); err != nil {
+			return fmt.Errorf("pack: commit manifest: %w", err)
+		}
+		addStats(ctx, func(s *PackStats) { s.PacksTotal = int64(len(p.m.Packs)) })
+	}
+	return p.removeV1(ctx)
 }
 
 // loadManifest reads the job manifest at dst and makes sure new packs are
@@ -298,22 +451,17 @@ func (p *packer) loadManifest(ctx context.Context) error {
 		names = append(names, path.Base(e.Remote()))
 	}
 	m.raiseNext(names...)
+	for _, n := range names {
+		if n == PackIndexName {
+			// The root's version 1 pack lives beside the job packs.
+			p.v1Dirs[""] = struct{}{}
+		}
+	}
 	return nil
 }
 
-// scan sorts one src directory's files into small and not, and notes the
-// small ones that also sit loose at dst.
-func (p *packer) scan(ctx context.Context, dir string, files []fs.Object) error {
-	p.visited[dir] = struct{}{}
-	loose, hasPack, err := p.dstFiles(ctx, dir)
-	if err != nil {
-		return err
-	}
-	if hasPack {
-		if err := p.noteV1(ctx, dir); err != nil {
-			return err
-		}
-	}
+// scan sorts one src directory's files into small and not.
+func (p *packer) scan(files []fs.Object) {
 	for _, o := range files {
 		if o.Size() < 0 || o.Size() >= p.opts.Threshold || !validRel(o.Remote()) {
 			p.present[o.Remote()] = struct{}{}
@@ -321,63 +469,7 @@ func (p *packer) scan(ctx context.Context, dir string, files []fs.Object) error 
 		}
 		p.smalls = append(p.smalls, o)
 		p.hidden[o.Remote()] = struct{}{}
-		if d, ok := loose[path.Base(o.Remote())]; ok {
-			p.loose = append(p.loose, loosePair{o, d})
-		}
 	}
-	return nil
-}
-
-// dstFiles lists the loose files of dir at dst. The main pass lists the same
-// directories, and OpenList caches listings, so this is not a second round of
-// driver calls.
-func (p *packer) dstFiles(ctx context.Context, dir string) (files map[string]fs.Object, hasPackDir bool, err error) {
-	entries, err := p.dst.List(ctx, dir)
-	if err != nil {
-		if errors.Is(err, fs.ErrorDirNotFound) {
-			return nil, false, nil
-		}
-		return nil, false, fmt.Errorf("list %q at dst: %w", dir, err)
-	}
-	files = map[string]fs.Object{}
-	for _, e := range entries {
-		switch x := e.(type) {
-		case fs.Directory:
-			if path.Base(x.Remote()) == PackDirName {
-				hasPackDir = true
-			}
-		case fs.Object:
-			files[path.Base(x.Remote())] = x
-		}
-	}
-	return files, hasPackDir, nil
-}
-
-// noteV1 records dir's version 1 pack, if it has one.
-func (p *packer) noteV1(ctx context.Context, dir string) error {
-	m, _, err := loadV1(ctx, p.dst, dir)
-	if err != nil {
-		return fmt.Errorf("pack %q: read v1 index: %w", dir, err)
-	}
-	if m != nil {
-		p.v1 = append(p.v1, v1Dir{dir, m})
-	}
-	return nil
-}
-
-// findOrphanV1 finds version 1 packs in directories src no longer has.
-func (p *packer) findOrphanV1(ctx context.Context) error {
-	return walkDirs(ctx, p.dst, func(dir string, _ []fs.Object, subdirs []string) error {
-		if _, ok := p.visited[dir]; ok {
-			return nil
-		}
-		for _, d := range subdirs {
-			if d == PackDirName {
-				return p.noteV1(ctx, dir)
-			}
-		}
-		return nil
-	})
 }
 
 // removeV1 deletes the version 1 packs that now live in the job packs. The
@@ -466,42 +558,53 @@ func (p *packer) changed(ctx context.Context, o fs.Object, e fileEntry) (changed
 	return timed, false
 }
 
-// sameLoose says whether the loose dst file is the very file that is packed:
-// same size and, where dst keeps modification times, the same time to within
-// a second; where it doesn't (115), the same SHA1 — without one to compare,
-// it is not provably the same.
-func (p *packer) sameLoose(ctx context.Context, srcObj, dstObj fs.Object) bool {
-	if srcObj.Size() != dstObj.Size() {
+// sameLoose says whether the loose dst file is the very file the manifest
+// holds: same size and, where dst keeps modification times, the same time to
+// within a second; where it doesn't (115), the same SHA1 — without one to
+// compare, it is not provably the same.
+func (p *packer) sameLoose(ctx context.Context, e fileEntry, o fs.Object) bool {
+	if e.Size != o.Size() {
 		return false
 	}
 	if p.dst.Precision() != fs.ModTimeNotSupported {
-		d := srcObj.ModTime(ctx).Sub(dstObj.ModTime(ctx))
+		d := e.modTime().Sub(o.ModTime(ctx))
 		if d < 0 {
 			d = -d
 		}
 		return d <= max(time.Second, p.dst.Precision())
 	}
-	a, errA := srcObj.Hash(ctx, rhash.SHA1)
-	b, errB := dstObj.Hash(ctx, rhash.SHA1)
-	return errA == nil && errB == nil && a != "" && strings.EqualFold(a, b)
+	sum, err := o.Hash(ctx, rhash.SHA1)
+	return err == nil && sum != "" && strings.EqualFold(sum, e.SHA1)
 }
 
 // retireLoose removes the loose dst copies of files that now live in a pack.
 // A copy that differs from what was packed is somebody's other data: it is
-// kept, counted as a conflict, and hidden from the main pass so sync leaves
-// it alone too.
+// kept and counted as a conflict. The main pass never saw either kind, so
+// sync left them alone. A dry run only counts, and can't judge a file it
+// didn't pack.
 func (p *packer) retireLoose(ctx context.Context) error {
-	for _, pr := range p.loose {
-		if p.sameLoose(ctx, pr.src, pr.dst) {
-			if err := pr.dst.Remove(ctx); err != nil {
-				return fmt.Errorf("remove superseded %s: %w", pr.dst.Remote(), err)
-			}
-			addStats(ctx, func(s *PackStats) { s.LooseRemoved++ })
+	remotes := make([]string, 0, len(p.loose))
+	for r := range p.loose {
+		remotes = append(remotes, r)
+	}
+	sort.Strings(remotes)
+	for _, r := range remotes {
+		o := p.loose[r]
+		e, ok := p.m.Files[r]
+		if !ok {
 			continue
 		}
-		log.Warnf("[sync] pack: %s exists loose at dst with different content than the packed copy; keeping both", pr.dst.Remote())
-		p.hiddenDst[pr.dst.Remote()] = struct{}{}
-		addStats(ctx, func(s *PackStats) { s.Conflicts++ })
+		if !p.sameLoose(ctx, e, o) {
+			log.Warnf("[sync] pack: %s exists loose at dst with different content than the packed copy; keeping both", r)
+			addStats(ctx, func(s *PackStats) { s.Conflicts++ })
+			continue
+		}
+		if !p.dry {
+			if err := o.Remove(ctx); err != nil {
+				return fmt.Errorf("remove superseded %s: %w", r, err)
+			}
+		}
+		addStats(ctx, func(s *PackStats) { s.LooseRemoved++ })
 	}
 	return nil
 }
@@ -518,7 +621,7 @@ func (p *packer) commit(ctx context.Context) error {
 		if err != nil && !notFound(err) {
 			return err
 		}
-		if err := p.upload(ctx, rel, packPath("", PackManifestPrevName), prev); err != nil {
+		if _, err := p.upload(ctx, rel, packPath("", PackManifestPrevName), prev); err != nil {
 			return err
 		}
 	}
@@ -530,7 +633,13 @@ func (p *packer) commit(ctx context.Context) error {
 	if err := os.WriteFile(full, b, 0o644); err != nil {
 		return err
 	}
-	return p.upload(ctx, rel, packPath("", PackManifestName), p.mObj)
+	o, err := p.upload(ctx, rel, packPath("", PackManifestName), p.mObj)
+	if err != nil {
+		return err
+	}
+	// A later commit of this run replaces this one.
+	p.mObj, p.oldRaw = o, b
+	return nil
 }
 
 func (p *packer) removeObject(ctx context.Context, remote string) error {
@@ -664,7 +773,7 @@ func (b *packBuilder) finish(ctx context.Context) error {
 		return err
 	}
 	b.m.Packs[name] = packEntry{Bytes: w.n, SHA1: hex.EncodeToString(w.h.Sum(nil)), Live: members}
-	if err := b.p.upload(ctx, rel, packPath("", name), nil); err != nil {
+	if _, err := b.p.upload(ctx, rel, packPath("", name), nil); err != nil {
 		return fmt.Errorf("upload %s: %w", name, err)
 	}
 	addStats(ctx, func(s *PackStats) { s.PacksWritten++; s.BytesOut += w.n })
@@ -806,14 +915,14 @@ func fetchTo(ctx context.Context, o fs.Object, path string) (string, error) {
 
 // upload copies a staged file to dst, replacing existing when given, and
 // frees the staged copy.
-func (p *packer) upload(ctx context.Context, rel, remote string, existing fs.Object) error {
+func (p *packer) upload(ctx context.Context, rel, remote string, existing fs.Object) (fs.Object, error) {
 	o, err := p.stage.object(ctx, rel)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	_, err = operations.Copy(ctx, p.dst, existing, remote, o)
+	dstObj, err := operations.Copy(ctx, p.dst, existing, remote, o)
 	if rerr := os.Remove(filepath.Join(p.stage.root, rel)); err == nil && rerr != nil && !os.IsNotExist(rerr) {
 		log.Warnf("[sync] pack: can't remove staged %s: %v", rel, rerr)
 	}
-	return err
+	return dstObj, err
 }
