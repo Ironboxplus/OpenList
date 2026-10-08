@@ -174,6 +174,7 @@ func admin(g *gin.RouterGroup) {
 	syncGrp.GET("/list", handles.SyncList)
 	syncGrp.POST("/cancel", handles.SyncCancel)
 	syncGrp.GET("/history", handles.SyncHistory)
+	syncGrp.GET("/pack_defaults", handles.SyncPackDefaults)
 	syncGrp.GET("/bwlimit", handles.SyncBwLimit)
 	syncGrp.POST("/bwlimit", handles.SyncBwLimit)
 

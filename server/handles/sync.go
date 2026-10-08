@@ -83,3 +83,9 @@ func SyncBwLimit(c *gin.Context) {
 	}
 	common.SuccessResp(c, gin.H{"bytes_per_second": bps})
 }
+
+// SyncPackDefaults reports the small-file packing defaults a request gets for
+// every pack option it leaves unset, for forms to show.
+func SyncPackDefaults(c *gin.Context) {
+	common.SuccessResp(c, syncjob.DefaultPackOptions())
+}

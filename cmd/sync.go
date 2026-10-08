@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,6 +43,14 @@ var syncFlags struct {
 	maxDelete    int64
 	events       bool
 	limit        int
+	follow       bool
+
+	pack          bool
+	packThreshold string
+	packMinFiles  int
+	packMax       string
+	unpack        bool
+	unpackSync    bool
 }
 
 const endpointHelp = `
@@ -56,8 +65,12 @@ and only transfer what the drive doesn't already have.
 
 The server must be running; the job runs inside it. Follow or inspect it with
 "openlist jobs", stop it with "openlist jobs cancel", and cap the bandwidth of
-all running jobs with "openlist bwlimit". Ctrl-C cancels the job; --detach
-leaves it running.`
+all running jobs with "openlist bwlimit". Ctrl-C only stops following; the
+job keeps running until it ends or "openlist jobs cancel <id>".
+
+copy and sync can pack small files (--pack) so a drive with a per-file API
+cost sees a few large uploads instead of thousands of tiny ones, and unpack
+them again (--unpack, or "openlist sync unpack").`
 
 func newSyncCommand(mode syncjob.Mode, use, short string) *cobra.Command {
 	c := &cobra.Command{
@@ -66,59 +79,20 @@ func newSyncCommand(mode syncjob.Mode, use, short string) *cobra.Command {
 		Long:  short + "\n" + endpointHelp,
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			src, err := endpointArg(args[0])
-			if err != nil {
-				return err
-			}
-			dst, err := endpointArg(args[1])
-			if err != nil {
-				return err
-			}
-			client, err := newSyncClient()
-			if err != nil {
-				return err
-			}
-			spec := syncjob.Spec{
-				Mode:         mode,
-				Src:          src,
-				Dst:          dst,
-				DryRun:       syncFlags.dryRun,
-				SizeOnly:     syncFlags.sizeOnly,
-				TrackRenames: syncFlags.trackRenames,
-				Resync:       syncFlags.resync,
-				Force:        syncFlags.force,
-				Filters:      syncFlags.filters,
-				Transfers:    syncFlags.transfers,
-				Checkers:     syncFlags.checkers,
-			}
-			if cmd.Flags().Changed("max-delete") {
-				spec.MaxDelete = &syncFlags.maxDelete
-			}
-			snap, err := client.start(spec)
-			if err != nil {
-				return err
-			}
-			fmt.Printf("job %s started: %s %s -> %s\n", snap.ID, mode, src, dst)
-			if syncFlags.detach {
-				return nil
-			}
-			return client.follow(snap.ID)
+			return runSync(cmd, mode, args)
 		},
 	}
 	f := c.Flags()
-	f.BoolVarP(&syncFlags.dryRun, "dry-run", "n", false, "show what would change without changing anything")
-	f.BoolVar(&syncFlags.sizeOnly, "size-only", false, "compare by size only (skips hashing; misses same-size edits)")
-	f.StringArrayVar(&syncFlags.filters, "filter", nil, `rclone filter rule, repeatable, e.g. --filter "- *.tmp"`)
-	f.BoolVarP(&syncFlags.detach, "detach", "d", false, "start the job and return without waiting")
-	f.IntVar(&syncFlags.transfers, "transfers", 0, "files transferred at once (default 4)")
-	f.IntVar(&syncFlags.checkers, "checkers", 0, "files compared at once (default 8)")
-	addServerFlags(f)
+	addCommonFlags(f)
 	switch mode {
 	case syncjob.ModeCopy:
 		f.BoolVar(&syncFlags.trackRenames, "track-renames", false, "turn renames at src into server-side moves at dst instead of re-uploads")
+		addPackFlags(f)
 	case syncjob.ModeSync:
 		f.BoolVar(&syncFlags.trackRenames, "track-renames", false, "turn renames at src into server-side moves at dst instead of re-uploads")
 		f.Int64Var(&syncFlags.maxDelete, "max-delete", 0, "abort if more than this many files would be deleted at dst")
+		addPackFlags(f)
+		c.AddCommand(newUnpackCommand())
 	case syncjob.ModeBisync:
 		f.BoolVar(&syncFlags.resync, "resync", false, "rebuild the baseline; required on the first run")
 		f.BoolVar(&syncFlags.force, "force", false, "allow a run that deletes more than half the files")
@@ -126,9 +100,149 @@ func newSyncCommand(mode syncjob.Mode, use, short string) *cobra.Command {
 	return c
 }
 
+func addCommonFlags(f *pflag.FlagSet) {
+	f.BoolVarP(&syncFlags.dryRun, "dry-run", "n", false, "show what would change without changing anything")
+	f.BoolVar(&syncFlags.sizeOnly, "size-only", false, "compare by size only (skips hashing; misses same-size edits)")
+	f.StringArrayVar(&syncFlags.filters, "filter", nil, `rclone filter rule, repeatable, e.g. --filter "- *.tmp"`)
+	f.BoolVarP(&syncFlags.detach, "detach", "d", false, "start the job and return without waiting")
+	f.IntVar(&syncFlags.transfers, "transfers", 0, "files transferred at once (default 4)")
+	f.IntVar(&syncFlags.checkers, "checkers", 0, "files compared at once (default 8)")
+	addServerFlags(f)
+}
+
+func runSync(cmd *cobra.Command, mode syncjob.Mode, args []string) error {
+	src, err := endpointArg(args[0])
+	if err != nil {
+		return err
+	}
+	dst, err := endpointArg(args[1])
+	if err != nil {
+		return err
+	}
+	spec := syncjob.Spec{
+		Mode:         mode,
+		Src:          src,
+		Dst:          dst,
+		DryRun:       syncFlags.dryRun,
+		SizeOnly:     syncFlags.sizeOnly,
+		TrackRenames: syncFlags.trackRenames,
+		Resync:       syncFlags.resync,
+		Force:        syncFlags.force,
+		Filters:      syncFlags.filters,
+		Transfers:    syncFlags.transfers,
+		Checkers:     syncFlags.checkers,
+	}
+	if cmd.Flags().Changed("max-delete") {
+		spec.MaxDelete = &syncFlags.maxDelete
+	}
+	if err := applyPackFlags(&spec); err != nil {
+		return err
+	}
+	client, err := newSyncClient()
+	if err != nil {
+		return err
+	}
+	snap, err := client.start(spec)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("job %s started: %s %s -> %s\n", snap.ID, mode, src, dst)
+	if syncFlags.detach {
+		return nil
+	}
+	return client.follow(interruptContext(), snap.ID)
+}
+
+func addPackFlags(f *pflag.FlagSet) {
+	d := syncjob.DefaultPackOptions()
+	f.BoolVar(&syncFlags.pack, "pack", false, "zip each directory's small files into packs at dst")
+	f.StringVar(&syncFlags.packThreshold, "pack-threshold", formatSize(d.Threshold), "with --pack: files smaller than this are packed (K, M, G suffixes)")
+	f.IntVar(&syncFlags.packMinFiles, "pack-min-files", d.MinFiles, "with --pack: don't pack a directory with fewer small files than this")
+	f.StringVar(&syncFlags.packMax, "pack-max", formatSize(d.MaxPackBytes), "with --pack: largest pack; more content goes into more packs (K, M, G suffixes)")
+	f.BoolVar(&syncFlags.unpack, "unpack", false, "extract packs (and legacy PACKED.tsv archives) found at src into plain files at dst")
+}
+
+func newUnpackCommand() *cobra.Command {
+	c := &cobra.Command{
+		Use:   "unpack <src> <dst>",
+		Short: "Extract packed directories at src into plain files at dst (copy --unpack; with --sync, sync --unpack)",
+		Long: "Extract packed directories at src into plain files at dst. Same as \"openlist copy --unpack\",\n" +
+			"or with --sync \"openlist sync --unpack\", which also deletes files at dst that are not at src.\n" + endpointHelp,
+		Args: cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			mode := syncjob.ModeCopy
+			if syncFlags.unpackSync {
+				mode = syncjob.ModeSync
+			}
+			syncFlags.unpack = true
+			return runSync(cmd, mode, args)
+		},
+	}
+	f := c.Flags()
+	addCommonFlags(f)
+	f.BoolVar(&syncFlags.unpackSync, "sync", false, "also delete files at dst that are not at src")
+	f.Int64Var(&syncFlags.maxDelete, "max-delete", 0, "with --sync: abort if more than this many files would be deleted at dst")
+	return c
+}
+
+// applyPackFlags copies the pack flags into spec, rejecting contradictions
+// before anything is sent.
+func applyPackFlags(spec *syncjob.Spec) error {
+	if syncFlags.pack && syncFlags.unpack {
+		return fmt.Errorf("--pack and --unpack can't be used together")
+	}
+	spec.Unpack = syncFlags.unpack
+	if !syncFlags.pack {
+		return nil
+	}
+	threshold, err := parseSize(syncFlags.packThreshold)
+	if err != nil {
+		return fmt.Errorf("--pack-threshold: %w", err)
+	}
+	maxPack, err := parseSize(syncFlags.packMax)
+	if err != nil {
+		return fmt.Errorf("--pack-max: %w", err)
+	}
+	if threshold <= 0 || maxPack <= 0 || syncFlags.packMinFiles <= 0 {
+		return fmt.Errorf("--pack-threshold, --pack-min-files and --pack-max must be positive")
+	}
+	spec.Pack = &syncjob.PackOptions{Enabled: true, Threshold: threshold, MinFiles: syncFlags.packMinFiles, MaxPackBytes: maxPack}
+	return nil
+}
+
+// parseSize reads a byte count with an optional K, M, G or T suffix (powers of
+// 1024; "KiB" and "KB" spellings are accepted too).
+func parseSize(s string) (int64, error) {
+	t := strings.ToUpper(strings.TrimSpace(s))
+	t = strings.TrimSuffix(strings.TrimSuffix(t, "IB"), "B")
+	mult := int64(1)
+	if t != "" {
+		if i := strings.IndexByte("KMGT", t[len(t)-1]); i >= 0 {
+			mult = int64(1) << (10 * (i + 1))
+			t = t[:len(t)-1]
+		}
+	}
+	n, err := strconv.ParseFloat(strings.TrimSpace(t), 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("bad size %q (want e.g. 512K, 8M, 1G)", s)
+	}
+	return int64(n * float64(mult)), nil
+}
+
+// formatSize is parseSize's inverse for round numbers: 8388608 -> "8M".
+func formatSize(n int64) string {
+	for i, suffix := range []string{"T", "G", "M", "K"} {
+		unit := int64(1) << (10 * (4 - i))
+		if n >= unit && n%unit == 0 {
+			return fmt.Sprintf("%d%s", n/unit, suffix)
+		}
+	}
+	return strconv.FormatInt(n, 10)
+}
+
 var jobsCmd = &cobra.Command{
 	Use:   "jobs [id]",
-	Short: "List sync jobs, or follow one (--events for its per-file log)",
+	Short: "List sync jobs, or show one (--follow to watch it, --events for its per-file log)",
 	Args:  cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		client, err := newSyncClient()
@@ -139,7 +253,10 @@ var jobsCmd = &cobra.Command{
 			if syncFlags.events {
 				return client.printEvents(args[0])
 			}
-			return client.follow(args[0])
+			if syncFlags.follow {
+				return client.follow(interruptContext(), args[0])
+			}
+			return client.show(os.Stdout, args[0])
 		}
 		var list []syncjob.Snapshot
 		if err := client.call(http.MethodGet, "/api/admin/sync/list", nil, &list); err != nil {
@@ -220,7 +337,8 @@ func init() {
 		bwlimitCmd,
 	)
 	jobsCmd.AddCommand(jobsCancelCmd, jobsHistoryCmd)
-	jobsCmd.Flags().BoolVar(&syncFlags.events, "events", false, "print the job's per-file log instead of following it")
+	jobsCmd.Flags().BoolVar(&syncFlags.events, "events", false, "print the job's per-file log")
+	jobsCmd.Flags().BoolVar(&syncFlags.follow, "follow", false, "keep printing progress until the job ends (Ctrl-C stops following, not the job)")
 	jobsHistoryCmd.Flags().IntVar(&syncFlags.limit, "limit", 20, "how many jobs to show")
 	addServerFlags(jobsCmd.PersistentFlags())
 	addServerFlags(bwlimitCmd.Flags())
@@ -369,11 +487,33 @@ func (c *syncClient) call(method, path string, body, out any) error {
 	return nil
 }
 
-// follow prints progress until the job ends. Ctrl-C cancels the job on the
-// server rather than leaving it running unobserved.
-func (c *syncClient) follow(id string) error {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
+// interruptContext is cancelled by Ctrl-C.
+func interruptContext() context.Context {
+	ctx, _ := signal.NotifyContext(context.Background(), os.Interrupt)
+	return ctx
+}
+
+// show prints a job's current state once.
+func (c *syncClient) show(w io.Writer, id string) error {
+	var s syncjob.Snapshot
+	if err := c.call(http.MethodGet, "/api/admin/sync/get?id="+url.QueryEscape(id), nil, &s); err != nil {
+		return err
+	}
+	fmt.Fprintf(w, "%s  %s %s -> %s  started %s\n", s.ID, s.Spec.Mode, s.Spec.Src, s.Spec.Dst, s.StartedAt.Local().Format(time.DateTime))
+	fmt.Fprintln(w, progressLine(s))
+	if pl := packLine(s); pl != "" {
+		fmt.Fprintln(w, pl)
+	}
+	fmt.Fprintln(w, summaryLine(s))
+	if s.Error != "" {
+		fmt.Fprintf(w, "error: %s\n", s.Error)
+	}
+	return nil
+}
+
+// follow prints progress until the job ends. Ctrl-C (ctx cancelled) only
+// stops following: a job is cancelled explicitly with "jobs cancel".
+func (c *syncClient) follow(ctx context.Context, id string) error {
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
 	for {
@@ -384,6 +524,9 @@ func (c *syncClient) follow(id string) error {
 		fmt.Printf("\r%s", progressLine(s))
 		if s.State != syncjob.StateRunning {
 			fmt.Println()
+			if pl := packLine(s); pl != "" {
+				fmt.Println(pl)
+			}
 			fmt.Println(summaryLine(s))
 			if s.State != syncjob.StateSucceeded {
 				return fmt.Errorf("job %s %s: %s", id, s.State, s.Error)
@@ -392,11 +535,25 @@ func (c *syncClient) follow(id string) error {
 		}
 		select {
 		case <-ctx.Done():
-			fmt.Println("\ninterrupted, cancelling job", id)
-			return c.call(http.MethodPost, "/api/admin/sync/cancel?id="+url.QueryEscape(id), nil, nil)
+			fmt.Printf("\nstopped following; job %s keeps running (cancel it with: openlist jobs cancel %s)\n", id, id)
+			return nil
 		case <-tick.C:
 		}
 	}
+}
+
+// packLine summarises packing / unpacking progress, "" for jobs that do neither.
+func packLine(s syncjob.Snapshot) string {
+	p := s.PackStats
+	if p == nil {
+		return ""
+	}
+	if s.Spec.Unpack {
+		return fmt.Sprintf("unpack: %d dirs, %d files extracted (%s), %d packs fetched, %d read by range",
+			p.Dirs, p.UnpackedFiles, humanBytes(float64(p.UnpackedBytes)), p.PacksFetched, p.PacksRanged)
+	}
+	return fmt.Sprintf("pack: %d dirs, %d files -> %d packs (%s read, %s written), %d dirs too small to pack, %d entries retired",
+		p.Dirs, p.PackedFiles, p.Packs, humanBytes(float64(p.BytesIn)), humanBytes(float64(p.BytesOut)), p.SkippedDirs, p.DeadRemoved)
 }
 
 func progressLine(s syncjob.Snapshot) string {
@@ -404,8 +561,12 @@ func progressLine(s syncjob.Snapshot) string {
 		v, _ := s.Stats[k].(float64)
 		return v
 	}
-	return fmt.Sprintf("%-9s %s / %s  %.0f/%.0f files  %.0f checks  %.0f deleted  %.0f renamed  %.0f errors  %s/s   ",
-		s.State,
+	state := string(s.State)
+	if s.State == syncjob.StateRunning && s.Stage != "" {
+		state = s.Stage
+	}
+	return fmt.Sprintf("%-12s %s / %s  %.0f/%.0f files  %.0f checks  %.0f deleted  %.0f renamed  %.0f errors  %s/s   ",
+		state,
 		humanBytes(num("bytes")), humanBytes(num("totalBytes")),
 		num("transfers"), num("totalTransfers"), num("checks"),
 		num("deletes"), num("renames"), num("errors"),
