@@ -49,6 +49,9 @@ func (o *Orchestrator) ScrapeOne(ctx context.Context, p string, opts ScrapeOpts)
 	if err != nil {
 		return nil, err
 	}
+	if cur, ok := ex[p]; ok && cur.Kind == "library" {
+		return nil, ErrLibrary
+	}
 	if cur, ok := ex[p]; ok && cur.Locked && !opts.Force {
 		return nil, ErrLocked
 	}

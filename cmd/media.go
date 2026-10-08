@@ -15,6 +15,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/media/apply"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/check"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/scraper"
+	mdl "github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/spf13/cobra"
 )
 
@@ -134,6 +135,23 @@ one /api/fs/get and one Range request per work.`,
 	chk.Flags().BoolVar(&mediaFlags.probe, "probe-embedded", false, "read the head of the first mkv of each work to find built-in subtitle tracks")
 	chk.Flags().StringVar(&mediaFlags.out, "out", "", "write the markdown report here (default: stdout)")
 	_ = chk.MarkFlagRequired("root")
+
+	lib := &cobra.Command{
+		Use:   "library",
+		Short: "Mark directories as library roots (kind=library): they open as a poster wall of their entries",
+	}
+	libAdd := &cobra.Command{Use: "add", Short: "Mark --path as a library root (locked, source manual)", Args: cobra.NoArgs, RunE: runLibraryAdd}
+	libRm := &cobra.Command{Use: "rm", Short: "Remove the library mark of --path (its entries stay)", Args: cobra.NoArgs, RunE: runLibraryRm}
+	libLs := &cobra.Command{Use: "ls", Short: "List library roots", Args: cobra.NoArgs, RunE: runLibraryLs}
+	for _, c := range []*cobra.Command{libAdd, libRm} {
+		c.Flags().StringVar(&mediaFlags.path, "path", "", "the library directory, e.g. /115/arc/MOV/Anime (required)")
+		_ = c.MarkFlagRequired("path")
+	}
+	for _, c := range []*cobra.Command{libAdd, libRm, libLs} {
+		addServerFlags(c.Flags())
+		lib.AddCommand(c)
+	}
+	mediaCmd.AddCommand(lib)
 
 	for _, c := range []*cobra.Command{plan, app, scrape, ls, chk} {
 		addServerFlags(c.Flags())
@@ -388,6 +406,88 @@ func runMediaLs(cmd *cobra.Command, args []string) error {
 		}
 		if len(resp.Content) == 0 || int64(page*500) >= resp.Total {
 			fmt.Fprintf(os.Stderr, "%d items\n", resp.Total)
+			return nil
+		}
+	}
+}
+
+func libraryPath() string {
+	p := strings.TrimRight(strings.ReplaceAll(mediaFlags.path, "\\", "/"), "/")
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return p
+}
+
+func runLibraryAdd(cmd *cobra.Command, args []string) error {
+	c, err := newSyncClient()
+	if err != nil {
+		return err
+	}
+	p := libraryPath()
+	ctx, stop := mediaContext()
+	defer stop()
+	remote := apply.Remote{API: c}
+	ex, err := remote.Existing(ctx, p)
+	if err != nil {
+		return err
+	}
+	switch cur := ex[p]; cur.Kind {
+	case "movie", "tv", "anime":
+		return fmt.Errorf("%s is already a %s item; remove it first (openlist media library rm does not touch works)", p, cur.Kind)
+	}
+	title := p[strings.LastIndex(p, "/")+1:]
+	kind, src, lock := mdl.MediaKindLibrary, mdl.MediaSourceManual, true
+	req := mdl.MediaSetReq{Path: p, Kind: &kind, Title: &title, Source: &src, Locked: &lock}
+	if err := remote.Set(ctx, req, true); err != nil {
+		return err
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "%s is a library\n", p)
+	return nil
+}
+
+func runLibraryRm(cmd *cobra.Command, args []string) error {
+	c, err := newSyncClient()
+	if err != nil {
+		return err
+	}
+	p := libraryPath()
+	ctx, stop := mediaContext()
+	defer stop()
+	ex, err := apply.Remote{API: c}.Existing(ctx, p)
+	if err != nil {
+		return err
+	}
+	if ex[p].Kind != mdl.MediaKindLibrary {
+		return fmt.Errorf("%s is not a library", p)
+	}
+	if err := c.Call("POST", "/api/admin/media/delete", map[string]any{"path": p}, nil); err != nil {
+		return err
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "%s is no longer a library\n", p)
+	return nil
+}
+
+func runLibraryLs(cmd *cobra.Command, args []string) error {
+	c, err := newSyncClient()
+	if err != nil {
+		return err
+	}
+	for page := 1; ; page++ {
+		var resp struct {
+			Content []struct {
+				Path string `json:"path"`
+			} `json:"content"`
+			Total int64 `json:"total"`
+		}
+		q := url.Values{"kind": {mdl.MediaKindLibrary}, "page": {strconv.Itoa(page)}, "per_page": {"500"}}
+		if err := c.Call("GET", "/api/admin/media/list?"+q.Encode(), nil, &resp); err != nil {
+			return err
+		}
+		for _, it := range resp.Content {
+			fmt.Fprintln(cmd.OutOrStdout(), it.Path)
+		}
+		if len(resp.Content) == 0 || int64(page*500) >= resp.Total {
 			return nil
 		}
 	}

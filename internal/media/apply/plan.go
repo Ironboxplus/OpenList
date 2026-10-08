@@ -62,7 +62,7 @@ func fatal(err error) bool {
 
 func (o *Orchestrator) planEntry(ctx context.Context, parent string, e identify.Entry, depthLeft int, existing map[string]Existing, res *PlanResult) error {
 	p := path.Join(parent, e.Name)
-	if ex, ok := existing[p]; ok && ex.Locked {
+	if ex, ok := existing[p]; ok && (ex.Locked || ex.Kind == "library") {
 		res.Skipped = append(res.Skipped, p)
 		return nil
 	}

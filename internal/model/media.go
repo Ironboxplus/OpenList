@@ -10,6 +10,7 @@ const (
 	MediaKindAnime      = "anime"
 	MediaKindCollection = "collection"
 	MediaKindIgnore     = "ignore"
+	MediaKindLibrary    = "library" // a root whose entries are the works: opens as a poster wall
 )
 
 // Where an item's data came from.
@@ -25,7 +26,7 @@ const MediaPendingConfidence = 0.6
 
 func ValidMediaKind(k string) bool {
 	switch k {
-	case MediaKindMovie, MediaKindTV, MediaKindAnime, MediaKindCollection, MediaKindIgnore:
+	case MediaKindMovie, MediaKindTV, MediaKindAnime, MediaKindCollection, MediaKindIgnore, MediaKindLibrary:
 		return true
 	}
 	return false

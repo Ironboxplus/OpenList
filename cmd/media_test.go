@@ -71,7 +71,7 @@ func (f *fakeOP) serve(w http.ResponseWriter, r *http.Request) {
 		prefix := r.URL.Query().Get("prefix")
 		var out []map[string]any
 		for p, it := range f.items {
-			if strings.HasPrefix(p, prefix) {
+			if strings.HasPrefix(p, prefix) && (r.URL.Query().Get("kind") == "" || r.URL.Query().Get("kind") == *it.Kind) {
 				out = append(out, map[string]any{"path": p, "kind": *it.Kind, "locked": f.locked[p], "confidence": 1})
 			}
 		}
@@ -107,6 +107,12 @@ func (f *fakeOP) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		reply(200, "success", []scraper.Candidate{{Provider: "tmdb", ID: "tv/1", Title: "Something", Year: 2001, Score: 0.31}, {Provider: "tmdb", ID: "tv/2", Title: "Other", Year: 2002, Score: 0.3}})
+	case "/api/admin/media/delete":
+		var req struct{ Path string }
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		delete(f.items, req.Path)
+		delete(f.locked, req.Path)
+		reply(200, "success", nil)
 	case "/api/fs/media":
 		var req struct{ Path string }
 		_ = json.NewDecoder(r.Body).Decode(&req)
@@ -422,5 +428,36 @@ func TestCheckReportsMissingEpisodesAndProbes(t *testing.T) {
 	}
 	if len(f.sets) != 0 || f.uploads != 0 {
 		t.Error("check must not write")
+	}
+}
+
+func TestLibraryAddLsRm(t *testing.T) {
+	f, srv := newFakeOP(t)
+	pointAtFakeOP(t, srv)
+	mediaFlags.path = "/115/arc/MOV/Anime/"
+	if out, err := run(t, runLibraryAdd); err != nil || !strings.Contains(out, "/115/arc/MOV/Anime is a library") {
+		t.Fatalf("add: %q %v", out, err)
+	}
+	got := f.items["/115/arc/MOV/Anime"]
+	if got.Kind == nil || *got.Kind != "library" || got.Locked == nil || !*got.Locked || got.Source == nil || *got.Source != "manual" || *got.Title != "Anime" {
+		t.Fatalf("stored: %+v", got)
+	}
+	f.items["/115/arc/MOV/Anime/EVA"] = mm.MediaSetReq{Path: "/115/arc/MOV/Anime/EVA", Kind: ptr("tv")}
+	if out, _ := run(t, runLibraryLs); strings.TrimSpace(out) != "/115/arc/MOV/Anime" {
+		t.Fatalf("ls: %q", out)
+	}
+	mediaFlags.path = "/115/arc/MOV/Anime/EVA"
+	if _, err := run(t, runLibraryRm); err == nil {
+		t.Fatal("rm removed a work")
+	}
+	if _, err := run(t, runLibraryAdd); err == nil {
+		t.Fatal("add overwrote a work")
+	}
+	mediaFlags.path = "/115/arc/MOV/Anime"
+	if _, err := run(t, runLibraryRm); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.items["/115/arc/MOV/Anime"]; ok || f.items["/115/arc/MOV/Anime/EVA"].Path == "" {
+		t.Fatalf("rm should delete only the root: %v", f.items)
 	}
 }

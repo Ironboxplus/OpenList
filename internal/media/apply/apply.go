@@ -68,7 +68,7 @@ func (o *Orchestrator) applyRow(ctx context.Context, row Row, opts ApplyOpts) (s
 	what := fmt.Sprintf("%s [%s]", row.Path, row.Kind)
 
 	switch {
-	case row.Provider == "" || row.Kind == "ignore":
+	case row.Provider == "" || row.Kind == "ignore" || row.Kind == "library":
 		if opts.DryRun {
 			return "would set " + what, nil
 		}

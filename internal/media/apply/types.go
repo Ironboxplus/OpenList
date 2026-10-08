@@ -17,6 +17,10 @@ import (
 // ErrLocked is returned when a locked item would be overwritten.
 var ErrLocked = errors.New("media item is locked")
 
+// ErrLibrary is returned when a library root itself would be scraped: only its
+// entries are works.
+var ErrLibrary = errors.New("path is a library root; scrape its entries (media plan --root <path>)")
+
 // ErrNotDir is returned by a Lister for a path that is a file.
 var ErrNotDir = errors.New("not a directory")
 

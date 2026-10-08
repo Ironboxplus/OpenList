@@ -759,3 +759,27 @@ func TestExportImportRoundTripRedownloadsAssets(t *testing.T) {
 		t.Fatalf("import overwrote a locked item: %q", got.Title)
 	}
 }
+
+func TestLibraryRootOpensWithItsChildren(t *testing.T) {
+	m := newMediaEnv(t)
+	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib", "kind": "library", "title": "Lib", "locked": true, "source": "manual"})
+	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib/A", "kind": "movie", "title": "A"})
+	raw := m.ok("POST", "/api/fs/media", "alice", map[string]any{"path": "/lib"})
+	var got struct {
+		Item struct {
+			Kind string `json:"kind"`
+		} `json:"item"`
+		Children []struct {
+			Path string `json:"path"`
+		} `json:"children"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Item.Kind != "library" || len(got.Children) != 1 || got.Children[0].Path != "/lib/A" {
+		t.Fatalf("library response: %s", raw)
+	}
+	if !strings.Contains(string(m.ok("GET", "/api/admin/media/list?kind=library", "admin", nil)), "/lib") {
+		t.Fatal("admin list by kind=library lost the root")
+	}
+}

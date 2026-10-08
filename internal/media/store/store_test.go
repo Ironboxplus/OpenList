@@ -236,3 +236,14 @@ func TestAssetDedupBySHA(t *testing.T) {
 		t.Fatal("garbage accepted as an image")
 	}
 }
+
+func TestLibraryKindIsAccepted(t *testing.T) {
+	s := newTestStore(t)
+	it, err := s.Set(model.MediaSetReq{Path: "/lib", Kind: str("library"), Title: str("Lib")}, SetOptions{})
+	if err != nil || it.Kind != "library" {
+		t.Fatalf("library rejected: %v", err)
+	}
+	if items, total, err := db.ListMediaItems(db.MediaListFilter{Kind: "library", Page: 1, PerPage: 10}); err != nil || total != 1 || items[0].Path != "/lib" {
+		t.Fatalf("list by kind: %v %d", err, total)
+	}
+}

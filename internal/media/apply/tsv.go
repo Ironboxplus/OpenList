@@ -69,7 +69,7 @@ func ParseTSV(r io.Reader) ([]Row, error) {
 			return nil, fmt.Errorf("line %d: path %q is not absolute", line, row.Path)
 		}
 		switch row.Kind {
-		case "movie", "tv", "anime", "collection", "ignore":
+		case "movie", "tv", "anime", "collection", "ignore", "library":
 		default:
 			return nil, fmt.Errorf("line %d: unknown kind %q", line, row.Kind)
 		}

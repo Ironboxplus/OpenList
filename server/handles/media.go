@@ -77,6 +77,10 @@ func mediaErr(c *gin.Context, err error) {
 		common.ErrorStrResp(c, "this item is locked; unlock it or force the change", 409)
 		return
 	}
+	if errors.Is(err, apply.ErrLibrary) {
+		common.ErrorStrResp(c, err.Error(), 400)
+		return
+	}
 	class := scraper.ClassOf(err)
 	switch class {
 	case scraper.ClassNetwork:
