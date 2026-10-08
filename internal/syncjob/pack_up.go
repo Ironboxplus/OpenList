@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -158,6 +159,9 @@ type packer struct {
 	loose  map[string]fs.Object // loose dst copies of packed files, by remote
 	v1Dirs map[string]struct{}  // directories with a version 1 .oppack
 	v1     []v1Dir
+
+	// Job pack file names found under .oppack when the manifest was loaded.
+	packFiles []string
 }
 
 // v1Dir is a directory at dst packed the version 1 way (dir/.oppack/index.json).
@@ -357,7 +361,55 @@ func (p *packer) tail(ctx context.Context) error {
 	if err := p.retireLoose(ctx); err != nil {
 		return err
 	}
-	return p.migrateV1(ctx)
+	if err := p.migrateV1(ctx); err != nil {
+		return err
+	}
+	return p.removeOrphanPacks(ctx)
+}
+
+// jobPackRE is the exact shape of a pack name; nothing else in .oppack is
+// ever a candidate for orphan removal.
+var jobPackRE = regexp.MustCompile(`^p-\d{6}\.zip$`)
+
+// removeOrphanPacks deletes the packs under .oppack that the committed
+// manifest doesn't refer to: what a run that died before its commit left. The
+// root's v1 packs are spared (removeV1 owns them), and with no manifest at dst
+// there is nothing to judge against.
+func (p *packer) removeOrphanPacks(ctx context.Context) error {
+	if p.mObj == nil {
+		return nil
+	}
+	keep := map[string]struct{}{}
+	for name := range p.m.Packs {
+		keep[name] = struct{}{}
+	}
+	readRoot := false
+	for _, d := range p.v1 {
+		if d.dir != "" {
+			continue
+		}
+		readRoot = true
+		for name := range d.m.Packs {
+			keep[name] = struct{}{}
+		}
+	}
+	if _, has := p.v1Dirs[""]; has && !readRoot {
+		// A root v1 index we couldn't read: its packs are unknown.
+		return nil
+	}
+	for _, name := range p.packFiles {
+		if _, ok := keep[name]; ok {
+			continue
+		}
+		if !p.dry {
+			if err := p.removeObject(ctx, packPath("", name)); err != nil {
+				log.Warnf("[sync] pack: can't remove orphan %s: %v", packPath("", name), err)
+				continue
+			}
+		}
+		addStats(ctx, func(s *PackStats) { s.OrphanPacksRemoved++ })
+	}
+	return nil
 }
 
 // migrateV1 folds the version 1 packs seen at dst into the job packs. Members
@@ -452,6 +504,9 @@ func (p *packer) loadManifest(ctx context.Context) error {
 	}
 	m.raiseNext(names...)
 	for _, n := range names {
+		if jobPackRE.MatchString(n) {
+			p.packFiles = append(p.packFiles, n)
+		}
 		if n == PackIndexName {
 			// The root's version 1 pack lives beside the job packs.
 			p.v1Dirs[""] = struct{}{}

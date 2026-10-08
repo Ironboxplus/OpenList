@@ -137,6 +137,10 @@ type PackStats struct {
 	Conflicts      int64 `json:"conflicts"`
 	LooseRemoved   int64 `json:"loose_removed"`
 	V1MigratedDirs int64 `json:"v1_migrated_dirs"`
+	// OrphanPacksRemoved counts packs no committed manifest refers to (left
+	// by runs that died before their commit) that were deleted, or in a dry
+	// run would be.
+	OrphanPacksRemoved int64 `json:"orphan_packs_removed"`
 	// Unpacking: files extracted to dst and their bytes, and packs fetched in
 	// full / read by range.
 	UnpackedFiles int64 `json:"unpacked_files,omitempty"`

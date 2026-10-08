@@ -8,6 +8,7 @@ import (
 	"context"
 	"io"
 	stdpath "path"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -190,3 +191,19 @@ var (
 	_ driver.PutResult   = (*Driver)(nil)
 	_ driver.IRootPath   = (*Driver)(nil)
 )
+
+// Remove deletes a file or a directory with everything below it.
+func (d *Driver) Remove(_ context.Context, obj model.Obj) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	p := obj.GetPath()
+	for k := range d.nodes {
+		if k == p || strings.HasPrefix(k, p+"/") {
+			delete(d.nodes, k)
+			delete(d.data, k)
+		}
+	}
+	return nil
+}
+
+var _ driver.Remove = (*Driver)(nil)

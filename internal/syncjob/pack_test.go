@@ -498,8 +498,10 @@ func TestPackNeverReusesAPackName(t *testing.T) {
 	if got := loadTestManifest(t, dst).Files["a/x.txt"].Pack; got != "p-000002.zip" {
 		t.Fatalf("a/x.txt in %s, want a fresh p-000002.zip", got)
 	}
-	if !exists(dst, ".oppack/p-000001.zip") {
-		t.Fatalf("existing pack overwritten or removed")
+	// The old pack was not reused; with no manifest left to refer to it, it is
+	// an orphan and goes once the new manifest is committed.
+	if exists(dst, ".oppack/p-000001.zip") {
+		t.Fatalf("orphan pack kept")
 	}
 }
 
@@ -715,5 +717,133 @@ func TestPackMigratesVersion1DirectoryPacks(t *testing.T) {
 		if s.PackStats.V1MigratedDirs != 0 || s.PackStats.PacksWritten != 0 {
 			t.Fatalf("%s: second run stats = %+v", mode, s.PackStats)
 		}
+	}
+}
+
+// A run that died before its commit leaves packs no manifest refers to; the
+// next committed run removes them, and only them.
+func TestPackOrphanPacksAreRemovedAfterACommit(t *testing.T) {
+	m := newManager(t)
+	src := tempDir(t)
+	for i := 0; i < 4; i++ {
+		write(t, src, fmt.Sprintf("d/f%d.txt", i), fmt.Sprintf("v1 %d", i))
+	}
+	drv := fakeMount(t, "/fk-orphan")
+	spec := syncjob.Spec{Mode: syncjob.ModeSync, Src: "local:" + src, Dst: "/fk-orphan",
+		Pack: &syncjob.PackOptions{Enabled: true, Threshold: 1024, MaxPackBytes: 1}}
+	mustSucceed(t, runJob(t, m, spec))
+	time.Sleep(200 * time.Millisecond)
+
+	write(t, src, "d/f1.txt", "v2 edited")
+	write(t, src, "d/new.txt", "brand new")
+	var puts int
+	drv.FailPut = func(path string) error {
+		if strings.HasPrefix(path, "/.oppack/p-") {
+			if puts++; puts == 2 {
+				return fmt.Errorf("injected failure on %s", path)
+			}
+		}
+		return nil
+	}
+	if s := runJob(t, m, spec); s.State != syncjob.StateFailed {
+		t.Fatalf("job state = %s, want failed", s.State)
+	}
+	var orphan string // the first run made p-000001..4, one per file
+	for _, n := range []string{"p-000005.zip", "p-000006.zip", "p-000007.zip"} {
+		if _, ok := drv.Content("/.oppack/" + n); ok {
+			orphan = n
+		}
+	}
+	if orphan == "" {
+		t.Fatal("the failed run left no orphan pack")
+	}
+	// Files that are not packs must survive.
+	drv.FailPut = nil
+	s := mustSucceed(t, runJob(t, m, spec))
+	time.Sleep(200 * time.Millisecond)
+	mf := make(map[string]bool)
+	raw, _ := drv.Content("/.oppack/manifest.json.gz")
+	zr, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tm testManifest
+	if err := json.NewDecoder(zr).Decode(&tm); err != nil {
+		t.Fatal(err)
+	}
+	for name := range tm.Packs {
+		mf[name] = true
+		if _, ok := drv.Content("/.oppack/" + name); !ok {
+			t.Fatalf("referenced pack %s was removed", name)
+		}
+	}
+	if s.PackStats.OrphanPacksRemoved < 1 {
+		t.Fatalf("stats = %+v, want orphans removed", s.PackStats)
+	}
+	for i := 1; i <= 10; i++ {
+		n := fmt.Sprintf("p-%06d.zip", i)
+		_, there := drv.Content("/.oppack/" + n)
+		if there != mf[n] {
+			t.Fatalf("%s: at dst = %v, referenced = %v", n, there, mf[n])
+		}
+	}
+	if _, ok := drv.Content("/.oppack/manifest.prev.json.gz"); !ok {
+		t.Fatal("manifest.prev was removed")
+	}
+}
+
+func TestPackOrphanCleanupSparesOtherFilesAndDryRunOnlyCounts(t *testing.T) {
+	m := newManager(t)
+	src, dst := tempDir(t), tempDir(t)
+	write(t, src, "a/x.txt", "x")
+	opts := syncjob.PackOptions{Threshold: 1024}
+	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, dst, opts)))
+
+	write(t, dst, ".oppack/p-000009.zip", "orphan")
+	write(t, dst, ".oppack/p-9.zip", "not a job pack name")
+	write(t, dst, ".oppack/notes.txt", "mine")
+
+	sp := packSpec(syncjob.ModeCopy, src, dst, opts)
+	sp.DryRun = true
+	s := mustSucceed(t, runJob(t, m, sp))
+	if s.PackStats.OrphanPacksRemoved != 1 || !exists(dst, ".oppack/p-000009.zip") {
+		t.Fatalf("dry run: stats = %+v, orphan present = %v", s.PackStats, exists(dst, ".oppack/p-000009.zip"))
+	}
+
+	s = mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, dst, opts)))
+	if s.PackStats.OrphanPacksRemoved != 1 || exists(dst, ".oppack/p-000009.zip") {
+		t.Fatalf("stats = %+v, orphan present = %v", s.PackStats, exists(dst, ".oppack/p-000009.zip"))
+	}
+	for _, keep := range []string{".oppack/p-9.zip", ".oppack/notes.txt", ".oppack/manifest.json.gz", ".oppack/p-000001.zip"} {
+		if !exists(dst, keep) {
+			t.Fatalf("%s was removed", keep)
+		}
+	}
+}
+
+// The root's v1 pack shares .oppack with the job packs and has the same
+// names; until it is migrated it is not an orphan.
+func TestPackOrphanCleanupSparesRootV1PackBeforeMigration(t *testing.T) {
+	m := newManager(t)
+	src, dst := tempDir(t), tempDir(t)
+	write(t, src, "rootfile.txt", "root")
+	mt := time.Date(2026, 9, 14, 10, 0, 0, 0, time.UTC)
+	buildV1(t, dst, "", map[string]string{"rootfile.txt": "root", "rootgone.txt": "only in v1"}, mt)
+	// A manifest has to exist for the cleanup to judge against.
+	opts := syncjob.PackOptions{Threshold: 1024}
+	sp := packSpec(syncjob.ModeCopy, src, dst, opts)
+	sp.DryRun = true
+	s := mustSucceed(t, runJob(t, m, sp))
+	if s.PackStats.OrphanPacksRemoved != 0 || !exists(dst, ".oppack/p-000001.zip") || !exists(dst, ".oppack/index.json") {
+		t.Fatalf("dry run: stats = %+v", s.PackStats)
+	}
+	s = mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, dst, opts)))
+	if s.PackStats.OrphanPacksRemoved != 0 {
+		t.Fatalf("v1 pack counted as orphan: %+v", s.PackStats)
+	}
+	out := tempDir(t)
+	mustSucceed(t, runJob(t, m, unpackSpec(syncjob.ModeCopy, dst, out)))
+	if got, _ := read(t, out, "rootgone.txt"); got != "only in v1" {
+		t.Fatalf("migrated member lost: %q", got)
 	}
 }
