@@ -2,9 +2,13 @@ package syncjob_test
 
 import (
 	"archive/zip"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,6 +24,7 @@ import (
 
 type testManifest struct {
 	Version int `json:"version"`
+	Next    int `json:"next"`
 	Files   map[string]struct {
 		Size int64  `json:"size"`
 		Pack string `json:"pack"`
@@ -32,15 +37,30 @@ type testManifest struct {
 	} `json:"packs"`
 }
 
-func loadTestManifest(t *testing.T, root, dir string) testManifest {
+func readTestManifest(t *testing.T, root, name string) testManifest {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(dir), ".oppack", "index.json"))
+	f, err := os.Open(filepath.Join(root, ".oppack", name))
 	if err != nil {
-		t.Fatalf("manifest of %q: %v", dir, err)
+		t.Fatalf("manifest %s: %v", name, err)
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("manifest %s is not gzip: %v", name, err)
 	}
 	var m testManifest
-	if err := json.Unmarshal(b, &m); err != nil {
+	if err := json.NewDecoder(zr).Decode(&m); err != nil {
 		t.Fatal(err)
+	}
+	return m
+}
+
+// loadTestManifest reads the job manifest at root.
+func loadTestManifest(t *testing.T, root string) testManifest {
+	t.Helper()
+	m := readTestManifest(t, root, "manifest.json.gz")
+	if m.Version != 2 {
+		t.Fatalf("manifest version %d", m.Version)
 	}
 	return m
 }
@@ -66,6 +86,44 @@ func fileNames(m testManifest) []string {
 	return out
 }
 
+// looseSmall lists files under root, outside .oppack, smaller than threshold.
+func looseSmall(t *testing.T, root string, threshold int64) []string {
+	t.Helper()
+	var out []string
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if d.Name() == ".oppack" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if info, _ := d.Info(); info.Size() < threshold {
+			rel, _ := filepath.Rel(root, p)
+			out = append(out, filepath.ToSlash(rel))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func packNames(t *testing.T, root string) []string {
+	t.Helper()
+	entries, _ := os.ReadDir(filepath.Join(root, ".oppack"))
+	var out []string
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".zip") {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
 func packSpec(mode syncjob.Mode, src, dst string, p syncjob.PackOptions) syncjob.Spec {
 	p.Enabled = true
 	return syncjob.Spec{Mode: mode, Src: "local:" + src, Dst: "local:" + dst, Pack: &p}
@@ -87,38 +145,37 @@ func TestPackLayoutAndCompression(t *testing.T) {
 	}
 	write(t, src, "d/w.pt", strings.Repeat("weights", 20))
 	write(t, src, "d/big.bin", strings.Repeat("B", 5000))
+	// A directory with a single small file is packed like any other.
 	write(t, src, "d/sub/s1.txt", "one")
-	write(t, src, "d/sub/s2.txt", "two")
-	for i := 0; i < 3; i++ {
-		write(t, src, fmt.Sprintf("r%d.txt", i), "root")
-	}
+	write(t, src, "lonely/only.txt", "alone")
+	write(t, src, "r0.txt", "root")
 
-	s := mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, dst, syncjob.PackOptions{Threshold: 1024, MinFiles: 3})))
-	if s.PackStats == nil || s.PackStats.Dirs != 2 || s.PackStats.PackedFiles != 10 || s.PackStats.Packs != 2 || s.PackStats.SkippedDirs != 1 {
+	s := mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, dst, syncjob.PackOptions{Threshold: 1024})))
+	if st := s.PackStats; st == nil || st.SmallFiles != 10 || st.PackedFiles != 10 || st.PacksWritten != 1 || st.PacksTotal != 1 {
 		t.Fatalf("pack stats = %+v", s.PackStats)
 	}
 	if s.Stage != "transferring" {
 		t.Fatalf("stage = %q", s.Stage)
 	}
-
-	mf := loadTestManifest(t, dst, "d")
-	if got := strings.Join(fileNames(mf), ","); got != "a0.txt,a1.txt,a2.txt,a3.txt,a4.txt,a5.txt,w.pt" {
-		t.Fatalf("packed files = %s", got)
+	if loose := looseSmall(t, dst, 1024); len(loose) != 0 {
+		t.Fatalf("small files uploaded on their own: %v", loose)
 	}
-	if exists(dst, "d/a0.txt") || exists(dst, "d/w.pt") || exists(dst, "r0.txt") {
-		t.Fatalf("a packed file was also uploaded loose")
+	if !exists(dst, "d/big.bin") {
+		t.Fatalf("large file not transferred as usual")
 	}
-	if !exists(dst, "d/big.bin") || !exists(dst, "d/sub/s1.txt") || !exists(dst, "d/sub/s2.txt") {
-		t.Fatalf("big file or the below-MinFiles directory was not transferred as usual")
-	}
-	if exists(dst, "d/sub/.oppack") {
-		t.Fatalf("a directory under MinFiles got a pack")
-	}
-	if !exists(dst, ".oppack/index.json") {
-		t.Fatalf("root directory not packed")
+	for _, d := range []string{"d/.oppack", "d/sub/.oppack", "lonely/.oppack"} {
+		if exists(dst, d) {
+			t.Fatalf("per-directory %s created", d)
+		}
 	}
 
-	zr, err := zip.OpenReader(filepath.Join(dst, "d", ".oppack", mf.Files["a0.txt"].Pack))
+	mf := loadTestManifest(t, dst)
+	want := "d/a0.txt,d/a1.txt,d/a2.txt,d/a3.txt,d/a4.txt,d/a5.txt,d/sub/s1.txt,d/w.pt,lonely/only.txt,r0.txt"
+	if got := strings.Join(fileNames(mf), ","); got != want {
+		t.Fatalf("manifest files = %s", got)
+	}
+
+	zr, err := zip.OpenReader(filepath.Join(dst, ".oppack", "p-000001.zip"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,8 +184,8 @@ func TestPackLayoutAndCompression(t *testing.T) {
 	for _, f := range zr.File {
 		methods[f.Name] = f.Method
 	}
-	if methods["w.pt"] != zip.Store || methods["a0.txt"] != zip.Deflate {
-		t.Fatalf("methods = %v, want .pt stored and .txt deflated", methods)
+	if len(methods) != 10 || methods["d/w.pt"] != zip.Store || methods["d/a0.txt"] != zip.Deflate {
+		t.Fatalf("members/methods = %v, want full paths, .pt stored and .txt deflated", methods)
 	}
 }
 
@@ -144,9 +201,12 @@ func TestPackThresholds(t *testing.T) {
 		want      int
 	}{{1024, 3}, {4096, 6}, {64 << 10, 9}} {
 		dst := tempDir(t)
-		mustSucceed(t, runJob(t, newManager(t), packSpec(syncjob.ModeCopy, src, dst, syncjob.PackOptions{Threshold: c.threshold, MinFiles: 3})))
-		if got := len(loadTestManifest(t, dst, "d").Files); got != c.want {
+		mustSucceed(t, runJob(t, newManager(t), packSpec(syncjob.ModeCopy, src, dst, syncjob.PackOptions{Threshold: c.threshold})))
+		if got := len(loadTestManifest(t, dst).Files); got != c.want {
 			t.Errorf("threshold %d packed %d files, want %d", c.threshold, got, c.want)
+		}
+		if loose := looseSmall(t, dst, c.threshold); len(loose) != 0 {
+			t.Errorf("threshold %d: loose small files %v", c.threshold, loose)
 		}
 	}
 }
@@ -156,49 +216,58 @@ func TestPackIncrementalDeadCountsAndCompaction(t *testing.T) {
 	src, dst := tempDir(t), tempDir(t)
 	old := time.Now().Add(-48 * time.Hour)
 	for i := 0; i < 8; i++ {
-		rel := fmt.Sprintf("d/f%d.txt", i)
+		rel := fmt.Sprintf("d%d/f.txt", i)
 		write(t, src, rel, fmt.Sprintf("content %d", i))
 		setMTime(t, src, rel, old)
 	}
-	opts := syncjob.PackOptions{Threshold: 1024, MinFiles: 3}
+	opts := syncjob.PackOptions{Threshold: 1024}
 
 	s := mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeSync, src, dst, opts)))
-	if s.PackStats.Packs != 1 || s.PackStats.PackedFiles != 8 {
+	if s.PackStats.PacksWritten != 1 || s.PackStats.PackedFiles != 8 {
 		t.Fatalf("first run stats = %+v", s.PackStats)
 	}
 
-	// Nothing changed: nothing is packed again.
+	// Nothing changed: nothing is packed or committed again.
+	before := readTestManifest(t, dst, "manifest.json.gz")
 	s = mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeSync, src, dst, opts)))
-	if s.PackStats.Packs != 0 || s.PackStats.PackedFiles != 0 {
+	if s.PackStats.PacksWritten != 0 || s.PackStats.PackedFiles != 0 || s.PackStats.PacksTotal != 1 {
 		t.Fatalf("unchanged run repacked: %+v", s.PackStats)
 	}
+	if exists(dst, ".oppack/manifest.prev.json.gz") {
+		t.Fatalf("an unchanged run committed a new manifest")
+	}
 
-	// One edit makes exactly one new pack holding exactly that file.
-	write(t, src, "d/f3.txt", "content three, edited")
+	// One edit makes exactly one new pack holding exactly that file, and one
+	// new manifest; the old one is kept as prev.
+	write(t, src, "d3/f.txt", "content three, edited")
 	s = mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeSync, src, dst, opts)))
-	if s.PackStats.Packs != 1 || s.PackStats.PackedFiles != 1 || s.PackStats.DeadRemoved != 1 {
+	if s.PackStats.PacksWritten != 1 || s.PackStats.PackedFiles != 1 || s.PackStats.DeadRemoved != 1 || s.PackStats.PacksTotal != 2 {
 		t.Fatalf("edit run stats = %+v", s.PackStats)
 	}
-	mf := loadTestManifest(t, dst, "d")
-	if mf.Files["f3.txt"].Pack != "p-000002.zip" || mf.Files["f0.txt"].Pack != "p-000001.zip" {
+	mf := loadTestManifest(t, dst)
+	if mf.Files["d3/f.txt"].Pack != "p-000002.zip" || mf.Files["d0/f.txt"].Pack != "p-000001.zip" {
 		t.Fatalf("manifest after edit = %+v", mf.Files)
 	}
 	if p := mf.Packs["p-000001.zip"]; p.Live != 7 || p.Dead != 1 {
 		t.Fatalf("p-000001 live/dead = %d/%d, want 7/1", p.Live, p.Dead)
 	}
+	prev := readTestManifest(t, dst, "manifest.prev.json.gz")
+	if len(prev.Files) != len(before.Files) || prev.Files["d3/f.txt"].Pack != "p-000001.zip" {
+		t.Fatalf("manifest.prev is not the manifest before the edit: %+v", prev.Files)
+	}
 
 	// Deleting at src is only followed in sync mode; copy keeps the entry.
-	if err := os.Remove(filepath.Join(src, "d", "f0.txt")); err != nil {
+	if err := os.RemoveAll(filepath.Join(src, "d0")); err != nil {
 		t.Fatal(err)
 	}
 	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, dst, opts)))
-	if _, ok := loadTestManifest(t, dst, "d").Files["f0.txt"]; !ok {
+	if _, ok := loadTestManifest(t, dst).Files["d0/f.txt"]; !ok {
 		t.Fatalf("copy mode dropped a deleted file from the manifest")
 	}
 	s = mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeSync, src, dst, opts)))
-	mf = loadTestManifest(t, dst, "d")
-	if _, ok := mf.Files["f0.txt"]; ok || s.PackStats.DeadRemoved != 1 {
-		t.Fatalf("sync mode kept f0.txt (stats %+v)", s.PackStats)
+	mf = loadTestManifest(t, dst)
+	if _, ok := mf.Files["d0/f.txt"]; ok || s.PackStats.DeadRemoved != 1 {
+		t.Fatalf("sync mode kept d0/f.txt (stats %+v)", s.PackStats)
 	}
 	if p := mf.Packs["p-000001.zip"]; p.Live != 6 || p.Dead != 2 {
 		t.Fatalf("p-000001 live/dead = %d/%d, want 6/2", p.Live, p.Dead)
@@ -206,27 +275,49 @@ func TestPackIncrementalDeadCountsAndCompaction(t *testing.T) {
 
 	// Delete more until dead outnumber live: the pack is rewritten and the
 	// old one removed from dst.
-	for _, n := range []string{"f1", "f2", "f4", "f5"} {
-		_ = os.Remove(filepath.Join(src, "d", n+".txt"))
+	for _, n := range []string{"d1", "d2", "d4", "d5"} {
+		_ = os.RemoveAll(filepath.Join(src, n))
 	}
 	s = mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeSync, src, dst, opts)))
-	mf = loadTestManifest(t, dst, "d")
-	if exists(dst, "d/.oppack/p-000001.zip") {
+	mf = loadTestManifest(t, dst)
+	if exists(dst, ".oppack/p-000001.zip") {
 		t.Fatalf("compacted pack still at dst")
 	}
-	if got := strings.Join(fileNames(mf), ","); got != "f3.txt,f6.txt,f7.txt" {
+	if got := strings.Join(fileNames(mf), ","); got != "d3/f.txt,d6/f.txt,d7/f.txt" {
 		t.Fatalf("files after compaction = %s", got)
 	}
-	if len(mf.Packs) != 2 {
-		t.Fatalf("packs after compaction = %+v", mf.Packs)
+	if s.PackStats.CompactedPacks != 1 {
+		t.Fatalf("compacted packs = %d", s.PackStats.CompactedPacks)
 	}
 	for name, p := range mf.Packs {
 		if p.Live == 0 || p.Dead != 0 {
 			t.Fatalf("pack %s live/dead = %d/%d", name, p.Live, p.Dead)
 		}
-		if !exists(dst, "d/.oppack/"+name) {
+		if !exists(dst, ".oppack/"+name) {
 			t.Fatalf("pack %s listed but missing at dst", name)
 		}
+	}
+	if got := len(packNames(t, dst)); got != len(mf.Packs) {
+		t.Fatalf("%d packs at dst, %d in manifest", got, len(mf.Packs))
+	}
+}
+
+func TestPackRemovedEntirelyRemovesOppack(t *testing.T) {
+	m := newManager(t)
+	src, dst := tempDir(t), tempDir(t)
+	write(t, src, "a/x.txt", "x")
+	write(t, src, "big.bin", strings.Repeat("B", 3000))
+	opts := syncjob.PackOptions{Threshold: 1024}
+	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeSync, src, dst, opts)))
+	if err := os.RemoveAll(filepath.Join(src, "a")); err != nil {
+		t.Fatal(err)
+	}
+	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeSync, src, dst, opts)))
+	if exists(dst, ".oppack") {
+		t.Fatalf(".oppack still at dst with no live files")
+	}
+	if !exists(dst, "big.bin") || exists(dst, "a") {
+		t.Fatalf("dst tree wrong after sync")
 	}
 }
 
@@ -236,11 +327,11 @@ func TestPackRollsOverAtMaxPackBytes(t *testing.T) {
 		write(t, src, fmt.Sprintf("d/f%02d.bin", i), strings.Repeat(string(rune('a'+i)), 4000))
 	}
 	s := mustSucceed(t, runJob(t, newManager(t), packSpec(syncjob.ModeCopy, src, dst,
-		syncjob.PackOptions{Threshold: 8192, MinFiles: 3, MaxPackBytes: 10000})))
-	if s.PackStats.Packs < 4 {
-		t.Fatalf("12x4000 bytes with a 10000 byte cap made %d packs", s.PackStats.Packs)
+		syncjob.PackOptions{Threshold: 8192, MaxPackBytes: 10000})))
+	if s.PackStats.PacksWritten < 4 {
+		t.Fatalf("12x4000 bytes with a 10000 byte cap made %d packs", s.PackStats.PacksWritten)
 	}
-	if got := len(loadTestManifest(t, dst, "d").Files); got != 12 {
+	if got := len(loadTestManifest(t, dst).Files); got != 12 {
 		t.Fatalf("manifest lists %d files", got)
 	}
 }
@@ -253,10 +344,10 @@ func TestPackSyncKeepsOppackAndRemovesStrays(t *testing.T) {
 	}
 	write(t, dst, "d/stray.txt", "only at dst")
 	write(t, dst, "gone/old.txt", "whole directory only at dst")
-	opts := syncjob.PackOptions{Threshold: 1024, MinFiles: 3}
+	opts := syncjob.PackOptions{Threshold: 1024}
 	for i := 0; i < 2; i++ {
 		mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeSync, src, dst, opts)))
-		if !exists(dst, "d/.oppack/index.json") {
+		if !exists(dst, ".oppack/manifest.json.gz") {
 			t.Fatalf("run %d: sync deleted the manifest", i)
 		}
 		if exists(dst, "d/stray.txt") || exists(dst, "gone/old.txt") {
@@ -273,11 +364,9 @@ func TestPackDryRunWritesNothing(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		write(t, src, fmt.Sprintf("d/f%d.txt", i), "small")
 	}
-	s := mustSucceed(t, runJob(t, newManager(t), func() syncjob.Spec {
-		sp := packSpec(syncjob.ModeCopy, src, dst, syncjob.PackOptions{Threshold: 1024, MinFiles: 3})
-		sp.DryRun = true
-		return sp
-	}()))
+	sp := packSpec(syncjob.ModeCopy, src, dst, syncjob.PackOptions{Threshold: 1024})
+	sp.DryRun = true
+	s := mustSucceed(t, runJob(t, newManager(t), sp))
 	if s.PackStats.PackedFiles != 4 {
 		t.Fatalf("dry run stats = %+v", s.PackStats)
 	}
@@ -303,122 +392,222 @@ func TestPackOnlyForCopyAndSync(t *testing.T) {
 
 func TestPackDefaultsAreInOnePlace(t *testing.T) {
 	d := syncjob.DefaultPackOptions()
-	if d.Threshold != 8<<20 || d.MinFiles != 8 || d.MaxPackBytes != 1<<30 || len(d.StoreSuffixes) < 20 {
+	if d.Threshold != 8<<20 || d.MaxPackBytes != 1<<30 || len(d.StoreSuffixes) < 20 {
 		t.Fatalf("defaults = %+v", d)
 	}
-	// Unset fields in a request mean those defaults.
+	b, _ := json.Marshal(d)
+	if strings.Contains(string(b), "min_files") {
+		t.Fatalf("min_files is still an option: %s", b)
+	}
+	// Unset fields in a request mean those defaults, and even a lone small
+	// file is packed.
 	m := newManager(t)
 	src, dst := tempDir(t), tempDir(t)
-	for i := 0; i < 8; i++ {
-		write(t, src, fmt.Sprintf("f%d.txt", i), "x")
-	}
+	write(t, src, "f.txt", "x")
 	mustSucceed(t, runJob(t, m, syncjob.Spec{Mode: syncjob.ModeCopy, Src: "local:" + src, Dst: "local:" + dst, Pack: &syncjob.PackOptions{Enabled: true}}))
-	if !exists(dst, ".oppack/index.json") {
-		t.Fatalf("8 small files with default options were not packed")
+	if !exists(dst, ".oppack/manifest.json.gz") || exists(dst, "f.txt") {
+		t.Fatalf("a lone small file with default options was not packed")
 	}
 }
 
-func TestPackIsStickyBelowMinFiles(t *testing.T) {
-	m := newManager(t)
-	src, dst := tempDir(t), tempDir(t)
-	for i := 0; i < 5; i++ {
-		write(t, src, fmt.Sprintf("d/f%d.txt", i), "small")
-	}
-	opts := syncjob.PackOptions{Threshold: 1024, MinFiles: 4}
-	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeSync, src, dst, opts)))
-
-	// Down to 2 small files (< MinFiles): still packed, nothing loose.
-	for i := 2; i < 5; i++ {
-		_ = os.Remove(filepath.Join(src, "d", fmt.Sprintf("f%d.txt", i)))
-	}
-	write(t, src, "d/f0.txt", "edited")
-	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeSync, src, dst, opts)))
-	if exists(dst, "d/f0.txt") || exists(dst, "d/f1.txt") {
-		t.Fatalf("small files went up loose next to a manifest")
-	}
-	if got := strings.Join(fileNames(loadTestManifest(t, dst, "d")), ","); got != "f0.txt,f1.txt" {
-		t.Fatalf("manifest = %s", got)
-	}
-
-	// Down to none: the whole .oppack goes.
-	_ = os.Remove(filepath.Join(src, "d", "f0.txt"))
-	_ = os.Remove(filepath.Join(src, "d", "f1.txt"))
-	write(t, src, "d/big.bin", strings.Repeat("B", 3000))
-	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeSync, src, dst, opts)))
-	if exists(dst, "d/.oppack") {
-		t.Fatalf(".oppack still at dst with no live files")
-	}
-	if !exists(dst, "d/big.bin") {
-		t.Fatalf("big file missing")
-	}
-}
-
-func TestPackOrphanOppackFollowsSyncOnly(t *testing.T) {
-	opts := syncjob.PackOptions{Threshold: 1024, MinFiles: 3}
-	for _, mode := range []syncjob.Mode{syncjob.ModeSync, syncjob.ModeCopy} {
-		m := newManager(t)
-		src, dst := tempDir(t), tempDir(t)
-		for i := 0; i < 4; i++ {
-			write(t, src, fmt.Sprintf("gone/sub/f%d.txt", i), "small")
-			write(t, src, fmt.Sprintf("keep/f%d.txt", i), "small")
-		}
-		mustSucceed(t, runJob(t, m, packSpec(mode, src, dst, opts)))
-		if !exists(dst, "gone/sub/.oppack/index.json") {
-			t.Fatalf("%s: setup: no pack", mode)
-		}
-		if err := os.RemoveAll(filepath.Join(src, "gone")); err != nil {
-			t.Fatal(err)
-		}
-		mustSucceed(t, runJob(t, m, packSpec(mode, src, dst, opts)))
-		if mode == syncjob.ModeSync {
-			if exists(dst, "gone") {
-				t.Fatalf("sync left the deleted directory (or its .oppack) at dst")
-			}
-		} else if !exists(dst, "gone/sub/.oppack/index.json") {
-			t.Fatalf("copy removed .oppack of a deleted directory")
-		}
-		if !exists(dst, "keep/.oppack/index.json") {
-			t.Fatalf("%s: unrelated .oppack removed", mode)
-		}
-	}
-}
-
-// Finding out whether dst has a pack must not cost a driver Get per directory
-// (115 pays a rate-limited call for each): a pack-mode run over a tree with no
-// packs makes no more Gets than a plain run.
-func TestPackDetectionCostsNoExtraDriverGets(t *testing.T) {
+// A failure while packs go up must leave the previous manifest and packs
+// untouched, and the next run must carry on correctly.
+func TestPackFailureBeforeCommitKeepsOldManifest(t *testing.T) {
 	m := newManager(t)
 	src := tempDir(t)
+	for i := 0; i < 4; i++ {
+		write(t, src, fmt.Sprintf("d/f%d.txt", i), fmt.Sprintf("v1 %d", i))
+	}
+	drv := fakeMount(t, "/fk-atomic")
+	spec := syncjob.Spec{Mode: syncjob.ModeSync, Src: "local:" + src, Dst: "/fk-atomic",
+		Pack: &syncjob.PackOptions{Enabled: true, Threshold: 1024, MaxPackBytes: 1}}
+	mustSucceed(t, runJob(t, m, spec))
+	time.Sleep(200 * time.Millisecond)
+	manifestBefore, ok := drv.Content("/.oppack/manifest.json.gz")
+	if !ok {
+		t.Fatal("no manifest after the first run")
+	}
+	packBefore, _ := drv.Content("/.oppack/p-000001.zip")
+
+	write(t, src, "d/f1.txt", "v2 edited")
+	write(t, src, "d/new.txt", "brand new")
+	// Packs go up one per file; the second one fails.
+	var puts int
+	drv.FailPut = func(path string) error {
+		if strings.HasPrefix(path, "/.oppack/p-") {
+			if puts++; puts == 2 {
+				return fmt.Errorf("injected failure on %s", path)
+			}
+		}
+		return nil
+	}
+	s := runJob(t, m, spec)
+	if s.State != syncjob.StateFailed || !strings.Contains(s.Error, "injected failure") {
+		t.Fatalf("job state = %s (%s), want failed by the injected error", s.State, s.Error)
+	}
+	if after, _ := drv.Content("/.oppack/manifest.json.gz"); !bytes.Equal(manifestBefore, after) {
+		t.Fatalf("manifest changed although the run failed before the commit")
+	}
+	if _, there := drv.Content("/.oppack/manifest.prev.json.gz"); there {
+		t.Fatalf("manifest.prev written before the commit")
+	}
+	if after, _ := drv.Content("/.oppack/p-000001.zip"); !bytes.Equal(packBefore, after) {
+		t.Fatalf("an existing pack was modified")
+	}
+
+	// Next run, nothing failing: carries on and commits, never reusing the
+	// names of the orphan packs the failed run left.
+	drv.FailPut = nil
+	s = mustSucceed(t, runJob(t, m, spec))
+	time.Sleep(200 * time.Millisecond)
+	raw, _ := drv.Content("/.oppack/manifest.json.gz")
+	zr, err := gzip.NewReader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mf testManifest
+	if err := json.NewDecoder(zr).Decode(&mf); err != nil {
+		t.Fatal(err)
+	}
+	if mf.Files["d/f1.txt"].Pack == "p-000001.zip" || mf.Files["d/new.txt"].Pack == "" {
+		t.Fatalf("retry did not pack the changes: %+v", mf.Files)
+	}
+	for name := range mf.Packs {
+		if _, ok := drv.Content("/.oppack/" + name); !ok {
+			t.Fatalf("manifest lists %s which is not at dst", name)
+		}
+	}
+	if _, ok := drv.Content("/.oppack/manifest.prev.json.gz"); !ok {
+		t.Fatalf("retry did not keep the previous manifest")
+	}
+	if s.PackStats.PackedFiles != 2 {
+		t.Fatalf("retry stats = %+v", s.PackStats)
+	}
+}
+
+// A lost manifest must not let new packs overwrite packs that are still there.
+func TestPackNeverReusesAPackName(t *testing.T) {
+	m := newManager(t)
+	src, dst := tempDir(t), tempDir(t)
+	write(t, src, "a/x.txt", "x")
+	opts := syncjob.PackOptions{Threshold: 1024}
+	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, dst, opts)))
+	_ = os.Remove(filepath.Join(dst, ".oppack", "manifest.json.gz"))
+	_ = os.Remove(filepath.Join(dst, ".oppack", "manifest.prev.json.gz"))
+	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, dst, opts)))
+	if got := loadTestManifest(t, dst).Files["a/x.txt"].Pack; got != "p-000002.zip" {
+		t.Fatalf("a/x.txt in %s, want a fresh p-000002.zip", got)
+	}
+	if !exists(dst, ".oppack/p-000001.zip") {
+		t.Fatalf("existing pack overwritten or removed")
+	}
+}
+
+func TestPackRemovesSupersededLooseCopiesAndKeepsConflicts(t *testing.T) {
+	when := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	for _, mode := range []syncjob.Mode{syncjob.ModeCopy, syncjob.ModeSync} {
+		m := newManager(t)
+		src, dst := tempDir(t), tempDir(t)
+		for i := 0; i < 5; i++ {
+			rel := fmt.Sprintf("d/f%d.txt", i)
+			write(t, src, rel, "content")
+			setMTime(t, src, rel, when)
+			// An earlier non-pack run left the same file loose at dst.
+			write(t, dst, rel, "content")
+			setMTime(t, dst, rel, when)
+		}
+		// f3: dst copy has other content; f4: same content, other time.
+		write(t, dst, "d/f3.txt", "different size!")
+		setMTime(t, dst, "d/f4.txt", when.Add(time.Hour))
+
+		s := mustSucceed(t, runJob(t, m, packSpec(mode, src, dst, syncjob.PackOptions{Threshold: 1024})))
+		for _, gone := range []string{"f0", "f1", "f2"} {
+			if exists(dst, "d/"+gone+".txt") {
+				t.Fatalf("%s: superseded loose copy %s kept", mode, gone)
+			}
+		}
+		for _, kept := range []string{"f3", "f4"} {
+			if !exists(dst, "d/"+kept+".txt") {
+				t.Fatalf("%s: conflicting loose copy %s deleted", mode, kept)
+			}
+		}
+		if got, _ := read(t, dst, "d/f3.txt"); got != "different size!" {
+			t.Fatalf("%s: conflicting file content changed: %q", mode, got)
+		}
+		if s.PackStats.Conflicts != 2 || s.PackStats.LooseRemoved != 3 {
+			t.Fatalf("%s: conflicts/loose_removed = %d/%d, want 2/3", mode, s.PackStats.Conflicts, s.PackStats.LooseRemoved)
+		}
+		if len(loadTestManifest(t, dst).Files) != 5 {
+			t.Fatalf("%s: not all files packed", mode)
+		}
+	}
+}
+
+func fakeMount(t *testing.T, mount string) *fakedriver.Driver {
+	t.Helper()
+	id, err := op.CreateStorage(context.Background(), model.Storage{Driver: fakedriver.DriverName, MountPath: mount, Addition: "{}", CacheExpiration: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = op.DeleteStorageById(context.Background(), id) })
+	s, _ := op.GetStorageByMountPath(mount)
+	return s.(*fakedriver.Driver)
+}
+
+// The point of job-level packs: with one small file in each of N directories
+// the uploads are the packs plus the manifest, however large N is.
+func TestPackUploadCountDoesNotGrowWithDirectories(t *testing.T) {
+	m := newManager(t)
+	var puts []int32
+	for i, n := range []int{10, 40} {
+		src := tempDir(t)
+		for d := 0; d < n; d++ {
+			write(t, src, fmt.Sprintf("dir%03d/only.json", d), fmt.Sprintf(`{"d":%d}`, d))
+		}
+		mount := fmt.Sprintf("/fk-cost%d", i)
+		drv := fakeMount(t, mount)
+		drv.ResetCounts()
+		s := mustSucceed(t, runJob(t, m, syncjob.Spec{Mode: syncjob.ModeCopy, Src: "local:" + src, Dst: mount,
+			Pack: &syncjob.PackOptions{Enabled: true}}))
+		time.Sleep(200 * time.Millisecond)
+		if s.PackStats.PacksWritten != 1 || s.PackStats.PackedFiles != int64(n) {
+			t.Fatalf("N=%d: pack stats %+v", n, s.PackStats)
+		}
+		got := drv.Puts.Load()
+		t.Logf("N=%d dirs: %d uploads", n, got)
+		if want := int32(s.PackStats.PacksWritten) + 1; got != want {
+			t.Fatalf("N=%d: %d uploads, want packs+1 = %d", n, got, want)
+		}
+		puts = append(puts, got)
+	}
+	if puts[0] != puts[1] {
+		t.Fatalf("uploads grew with the number of directories: %v", puts)
+	}
+}
+
+// Packing must not add driver Gets on a tree it has nothing to pack in.
+func TestPackDetectionCostsNoExtraDriverGets(t *testing.T) {
+	m := newManager(t)
+	src := t.TempDir()
 	for d := 0; d < 12; d++ {
 		for f := 0; f < 3; f++ {
-			write(t, src, fmt.Sprintf("d%02d/s%d/f%d.txt", d, d%3, f), "x")
+			write(t, src, fmt.Sprintf("d%02d/s%d/f%d.txt", d, d%3, f), strings.Repeat("x", 2000))
 		}
 	}
-	newMount := func(mount string) *fakedriver.Driver {
-		id, err := op.CreateStorage(context.Background(), model.Storage{Driver: fakedriver.DriverName, MountPath: mount, Addition: "{}", CacheExpiration: 30})
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { _ = op.DeleteStorageById(context.Background(), id) })
-		s, _ := op.GetStorageByMountPath(mount)
-		return s.(*fakedriver.Driver)
-	}
-	plainDrv, packDrv := newMount("/fk-plain"), newMount("/fk-pack")
+	plainDrv, packDrv := fakeMount(t, "/fk-plain"), fakeMount(t, "/fk-pack")
 	spec := func(dst string, pack bool) syncjob.Spec {
 		sp := syncjob.Spec{Mode: syncjob.ModeSync, Src: "local:" + src, Dst: dst}
 		if pack {
-			sp.Pack = &syncjob.PackOptions{Enabled: true, MinFiles: 8}
+			sp.Pack = &syncjob.PackOptions{Enabled: true, Threshold: 1024}
 		}
 		return sp
 	}
-	// Both destinations already hold the tree (no writes, so no hooks or
-	// uploads move the counts) and start with a cold dir cache.
 	for _, drv := range []*fakedriver.Driver{plainDrv, packDrv} {
 		for d := 0; d < 12; d++ {
 			drv.AddDir(fmt.Sprintf("/d%02d", d))
 			drv.AddDir(fmt.Sprintf("/d%02d/s%d", d, d%3))
 			for f := 0; f < 3; f++ {
-				drv.AddFile(fmt.Sprintf("/d%02d/s%d/f%d.txt", d, d%3, f), "x")
+				drv.AddFile(fmt.Sprintf("/d%02d/s%d/f%d.txt", d, d%3, f), strings.Repeat("x", 2000))
 			}
 		}
 	}
@@ -429,15 +618,13 @@ func TestPackDetectionCostsNoExtraDriverGets(t *testing.T) {
 		if s.Counters.Match == 0 || s.Counters.OnlyInSrc != 0 || s.Counters.Uploaded != 0 {
 			t.Fatalf("dst should already match src: %+v", s.Counters)
 		}
-		if pack && s.PackStats.Packs != 0 {
-			t.Fatalf("test tree was packed: %+v", s.PackStats)
-		}
 		return drv.Gets.Load()
 	}
 	plain := count(plainDrv, "/fk-plain", false)
 	packed := count(packDrv, "/fk-pack", true)
 	t.Logf("driver Gets: plain=%d pack=%d", plain, packed)
-	if packed > plain {
+	// The manifest lookups are a constant, not per directory.
+	if packed > plain+4 {
 		t.Fatalf("pack mode made %d driver Gets, plain run %d", packed, plain)
 	}
 }
@@ -464,42 +651,4 @@ func tempDir(t *testing.T) string {
 	return dir
 }
 
-func TestPackRemovesSupersededLooseCopiesAndKeepsConflicts(t *testing.T) {
-	when := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
-	for _, mode := range []syncjob.Mode{syncjob.ModeCopy, syncjob.ModeSync} {
-		m := newManager(t)
-		src, dst := tempDir(t), tempDir(t)
-		for i := 0; i < 5; i++ {
-			rel := fmt.Sprintf("d/f%d.txt", i)
-			write(t, src, rel, "content")
-			setMTime(t, src, rel, when)
-			// An earlier non-pack run left the same file loose at dst.
-			write(t, dst, rel, "content")
-			setMTime(t, dst, rel, when)
-		}
-		// f3: dst copy has other content; f4: same content, other time.
-		write(t, dst, "d/f3.txt", "different size!")
-		setMTime(t, dst, "d/f4.txt", when.Add(time.Hour))
-
-		s := mustSucceed(t, runJob(t, m, packSpec(mode, src, dst, syncjob.PackOptions{Threshold: 1024, MinFiles: 3})))
-		for _, gone := range []string{"f0", "f1", "f2"} {
-			if exists(dst, "d/"+gone+".txt") {
-				t.Fatalf("%s: superseded loose copy %s kept", mode, gone)
-			}
-		}
-		for _, kept := range []string{"f3", "f4"} {
-			if !exists(dst, "d/"+kept+".txt") {
-				t.Fatalf("%s: conflicting loose copy %s deleted", mode, kept)
-			}
-		}
-		if got, _ := read(t, dst, "d/f3.txt"); got != "different size!" {
-			t.Fatalf("%s: conflicting file content changed: %q", mode, got)
-		}
-		if s.PackStats.Conflicts != 2 {
-			t.Fatalf("%s: conflicts = %d, want 2", mode, s.PackStats.Conflicts)
-		}
-		if len(loadTestManifest(t, dst, "d").Files) != 5 {
-			t.Fatalf("%s: not all files packed", mode)
-		}
-	}
-}
+var _ = io.EOF

@@ -157,24 +157,23 @@ func TestParseSize(t *testing.T) {
 func TestPackFlagsBuildTheSpec(t *testing.T) {
 	defer func() { syncFlags.pack, syncFlags.unpack = false, false }()
 	copyCmd := newSyncCommand(syncjob.ModeCopy, "copy", "x")
-	if err := copyCmd.ParseFlags([]string{"--pack", "--pack-threshold", "4M", "--pack-min-files", "5", "--pack-max", "512M"}); err != nil {
+	if err := copyCmd.ParseFlags([]string{"--pack", "--pack-threshold", "4M", "--pack-max", "512M"}); err != nil {
 		t.Fatal(err)
 	}
 	var spec syncjob.Spec
 	if err := applyPackFlags(&spec); err != nil {
 		t.Fatal(err)
 	}
-	if p := spec.Pack; p == nil || !p.Enabled || p.Threshold != 4<<20 || p.MinFiles != 5 || p.MaxPackBytes != 512<<20 {
-		t.Fatalf("pack = %+v, want 4M / 5 files / 512M", spec.Pack)
+	if p := spec.Pack; p == nil || !p.Enabled || p.Threshold != 4<<20 || p.MaxPackBytes != 512<<20 {
+		t.Fatalf("pack = %+v, want 4M / 512M", spec.Pack)
 	}
 
 	// Unset flags show the defaults from syncjob.
 	syncFlags.packThreshold = formatSize(syncjob.DefaultPackThreshold)
-	syncFlags.packMinFiles = syncjob.DefaultPackMinFiles
 	syncFlags.packMax = formatSize(syncjob.DefaultPackMaxPackBytes)
 	spec = syncjob.Spec{}
 	_ = applyPackFlags(&spec)
-	if spec.Pack.Threshold != 8<<20 || spec.Pack.MinFiles != 8 || spec.Pack.MaxPackBytes != 1<<30 {
+	if spec.Pack.Threshold != 8<<20 || spec.Pack.MaxPackBytes != 1<<30 {
 		t.Fatalf("default pack = %+v", spec.Pack)
 	}
 
@@ -233,14 +232,14 @@ func TestJobsPrintsOnceUnlessFollowing(t *testing.T) {
 
 func TestShowReportsPackStageAndStats(t *testing.T) {
 	var s syncjob.Snapshot
-	if err := json.Unmarshal([]byte(`{"state":"running","stage":"packing","spec":{"pack":{"enabled":true}},"pack_stats":{"dirs":3,"packed_files":120,"packs":2,"bytes_in":2097152,"bytes_out":1048576,"skipped_dirs":1,"dead_removed":4}}`), &s); err != nil {
+	if err := json.Unmarshal([]byte(`{"state":"running","stage":"packing","spec":{"pack":{"enabled":true}},"pack_stats":{"small_files":300,"packed_files":120,"packs_written":2,"packs_total":5,"bytes_in":2097152,"bytes_out":1048576,"dead_removed":4,"compacted_packs":1,"loose_removed":7,"conflicts":2,"v1_migrated_dirs":3}}`), &s); err != nil {
 		t.Fatal(err)
 	}
 	if line := progressLine(s); !strings.Contains(line, "packing") {
 		t.Fatalf("progress line %q doesn't show the packing stage", line)
 	}
 	pl := packLine(s)
-	for _, want := range []string{"3 dirs", "120 files -> 2 packs", "2.0 MiB read", "1.0 MiB written", "1 dirs too small", "4 entries retired"} {
+	for _, want := range []string{"300 small files", "120 newly packed", "2.0 MiB read", "2 new packs", "1.0 MiB written", "5 packs in total", "4 entries retired", "1 packs compacted", "7 loose copies removed", "2 conflicts", "3 v1 dirs migrated"} {
 		if !strings.Contains(pl, want) {
 			t.Fatalf("pack line %q lacks %q", pl, want)
 		}

@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
@@ -23,16 +22,17 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// packUp is the packing stage of an upload. It walks src, and for every
-// directory with enough small files at its own level it brings the packs and
-// the manifest under "<dir>/.oppack/" at dst up to date. It returns views of
-// src and dst for the main rclone pass: src without the files now living in
-// packs, dst without the .oppack directories.
+// packUp is the packing stage of an upload. It walks src and brings the packs
+// and the manifest under "<dst>/.oppack/" up to date with every file below
+// the threshold. It returns views of src and dst for the main rclone pass: src
+// without any small file (they live in packs now), dst without the .oppack
+// directories, so the pass moves only the large files and neither re-uploads
+// the small ones nor (sync) deletes the packs as extras.
 //
-// Packs are uploaded as soon as they are full, then the manifest last; the
-// manifest upload is the commit. A run that dies in between leaves orphan
-// packs the next run overwrites or ignores, never a manifest that points at
-// something missing.
+// Packs are uploaded as soon as they are full; once all are up, the previous
+// manifest is saved as manifest.prev and the new manifest uploaded. That last
+// upload is the commit: a run that dies earlier leaves the old manifest valid
+// and some orphan packs that the next run numbers past and ignores.
 func packUp(ctx context.Context, spec Spec, src, dst fs.Fs) (fs.Fs, fs.Fs, error) {
 	stage, err := newStaging(ctx)
 	if err != nil {
@@ -48,19 +48,12 @@ func packUp(ctx context.Context, spec Spec, src, dst fs.Fs) (fs.Fs, fs.Fs, error
 		dry:       spec.DryRun,
 		hidden:    map[string]struct{}{},
 		hiddenDst: map[string]struct{}{},
-		srcDirs:   map[string]struct{}{},
+		present:   map[string]struct{}{},
 	}
-	if err := walkDirs(ctx, src, func(dir string, files []fs.Object, _ []string) error {
-		return p.dir(ctx, dir, files)
-	}); err != nil {
+	if err := p.run(ctx); err != nil {
 		return nil, nil, err
 	}
-	if p.sync && !p.dry {
-		if err := p.removeOrphans(ctx); err != nil {
-			return nil, nil, err
-		}
-	}
-	hidden := p.hidden
+	hidden, hiddenDst := p.hidden, p.hiddenDst
 	srcView := newViewFs(ctx, src, func(remote string, isDir bool) bool {
 		if isDir {
 			return isPackDir(remote)
@@ -68,7 +61,6 @@ func packUp(ctx context.Context, spec Spec, src, dst fs.Fs) (fs.Fs, fs.Fs, error
 		_, ok := hidden[remote]
 		return ok
 	})
-	hiddenDst := p.hiddenDst
 	dstView := newViewFs(ctx, dst, func(remote string, isDir bool) bool {
 		if isDir {
 			return isPackDir(remote)
@@ -80,194 +72,44 @@ func packUp(ctx context.Context, spec Spec, src, dst fs.Fs) (fs.Fs, fs.Fs, error
 }
 
 type packer struct {
-	opts   *PackOptions
-	src    fs.Fs
-	dst    fs.Fs
-	stage  *stagingArea
-	sync   bool
-	dry    bool
-	hidden map[string]struct{}
+	opts  *PackOptions
+	src   fs.Fs
+	dst   fs.Fs
+	stage *stagingArea
+	sync  bool
+	dry   bool
+
+	m      *manifest
+	mObj   fs.Object // the manifest object at dst, nil when there is none
+	oldRaw []byte    // its encoded bytes, saved as manifest.prev on commit
+
+	smalls  []fs.Object         // small files at src, in walk order
+	hidden  map[string]struct{} // their remotes: kept from the main pass
+	present map[string]struct{} // src files that are not small
+	loose   []loosePair
 	// hiddenDst are loose dst files the main pass must not touch.
 	hiddenDst map[string]struct{}
-	// srcDirs are the directories that exist at src (and pass the filter).
-	srcDirs map[string]struct{}
 }
 
-// scanDst lists dir at dst: whether it has a .oppack, and its loose files.
-func (p *packer) scanDst(ctx context.Context, dir string) (bool, map[string]fs.Object, error) {
-	entries, err := p.dst.List(ctx, dir)
-	if err != nil {
-		if errors.Is(err, fs.ErrorDirNotFound) {
-			return false, nil, nil
-		}
-		return false, nil, fmt.Errorf("list %q at dst: %w", dir, err)
-	}
-	has := false
-	files := map[string]fs.Object{}
-	for _, e := range entries {
-		switch x := e.(type) {
-		case fs.Directory:
-			if path.Base(x.Remote()) == PackDirName {
-				has = true
-			}
-		case fs.Object:
-			files[path.Base(x.Remote())] = x
-		}
-	}
-	return has, files, nil
-}
+// loosePair is a small file at src that also exists loose at dst.
+type loosePair struct{ src, dst fs.Object }
 
-// sameLoose says whether the loose dst file is the very file just packed:
-// same size and, where dst keeps modification times, the same time to within
-// a second; where it doesn't (115), the same SHA1 — without one to compare,
-// it is not provably the same.
-func (p *packer) sameLoose(ctx context.Context, srcObj, dstObj fs.Object) bool {
-	if srcObj.Size() != dstObj.Size() {
-		return false
-	}
-	if p.dst.Precision() != fs.ModTimeNotSupported {
-		d := srcObj.ModTime(ctx).Sub(dstObj.ModTime(ctx))
-		if d < 0 {
-			d = -d
-		}
-		return d <= max(time.Second, p.dst.Precision())
-	}
-	a, errA := srcObj.Hash(ctx, rhash.SHA1)
-	b, errB := dstObj.Hash(ctx, rhash.SHA1)
-	return errA == nil && errB == nil && a != "" && strings.EqualFold(a, b)
-}
-
-// retireLoose removes the loose dst copies of files that now live in a pack.
-// A copy that differs from what was packed is somebody's other data: it is
-// kept, counted as a conflict, and hidden from the main pass so sync leaves
-// it alone too.
-func (p *packer) retireLoose(ctx context.Context, dir string, packed []fs.Object, loose map[string]fs.Object) error {
-	for _, o := range packed {
-		name := path.Base(o.Remote())
-		d, ok := loose[name]
-		if !ok {
-			continue
-		}
-		if p.sameLoose(ctx, o, d) {
-			if err := d.Remove(ctx); err != nil {
-				return fmt.Errorf("remove superseded %s: %w", d.Remote(), err)
-			}
-			continue
-		}
-		log.Warnf("[sync] pack: %s exists loose at dst with different content than the packed copy; keeping both", d.Remote())
-		p.hiddenDst[d.Remote()] = struct{}{}
-		addStats(ctx, func(s *PackStats) { s.Conflicts++ })
-	}
-	return nil
-}
-
-// removeOrphans deletes the .oppack of directories sync is about to delete
-// because src no longer has them; hidden from the main pass, it would keep
-// the directory alive. Directories the filter excludes are not visited, so
-// they are left alone like any other file there.
-func (p *packer) removeOrphans(ctx context.Context) error {
-	var orphans []string
-	err := walkDirs(ctx, p.dst, func(dir string, _ []fs.Object, subdirs []string) error {
-		if _, ok := p.srcDirs[dir]; ok {
-			return nil
-		}
-		for _, d := range subdirs {
-			if d == PackDirName {
-				orphans = append(orphans, dir)
-			}
-		}
-		return nil
-	})
-	if err != nil {
+func (p *packer) run(ctx context.Context) error {
+	if err := p.loadManifest(ctx); err != nil {
 		return err
 	}
-	for _, dir := range orphans {
-		if err := p.removePackDir(ctx, dir); err != nil {
-			return err
-		}
+	if err := walkDirs(ctx, p.src, func(dir string, files []fs.Object, _ []string) error {
+		return p.scan(ctx, dir, files)
+	}); err != nil {
+		return err
 	}
-	return nil
-}
+	addStats(ctx, func(s *PackStats) { s.SmallFiles = int64(len(p.smalls)) })
 
-// removePackDir deletes dir's .oppack at dst, manifest first so nothing ever
-// points at a missing pack.
-func (p *packer) removePackDir(ctx context.Context, dir string) error {
-	pd := path.Join(dir, PackDirName)
-	entries, err := p.dst.List(ctx, pd)
-	if err != nil {
-		if errors.Is(err, fs.ErrorDirNotFound) {
-			return nil
-		}
-		return fmt.Errorf("pack %q: list %s: %w", dir, PackDirName, err)
+	m := p.m
+	small := make(map[string]fs.Object, len(p.smalls))
+	for _, o := range p.smalls {
+		small[o.Remote()] = o
 	}
-	var objs []fs.Object
-	for _, e := range entries {
-		if o, ok := e.(fs.Object); ok {
-			objs = append(objs, o)
-		}
-	}
-	sort.Slice(objs, func(i, j int) bool {
-		return path.Base(objs[i].Remote()) == PackIndexName && path.Base(objs[j].Remote()) != PackIndexName
-	})
-	for _, o := range objs {
-		if err := o.Remove(ctx); err != nil {
-			return fmt.Errorf("pack %q: remove %s: %w", dir, o.Remote(), err)
-		}
-	}
-	// Local file systems (Windows) can briefly still list files just removed.
-	var err2 error
-	for i := 0; i < 5; i++ {
-		if err2 = p.dst.Rmdir(ctx, pd); err2 == nil {
-			return nil
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if err := err2; err != nil {
-		log.Warnf("[sync] pack: can't remove empty %s: %v", pd, err)
-	}
-	return nil
-}
-
-func (p *packer) dir(ctx context.Context, dir string, files []fs.Object) error {
-	all := map[string]fs.Object{}
-	small := map[string]fs.Object{}
-	for _, o := range files {
-		name := path.Base(o.Remote())
-		all[name] = o
-		if o.Size() >= 0 && o.Size() < p.opts.Threshold && validName(name) {
-			small[name] = o
-		}
-	}
-	p.srcDirs[dir] = struct{}{}
-	// Whether dst has a pack is read off its listing of dir, which the main
-	// pass needs anyway and OpenList caches; asking for index.json directly
-	// would be a driver lookup per directory.
-	m, mObj := newManifest(p.opts.Threshold), fs.Object(nil)
-	has, dstFiles, err := p.scanDst(ctx, dir)
-	if err != nil {
-		return fmt.Errorf("pack %q: %w", dir, err)
-	}
-	if has {
-		if m, mObj, err = loadManifest(ctx, p.dst, dir, p.opts.Threshold); err != nil {
-			return fmt.Errorf("pack %q: read manifest: %w", dir, err)
-		}
-	}
-	// MinFiles only decides whether to start packing a directory. Once dst
-	// has a manifest the directory stays packed, or loose and packed copies
-	// of the same names would coexist at dst.
-	if mObj == nil {
-		if len(small) == 0 {
-			return nil
-		}
-		if len(small) < p.opts.MinFiles {
-			addStats(ctx, func(s *PackStats) { s.SkippedDirs++ })
-			return nil
-		}
-	}
-	for _, o := range small {
-		p.hidden[o.Remote()] = struct{}{}
-	}
-	m.Threshold = p.opts.Threshold
 	dirty := false
 
 	// Entries whose file is no longer packable: still at src but no longer
@@ -278,16 +120,15 @@ func (p *packer) dir(ctx context.Context, dir string, files []fs.Object) error {
 		if _, ok := small[name]; ok {
 			continue
 		}
-		if _, present := all[name]; present || p.sync {
+		if _, there := p.present[name]; there || p.sync {
 			m.drop(name)
 			dropped++
 			dirty = true
 		}
 	}
-
 	var add []fs.Object
-	for name, o := range small {
-		e, ok := m.Files[name]
+	for _, o := range p.smalls {
+		e, ok := m.Files[o.Remote()]
 		if !ok {
 			add = append(add, o)
 			continue
@@ -295,16 +136,15 @@ func (p *packer) dir(ctx context.Context, dir string, files []fs.Object) error {
 		changed, touch := p.changed(ctx, o, e)
 		switch {
 		case changed:
-			m.drop(name)
+			m.drop(o.Remote())
 			dropped++
 			add = append(add, o)
 		case touch:
 			e.MTime = formatMTime(o.ModTime(ctx))
-			m.Files[name] = e
+			m.Files[o.Remote()] = e
 			dirty = true
 		}
 	}
-	sort.Slice(add, func(i, j int) bool { return add[i].Remote() < add[j].Remote() })
 
 	m.recount()
 	var compact, obsolete []string
@@ -318,78 +158,141 @@ func (p *packer) dir(ctx context.Context, dir string, files []fs.Object) error {
 	}
 	sort.Strings(compact)
 	sort.Strings(obsolete)
+	addStats(ctx, func(s *PackStats) { s.DeadRemoved += dropped })
 
-	addStats(ctx, func(s *PackStats) {
-		s.Dirs++
-		s.DeadRemoved += dropped
-	})
 	if p.dry {
 		var n int64
 		for _, o := range add {
 			n += o.Size()
 		}
-		addStats(ctx, func(s *PackStats) { s.PackedFiles += int64(len(add)); s.BytesIn += n })
+		addStats(ctx, func(s *PackStats) {
+			s.PackedFiles += int64(len(add))
+			s.BytesIn += n
+			s.PacksTotal = int64(len(m.Packs))
+		})
 		return nil
 	}
-	if mObj != nil && len(m.Files) == 0 && len(add) == 0 {
-		// Nothing left to pack: the whole .oppack goes.
-		return p.removePackDir(ctx, dir)
-	}
-	if len(add) == 0 && len(compact) == 0 && len(obsolete) == 0 && !dirty {
+	if len(m.Files) == 0 && len(add) == 0 {
+		addStats(ctx, func(s *PackStats) { s.PacksTotal = 0 })
+		if p.mObj != nil {
+			// Nothing left to pack: the packs and manifests go.
+			return p.removeAll(ctx)
+		}
 		return nil
 	}
 
-	b := &packBuilder{p: p, dir: dir, m: m}
-	for _, o := range add {
-		if err := b.add(ctx, o); err != nil {
-			return fmt.Errorf("pack %q: %w", dir, err)
+	changedAny := len(add) > 0 || len(compact) > 0 || len(obsolete) > 0 || dirty
+	if changedAny {
+		b := &packBuilder{p: p, m: m}
+		for _, o := range add {
+			if err := b.add(ctx, o); err != nil {
+				return fmt.Errorf("pack: %w", err)
+			}
+		}
+		for _, name := range compact {
+			if err := b.compact(ctx, name); err != nil {
+				return fmt.Errorf("pack: compact %s: %w", name, err)
+			}
+			obsolete = append(obsolete, name)
+		}
+		if err := b.finish(ctx); err != nil {
+			return fmt.Errorf("pack: %w", err)
+		}
+		addStats(ctx, func(s *PackStats) { s.CompactedPacks += int64(len(compact)) })
+		for _, name := range obsolete {
+			delete(m.Packs, name)
+		}
+		m.Threshold = p.opts.Threshold
+		m.recount()
+		if err := p.commit(ctx); err != nil {
+			return fmt.Errorf("pack: commit manifest: %w", err)
+		}
+		// Only now that no manifest refers to them.
+		for _, name := range obsolete {
+			if err := p.removeObject(ctx, packPath("", name)); err != nil {
+				log.Warnf("[sync] pack: can't remove obsolete %s: %v", packPath("", name), err)
+			}
 		}
 	}
-	for _, name := range compact {
-		if err := b.compact(ctx, name); err != nil {
-			return fmt.Errorf("pack %q: compact %s: %w", dir, name, err)
-		}
-		obsolete = append(obsolete, name)
+	addStats(ctx, func(s *PackStats) { s.PacksTotal = int64(len(m.Packs)) })
+	return p.retireLoose(ctx)
+}
+
+// loadManifest reads the job manifest at dst and makes sure new packs are
+// numbered past every pack already there.
+func (p *packer) loadManifest(ctx context.Context) error {
+	m, o, err := loadV2(ctx, p.dst, p.opts.Threshold)
+	if err != nil {
+		return fmt.Errorf("pack: read manifest: %w", err)
 	}
-	if err := b.finish(ctx); err != nil {
-		return fmt.Errorf("pack %q: %w", dir, err)
-	}
-	for _, name := range obsolete {
-		delete(m.Packs, name)
-	}
-	m.recount()
-	if err := p.commitManifest(ctx, dir, m, mObj); err != nil {
-		return fmt.Errorf("pack %q: write manifest: %w", dir, err)
-	}
-	// The new members are committed: loose copies at dst are now duplicates.
-	if err := p.retireLoose(ctx, dir, add, dstFiles); err != nil {
-		return fmt.Errorf("pack %q: %w", dir, err)
-	}
-	// Only now that no manifest refers to them.
-	for _, name := range obsolete {
-		o, err := p.dst.NewObject(ctx, packPath(dir, name))
-		if err == nil {
-			err = o.Remove(ctx)
-		}
+	p.m, p.mObj = m, o
+	if o != nil {
+		rc, err := o.Open(ctx)
 		if err != nil {
-			log.Warnf("[sync] pack: can't remove obsolete %s: %v", packPath(dir, name), err)
+			return fmt.Errorf("pack: read manifest: %w", err)
+		}
+		p.oldRaw, err = io.ReadAll(rc)
+		_ = rc.Close()
+		if err != nil {
+			return fmt.Errorf("pack: read manifest: %w", err)
+		}
+	}
+	entries, err := p.dst.List(ctx, PackDirName)
+	if err != nil && !errors.Is(err, fs.ErrorDirNotFound) {
+		return fmt.Errorf("pack: list %s: %w", PackDirName, err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, path.Base(e.Remote()))
+	}
+	m.raiseNext(names...)
+	return nil
+}
+
+// scan sorts one src directory's files into small and not, and notes the
+// small ones that also sit loose at dst.
+func (p *packer) scan(ctx context.Context, dir string, files []fs.Object) error {
+	var loose map[string]fs.Object
+	listed := false
+	for _, o := range files {
+		if o.Size() < 0 || o.Size() >= p.opts.Threshold || !validRel(o.Remote()) {
+			p.present[o.Remote()] = struct{}{}
+			continue
+		}
+		p.smalls = append(p.smalls, o)
+		p.hidden[o.Remote()] = struct{}{}
+		if !listed {
+			var err error
+			if loose, err = p.dstFiles(ctx, dir); err != nil {
+				return err
+			}
+			listed = true
+		}
+		if d, ok := loose[path.Base(o.Remote())]; ok {
+			p.loose = append(p.loose, loosePair{o, d})
 		}
 	}
 	return nil
 }
 
-// drop removes a file's entry; the member stays in its pack as dead weight
-// until the pack is compacted.
-func (m *manifest) drop(name string) {
-	e, ok := m.Files[name]
-	if !ok {
-		return
+// dstFiles lists the loose files of dir at dst. The main pass lists the same
+// directories, and OpenList caches listings, so this is not a second round of
+// driver calls.
+func (p *packer) dstFiles(ctx context.Context, dir string) (map[string]fs.Object, error) {
+	entries, err := p.dst.List(ctx, dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrorDirNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("list %q at dst: %w", dir, err)
 	}
-	delete(m.Files, name)
-	if pk, ok := m.Packs[e.Pack]; ok {
-		pk.Dead++
-		m.Packs[e.Pack] = pk
+	files := map[string]fs.Object{}
+	for _, e := range entries {
+		if o, ok := e.(fs.Object); ok {
+			files[path.Base(o.Remote())] = o
+		}
 	}
+	return files, nil
 }
 
 // changed compares a source file with its manifest entry: size and mtime
@@ -420,10 +323,109 @@ func (p *packer) changed(ctx context.Context, o fs.Object, e fileEntry) (changed
 	return timed, false
 }
 
+// sameLoose says whether the loose dst file is the very file that is packed:
+// same size and, where dst keeps modification times, the same time to within
+// a second; where it doesn't (115), the same SHA1 — without one to compare,
+// it is not provably the same.
+func (p *packer) sameLoose(ctx context.Context, srcObj, dstObj fs.Object) bool {
+	if srcObj.Size() != dstObj.Size() {
+		return false
+	}
+	if p.dst.Precision() != fs.ModTimeNotSupported {
+		d := srcObj.ModTime(ctx).Sub(dstObj.ModTime(ctx))
+		if d < 0 {
+			d = -d
+		}
+		return d <= max(time.Second, p.dst.Precision())
+	}
+	a, errA := srcObj.Hash(ctx, rhash.SHA1)
+	b, errB := dstObj.Hash(ctx, rhash.SHA1)
+	return errA == nil && errB == nil && a != "" && strings.EqualFold(a, b)
+}
+
+// retireLoose removes the loose dst copies of files that now live in a pack.
+// A copy that differs from what was packed is somebody's other data: it is
+// kept, counted as a conflict, and hidden from the main pass so sync leaves
+// it alone too.
+func (p *packer) retireLoose(ctx context.Context) error {
+	for _, pr := range p.loose {
+		if p.sameLoose(ctx, pr.src, pr.dst) {
+			if err := pr.dst.Remove(ctx); err != nil {
+				return fmt.Errorf("remove superseded %s: %w", pr.dst.Remote(), err)
+			}
+			addStats(ctx, func(s *PackStats) { s.LooseRemoved++ })
+			continue
+		}
+		log.Warnf("[sync] pack: %s exists loose at dst with different content than the packed copy; keeping both", pr.dst.Remote())
+		p.hiddenDst[pr.dst.Remote()] = struct{}{}
+		addStats(ctx, func(s *PackStats) { s.Conflicts++ })
+	}
+	return nil
+}
+
+// commit saves the previous manifest as manifest.prev, then uploads the new
+// one. Uploading the new manifest is what makes the run count.
+func (p *packer) commit(ctx context.Context) error {
+	if p.oldRaw != nil {
+		rel, full := p.stage.newPath()
+		if err := os.WriteFile(full, p.oldRaw, 0o644); err != nil {
+			return err
+		}
+		prev, err := p.dst.NewObject(ctx, packPath("", PackManifestPrevName))
+		if err != nil && !notFound(err) {
+			return err
+		}
+		if err := p.upload(ctx, rel, packPath("", PackManifestPrevName), prev); err != nil {
+			return err
+		}
+	}
+	b, err := p.m.encode()
+	if err != nil {
+		return err
+	}
+	rel, full := p.stage.newPath()
+	if err := os.WriteFile(full, b, 0o644); err != nil {
+		return err
+	}
+	return p.upload(ctx, rel, packPath("", PackManifestName), p.mObj)
+}
+
+func (p *packer) removeObject(ctx context.Context, remote string) error {
+	o, err := p.dst.NewObject(ctx, remote)
+	if err != nil {
+		if notFound(err) {
+			return nil
+		}
+		return err
+	}
+	return o.Remove(ctx)
+}
+
+// removeAll deletes the job's packs and manifests; v1 content in the same
+// directory is not ours to touch here.
+func (p *packer) removeAll(ctx context.Context) error {
+	names := []string{PackManifestName}
+	for name := range p.m.Packs {
+		names = append(names, name)
+	}
+	sort.Strings(names[1:])
+	for _, name := range names {
+		if err := p.removeObject(ctx, packPath("", name)); err != nil {
+			return fmt.Errorf("pack: remove %s: %w", name, err)
+		}
+	}
+	if err := p.removeObject(ctx, packPath("", PackManifestPrevName)); err != nil {
+		return fmt.Errorf("pack: remove %s: %w", PackManifestPrevName, err)
+	}
+	if err := p.dst.Rmdir(ctx, PackDirName); err != nil {
+		log.Debugf("[sync] pack: %s not removed: %v", PackDirName, err)
+	}
+	return nil
+}
+
 type packBuilder struct {
-	p   *packer
-	dir string
-	m   *manifest
+	p *packer
+	m *manifest
 
 	name    string
 	rel     string
@@ -466,9 +468,9 @@ func (b *packBuilder) add(ctx context.Context, o fs.Object) error {
 	if err := b.open(); err != nil {
 		return err
 	}
-	name := path.Base(o.Remote())
+	name := o.Remote()
 	method := zip.Deflate
-	if b.p.opts.stores(name) {
+	if b.p.opts.stores(path.Base(name)) {
 		method = zip.Store
 	}
 	mod := o.ModTime(ctx)
@@ -478,13 +480,13 @@ func (b *packBuilder) add(ctx context.Context, o fs.Object) error {
 	}
 	rc, err := o.Open(ctx)
 	if err != nil {
-		return fmt.Errorf("read %s: %w", o.Remote(), err)
+		return fmt.Errorf("read %s: %w", name, err)
 	}
 	h := sha1.New()
 	n, err := io.Copy(io.MultiWriter(w, h), rc)
 	_ = rc.Close()
 	if err != nil {
-		return fmt.Errorf("read %s: %w", o.Remote(), err)
+		return fmt.Errorf("read %s: %w", name, err)
 	}
 	// A file that changed while being read is recorded as read; the next run
 	// sees the size or mtime differ and packs it again.
@@ -519,16 +521,16 @@ func (b *packBuilder) finish(ctx context.Context) error {
 		return err
 	}
 	b.m.Packs[name] = packEntry{Bytes: w.n, SHA1: hex.EncodeToString(w.h.Sum(nil)), Live: members}
-	if err := b.p.upload(ctx, rel, packPath(b.dir, name), nil); err != nil {
+	if err := b.p.upload(ctx, rel, packPath("", name), nil); err != nil {
 		return fmt.Errorf("upload %s: %w", name, err)
 	}
-	addStats(ctx, func(s *PackStats) { s.Packs++; s.BytesOut += w.n })
+	addStats(ctx, func(s *PackStats) { s.PacksWritten++; s.BytesOut += w.n })
 	return nil
 }
 
 // compact re-packs the live members of an old pack into the current one.
 func (b *packBuilder) compact(ctx context.Context, name string) error {
-	o, err := b.p.dst.NewObject(ctx, packPath(b.dir, name))
+	o, err := b.p.dst.NewObject(ctx, packPath("", name))
 	if err != nil {
 		return err
 	}
@@ -592,16 +594,4 @@ func (p *packer) upload(ctx context.Context, rel, remote string, existing fs.Obj
 		log.Warnf("[sync] pack: can't remove staged %s: %v", rel, rerr)
 	}
 	return err
-}
-
-func (p *packer) commitManifest(ctx context.Context, dir string, m *manifest, existing fs.Object) error {
-	b, err := json.Marshal(m)
-	if err != nil {
-		return err
-	}
-	rel, full := p.stage.newPath()
-	if err := os.WriteFile(full, b, 0o644); err != nil {
-		return err
-	}
-	return p.upload(ctx, rel, packPath(dir, PackIndexName), existing)
 }

@@ -6,12 +6,16 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"math/rand"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -99,16 +103,19 @@ func TestPackUnpackRoundTrip(t *testing.T) {
 	src, packed, out := tempDir(t), tempDir(t), tempDir(t)
 	buildRoundTripTree(t, src)
 
-	s := mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, packed, syncjob.PackOptions{Threshold: 1024, MinFiles: 3})))
-	if s.PackStats.Packs == 0 {
+	s := mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, packed, syncjob.PackOptions{Threshold: 1024})))
+	if s.PackStats.PacksWritten == 0 {
 		t.Fatalf("nothing packed: %+v", s.PackStats)
 	}
-	if exists(packed, "a/b/c1/n2.json") || !exists(packed, "a/b/c1/huge.bin") || !exists(packed, "few/one.txt") {
-		t.Fatalf("packed layout wrong")
+	if loose := looseSmall(t, packed, 1024); len(loose) != 0 {
+		t.Fatalf("small files uploaded on their own: %v", loose)
+	}
+	if !exists(packed, "a/b/c1/huge.bin") {
+		t.Fatalf("large file missing from the packed tree")
 	}
 
 	s = mustSucceed(t, runJob(t, m, unpackSpec(syncjob.ModeCopy, packed, out)))
-	if s.Stage != "transferring" || s.PackStats.UnpackedFiles != 3*6+1+5 {
+	if s.Stage != "transferring" || s.PackStats.UnpackedFiles != 3*6+1+5+2+1 {
 		t.Fatalf("unpack stats = %+v (stage %s)", s.PackStats, s.Stage)
 	}
 	sameTree(t, tree(t, src), tree(t, out))
@@ -137,7 +144,7 @@ func TestUnpackSyncDeletesExtrasButKeepsPackedFiles(t *testing.T) {
 		write(t, src, fmt.Sprintf("d/f%d.txt", i), "small")
 	}
 	write(t, src, "d/big.bin", strings.Repeat("B", 3000))
-	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, packed, syncjob.PackOptions{Threshold: 1024, MinFiles: 3})))
+	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, packed, syncjob.PackOptions{Threshold: 1024})))
 
 	write(t, out, "d/extra.txt", "not in the backup")
 	write(t, out, "gone/x.txt", "nor this")
@@ -165,7 +172,7 @@ func TestUnpackByRangeReadsOnlyWhatItNeeds(t *testing.T) {
 		rng.Read(b)
 		write(t, src, fmt.Sprintf("d/f%02d.dat", i), string(b))
 	}
-	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, packed, syncjob.PackOptions{Threshold: 4096, MinFiles: 3, StoreSuffixes: []string{".dat"}})))
+	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, packed, syncjob.PackOptions{Threshold: 4096, StoreSuffixes: []string{".dat"}})))
 	mustSucceed(t, runJob(t, m, unpackSpec(syncjob.ModeCopy, packed, out)))
 
 	// Two files missing at dst: 4KB wanted out of a 120KB pack.
@@ -179,7 +186,7 @@ func TestUnpackByRangeReadsOnlyWhatItNeeds(t *testing.T) {
 
 	// The reader itself fetches far less than the pack.
 	ctx := context.Background()
-	lf, err := local.NewFs(ctx, "t", filepath.Join(packed, "d", ".oppack"), configmap.Simple{})
+	lf, err := local.NewFs(ctx, "t", filepath.Join(packed, ".oppack"), configmap.Simple{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,8 +221,10 @@ func TestUnpackRefusesCorruptPack(t *testing.T) {
 		write(t, src, fmt.Sprintf("bad/f%d.txt", i), "damaged soon")
 		write(t, src, fmt.Sprintf("good/f%d.txt", i), "healthy")
 	}
-	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, packed, syncjob.PackOptions{Threshold: 1024, MinFiles: 3})))
-	f, err := os.OpenFile(filepath.Join(packed, "bad", ".oppack", "p-000001.zip"), os.O_APPEND|os.O_WRONLY, 0)
+	write(t, src, "big.bin", strings.Repeat("B", 3000))
+	// A pack per file, so one bad pack costs one file.
+	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, packed, syncjob.PackOptions{Threshold: 1024, MaxPackBytes: 1})))
+	f, err := os.OpenFile(filepath.Join(packed, ".oppack", "p-000001.zip"), os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,8 +238,8 @@ func TestUnpackRefusesCorruptPack(t *testing.T) {
 	if exists(out, "bad/f0.txt") {
 		t.Fatalf("content of a corrupt pack was written")
 	}
-	if !exists(out, "good/f0.txt") {
-		t.Fatalf("one bad pack stopped the healthy directory")
+	if !exists(out, "bad/f1.txt") || !exists(out, "good/f0.txt") || !exists(out, "big.bin") {
+		t.Fatalf("one bad pack stopped the rest")
 	}
 }
 
@@ -373,7 +382,7 @@ func TestUnpackPrefersPackMemberOverLooseSameName(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		write(t, src, fmt.Sprintf("d/f%d.txt", i), "from the pack")
 	}
-	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, packed, syncjob.PackOptions{Threshold: 1024, MinFiles: 3})))
+	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, packed, syncjob.PackOptions{Threshold: 1024})))
 	write(t, packed, "d/f1.txt", "loose impostor")
 
 	for _, mode := range []syncjob.Mode{syncjob.ModeCopy, syncjob.ModeSync} {
@@ -384,5 +393,97 @@ func TestUnpackPrefersPackMemberOverLooseSameName(t *testing.T) {
 		if got, _ := read(t, out, "d/f1.txt"); got != "from the pack" {
 			t.Fatalf("%s: d/f1.txt = %q, want the pack member", mode, got)
 		}
+	}
+}
+
+// The point of full-path members: unzip at the root restores the tree.
+func TestPackMembersRestoreTheTreeWithPlainUnzip(t *testing.T) {
+	src, packed, out := tempDir(t), tempDir(t), tempDir(t)
+	buildRoundTripTree(t, src)
+	mustSucceed(t, runJob(t, newManager(t), packSpec(syncjob.ModeCopy, src, packed, syncjob.PackOptions{Threshold: 1024, MaxPackBytes: 600})))
+	if n := len(packNames(t, packed)); n < 3 {
+		t.Fatalf("only %d packs; the test wants several", n)
+	}
+	for _, name := range packNames(t, packed) {
+		zr, err := zip.OpenReader(filepath.Join(packed, ".oppack", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range zr.File {
+			rc, err := f.Open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, _ := io.ReadAll(rc)
+			_ = rc.Close()
+			writeBytes(t, out, f.Name, b)
+		}
+		_ = zr.Close()
+	}
+	for _, rel := range looseSmall(t, src, 1024) {
+		a, _ := os.ReadFile(filepath.Join(src, filepath.FromSlash(rel)))
+		b, err := os.ReadFile(filepath.Join(out, filepath.FromSlash(rel)))
+		if err != nil || !bytes.Equal(a, b) {
+			t.Errorf("%s not restored by unzip (err %v)", rel, err)
+		}
+	}
+}
+
+// If the commit died between saving prev and writing the new manifest, the
+// next reader falls back to prev.
+func TestUnpackFallsBackToPrevManifest(t *testing.T) {
+	src, packed, out := tempDir(t), tempDir(t), tempDir(t)
+	for i := 0; i < 3; i++ {
+		write(t, src, fmt.Sprintf("d/f%d.txt", i), "content")
+	}
+	mustSucceed(t, runJob(t, newManager(t), packSpec(syncjob.ModeCopy, src, packed, syncjob.PackOptions{Threshold: 1024})))
+	if err := os.Rename(filepath.Join(packed, ".oppack", "manifest.json.gz"), filepath.Join(packed, ".oppack", "manifest.prev.json.gz")); err != nil {
+		t.Fatal(err)
+	}
+	mustSucceed(t, runJob(t, newManager(t), unpackSpec(syncjob.ModeCopy, packed, out)))
+	if got, _ := read(t, out, "d/f2.txt"); got != "content" {
+		t.Fatalf("d/f2.txt = %q", got)
+	}
+}
+
+// buildV1 writes a version-1 per-directory pack the way earlier releases did.
+func buildV1(t *testing.T, root, dir string, files map[string]string, mtime time.Time) {
+	t.Helper()
+	var zb bytes.Buffer
+	zw := zip.NewWriter(&zb)
+	idx := map[string]any{}
+	for name, body := range files {
+		w, _ := zw.CreateHeader(&zip.FileHeader{Name: name, Method: zip.Deflate, Modified: mtime})
+		_, _ = w.Write([]byte(body))
+		sum := sha1.Sum([]byte(body))
+		idx[name] = map[string]any{"size": len(body), "mtime": mtime.UTC().Format(time.RFC3339Nano), "sha1": hex.EncodeToString(sum[:]), "pack": "p-000001.zip"}
+	}
+	_ = zw.Close()
+	pk := sha1.Sum(zb.Bytes())
+	writeBytes(t, root, path.Join(dir, ".oppack", "p-000001.zip"), zb.Bytes())
+	manifest, _ := json.Marshal(map[string]any{
+		"version": 1, "threshold": 1024, "files": idx,
+		"packs": map[string]any{"p-000001.zip": map[string]any{"bytes": zb.Len(), "sha1": hex.EncodeToString(pk[:]), "live": len(files), "dead": 0}},
+	})
+	writeBytes(t, root, path.Join(dir, ".oppack", "index.json"), manifest)
+}
+
+func TestUnpackStillReadsVersion1DirectoryPacks(t *testing.T) {
+	packed, out := tempDir(t), tempDir(t)
+	mt := time.Date(2026, 9, 14, 10, 0, 0, 0, time.UTC)
+	buildV1(t, packed, "old/dir", map[string]string{"a.json": `{"a":1}`, "b 二.json": `{"b":2}`}, mt)
+	buildV1(t, packed, "", map[string]string{"rootfile.txt": "root"}, mt)
+	write(t, packed, "old/dir/big.bin", strings.Repeat("B", 3000))
+	s := mustSucceed(t, runJob(t, newManager(t), unpackSpec(syncjob.ModeSync, packed, out)))
+	if s.PackStats.UnpackedFiles != 3 {
+		t.Fatalf("stats = %+v", s.PackStats)
+	}
+	for rel, want := range map[string]string{"old/dir/a.json": `{"a":1}`, "old/dir/b 二.json": `{"b":2}`, "rootfile.txt": "root"} {
+		if got, _ := read(t, out, rel); got != want {
+			t.Fatalf("%s = %q, want %q", rel, got, want)
+		}
+	}
+	if exists(out, "old/dir/.oppack") || exists(out, ".oppack") || !exists(out, "old/dir/big.bin") {
+		t.Fatalf("unpack target layout wrong")
 	}
 }

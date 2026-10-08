@@ -2,10 +2,8 @@ package syncjob
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -16,6 +14,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/filter"
+	log "github.com/sirupsen/logrus"
 )
 
 // progress lets the packing stages report to the job that runs them.
@@ -205,43 +204,19 @@ func readManifest(ctx context.Context, o fs.Object) (*manifest, error) {
 		return nil, err
 	}
 	defer rc.Close()
-	b, err := io.ReadAll(io.LimitReader(rc, 256<<20))
-	if err != nil {
-		return nil, err
-	}
-	m := newManifest(0)
-	if err := json.Unmarshal(b, m); err != nil {
-		return nil, fmt.Errorf("%s: %w", o.Remote(), err)
-	}
-	if m.Version != 1 {
-		return nil, fmt.Errorf("%s: unsupported manifest version %d", o.Remote(), m.Version)
-	}
-	if m.Files == nil {
-		m.Files = map[string]fileEntry{}
-	}
-	if m.Packs == nil {
-		m.Packs = map[string]packEntry{}
-	}
-	for name, e := range m.Files {
-		if !validName(name) || !validName(e.Pack) {
-			return nil, fmt.Errorf("%s: unsafe name %q in manifest", o.Remote(), name)
-		}
-	}
-	for name := range m.Packs {
-		if !validName(name) {
-			return nil, fmt.Errorf("%s: unsafe pack name %q in manifest", o.Remote(), name)
-		}
-	}
-	return m, nil
+	return decodeManifest(rc, o.Remote())
 }
 
-// loadManifest reads dir's manifest from f; a missing one is an empty
-// manifest, and the returned object is nil.
-func loadManifest(ctx context.Context, f fs.Fs, dir string, threshold int64) (*manifest, fs.Object, error) {
+func notFound(err error) bool {
+	return errors.Is(err, fs.ErrorObjectNotFound) || errors.Is(err, fs.ErrorDirNotFound)
+}
+
+// loadV1 reads dir's v1 per-directory manifest from f; nil when there is none.
+func loadV1(ctx context.Context, f fs.Fs, dir string) (*manifest, fs.Object, error) {
 	o, err := f.NewObject(ctx, packPath(dir, PackIndexName))
 	if err != nil {
-		if errors.Is(err, fs.ErrorObjectNotFound) || errors.Is(err, fs.ErrorDirNotFound) {
-			return newManifest(threshold), nil, nil
+		if notFound(err) {
+			return nil, nil, nil
 		}
 		return nil, nil, err
 	}
@@ -249,7 +224,38 @@ func loadManifest(ctx context.Context, f fs.Fs, dir string, threshold int64) (*m
 	if err != nil {
 		return nil, nil, err
 	}
+	if m.Version != 1 {
+		return nil, nil, fmt.Errorf("%s: unsupported manifest version %d", o.Remote(), m.Version)
+	}
 	return m, o, nil
+}
+
+// loadV2 reads the job manifest at f's root. When it is missing but the
+// previous one is there (a commit that died between the two), that one stands
+// in; with neither, the manifest is empty and the object nil.
+func loadV2(ctx context.Context, f fs.Fs, threshold int64) (*manifest, fs.Object, error) {
+	for i, name := range []string{PackManifestName, PackManifestPrevName} {
+		o, err := f.NewObject(ctx, packPath("", name))
+		if err != nil {
+			if notFound(err) {
+				continue
+			}
+			return nil, nil, err
+		}
+		m, err := readManifest(ctx, o)
+		if err != nil {
+			return nil, nil, err
+		}
+		if m.Version != 2 {
+			return nil, nil, fmt.Errorf("%s: unsupported manifest version %d", o.Remote(), m.Version)
+		}
+		if i == 1 {
+			log.Warnf("[sync] pack: %s missing at %s; recovering from %s", PackManifestName, f, PackManifestPrevName)
+			return m, nil, nil
+		}
+		return m, o, nil
+	}
+	return newManifest(2, threshold), nil, nil
 }
 
 func cleanRel(p string) string {

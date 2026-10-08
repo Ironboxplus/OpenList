@@ -4,6 +4,7 @@
 package fakedriver
 
 import (
+	"bytes"
 	"context"
 	"io"
 	stdpath "path"
@@ -15,6 +16,8 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
@@ -31,6 +34,10 @@ type Driver struct {
 	data  map[string][]byte
 
 	Gets, Lists, MakeDirs, Puts atomic.Int32
+
+	// FailPut, when set, is asked before each Put with the driver-side path
+	// of the file; a non-nil error fails the Put and stores nothing.
+	FailPut func(path string) error
 
 	// GetPaths records every path Get was asked for, in order.
 	GetPaths []string
@@ -125,8 +132,22 @@ func (d *Driver) List(_ context.Context, dir model.Obj, _ model.ListArgs) ([]mod
 	return out, nil
 }
 
-func (d *Driver) Link(context.Context, model.Obj, model.LinkArgs) (*model.Link, error) {
-	return nil, errs.NotSupport
+// Link serves the stored bytes of a file through a range reader.
+func (d *Driver) Link(_ context.Context, file model.Obj, _ model.LinkArgs) (*model.Link, error) {
+	b, ok := d.Content(file.GetPath())
+	if !ok {
+		return nil, errs.NotSupport
+	}
+	return &model.Link{
+		ContentLength: int64(len(b)),
+		RangeReader: stream.RangeReaderFunc(func(_ context.Context, r http_range.Range) (io.ReadCloser, error) {
+			end := int64(len(b))
+			if r.Length >= 0 && r.Start+r.Length < end {
+				end = r.Start + r.Length
+			}
+			return io.NopCloser(bytes.NewReader(b[min(r.Start, end):end])), nil
+		}),
+	}, nil
 }
 
 func (d *Driver) MakeDir(_ context.Context, parent model.Obj, name string) (model.Obj, error) {
@@ -142,6 +163,11 @@ func (d *Driver) MakeDir(_ context.Context, parent model.Obj, name string) (mode
 
 func (d *Driver) Put(_ context.Context, parent model.Obj, file model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
 	d.Puts.Add(1)
+	if d.FailPut != nil {
+		if err := d.FailPut(stdpath.Join(parent.GetPath(), file.GetName())); err != nil {
+			return nil, err
+		}
+	}
 	b, err := io.ReadAll(file)
 	if err != nil {
 		return nil, err

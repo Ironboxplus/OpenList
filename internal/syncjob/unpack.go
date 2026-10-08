@@ -63,22 +63,18 @@ func unpackDown(ctx context.Context, spec Spec, src, dst fs.Fs) (unpackResult, e
 		hiddenSrc: map[string]struct{}{},
 		hiddenDst: map[string]struct{}{},
 		dstDirs:   map[string]map[string]fs.Object{},
+		handled:   map[string]struct{}{},
 	}
 
-	type packDir struct {
-		dir   string
-		loose map[string]struct{}
-	}
-	var packDirs []packDir
+	var packDirs []string
 	var legacy []string
+	srcFiles := map[string]struct{}{}
 	err = walkDirs(ctx, src, func(dir string, files []fs.Object, subdirs []string) error {
-		loose := map[string]struct{}{}
 		for _, o := range files {
-			name := path.Base(o.Remote())
-			loose[name] = struct{}{}
+			srcFiles[o.Remote()] = struct{}{}
 			if dir == "" {
 				for _, l := range legacyIndexNames {
-					if name == l {
+					if path.Base(o.Remote()) == l {
 						legacy = append(legacy, l)
 						u.hiddenSrc[o.Remote()] = struct{}{}
 					}
@@ -87,7 +83,7 @@ func unpackDown(ctx context.Context, spec Spec, src, dst fs.Fs) (unpackResult, e
 		}
 		for _, s := range subdirs {
 			if s == PackDirName {
-				packDirs = append(packDirs, packDir{dir, loose})
+				packDirs = append(packDirs, dir)
 			}
 		}
 		return nil
@@ -96,11 +92,36 @@ func unpackDown(ctx context.Context, spec Spec, src, dst fs.Fs) (unpackResult, e
 		return unpackResult{}, err
 	}
 
-	for _, pd := range packDirs {
+	// The job manifest (v2) first, so its entries win over any v1 per-directory
+	// manifest left from before a migration.
+	for _, dir := range packDirs {
+		if dir != "" {
+			continue
+		}
+		m, _, err := loadV2(ctx, src, 0)
+		if err != nil {
+			u.fail("%s: %v", PackDirName, err)
+			continue
+		}
+		if len(m.Files) > 0 || len(m.Packs) > 0 {
+			if err := u.unpackManifest(ctx, "", m, true, srcFiles); err != nil {
+				return unpackResult{}, err
+			}
+		}
+	}
+	for _, dir := range packDirs {
 		if err := ctx.Err(); err != nil {
 			return unpackResult{}, err
 		}
-		if err := u.unpackDir(ctx, pd.dir, pd.loose); err != nil {
+		m, _, err := loadV1(ctx, src, dir)
+		if err != nil {
+			u.fail("%q: %v", dir, err)
+			continue
+		}
+		if m == nil {
+			continue
+		}
+		if err := u.unpackManifest(ctx, dir, m, false, srcFiles); err != nil {
 			return unpackResult{}, err
 		}
 	}
@@ -149,6 +170,7 @@ type unpacker struct {
 	hiddenDst      map[string]struct{}
 	hiddenPrefixes []string
 	dstDirs        map[string]map[string]fs.Object
+	handled        map[string]struct{} // remotes some manifest already covers
 	errs           []error
 }
 
@@ -201,28 +223,42 @@ func (u *unpacker) upToDate(ctx context.Context, o fs.Object, e fileEntry) bool 
 	return true
 }
 
-func (u *unpacker) unpackDir(ctx context.Context, dir string, loose map[string]struct{}) error {
-	m, _, err := loadManifest(ctx, u.src, dir, 0)
-	if err != nil {
-		u.fail("%q: %v", dir, err)
-		return nil
-	}
-	existing, err := u.dstDir(ctx, dir)
-	if err != nil {
-		return err
-	}
-	addStats(ctx, func(s *PackStats) { s.Dirs++ })
-	needed := map[string][]string{}
+// member is one file to extract: where it goes at dst, its name inside the
+// pack, and what the manifest says about it.
+type member struct {
+	remote  string
+	zipName string
+	e       fileEntry
+}
+
+// unpackManifest extracts what dst lacks of one manifest. For the job manifest
+// (v2) names are paths relative to the root and packs sit in the root's
+// .oppack; for a v1 manifest names are files of dir and its packs are in
+// dir/.oppack.
+func (u *unpacker) unpackManifest(ctx context.Context, dir string, m *manifest, v2 bool, srcFiles map[string]struct{}) error {
+	needed := map[string][]member{}
 	for name, e := range m.Files {
-		if _, ok := loose[name]; ok {
+		remote := path.Join(dir, name)
+		if v2 {
+			remote = name
+		}
+		if _, ok := u.handled[remote]; ok {
+			continue
+		}
+		u.handled[remote] = struct{}{}
+		if _, ok := srcFiles[remote]; ok {
 			// Two sources for one name: the pack member wins, and the loose
 			// file is kept out of the transfer so it can't overwrite it.
-			u.hiddenSrc[path.Join(dir, name)] = struct{}{}
+			u.hiddenSrc[remote] = struct{}{}
 			addStats(ctx, func(s *PackStats) { s.Conflicts++ })
 		}
-		u.hiddenDst[path.Join(dir, name)] = struct{}{}
-		if !u.upToDate(ctx, existing[name], e) {
-			needed[e.Pack] = append(needed[e.Pack], name)
+		u.hiddenDst[remote] = struct{}{}
+		existing, err := u.dstDir(ctx, path.Dir(remote))
+		if err != nil {
+			return err
+		}
+		if !u.upToDate(ctx, existing[path.Base(remote)], e) {
+			needed[e.Pack] = append(needed[e.Pack], member{remote: remote, zipName: name, e: e})
 		}
 	}
 	packs := make([]string, 0, len(needed))
@@ -231,36 +267,36 @@ func (u *unpacker) unpackDir(ctx context.Context, dir string, loose map[string]s
 	}
 	sort.Strings(packs)
 	for _, p := range packs {
-		names := needed[p]
-		sort.Strings(names)
+		ms := needed[p]
+		sort.Slice(ms, func(i, j int) bool { return ms[i].remote < ms[j].remote })
 		if u.dry {
 			var n int64
-			for _, name := range names {
-				n += m.Files[name].Size
+			for _, mb := range ms {
+				n += mb.e.Size
 			}
-			addStats(ctx, func(s *PackStats) { s.UnpackedFiles += int64(len(names)); s.UnpackedBytes += n })
+			addStats(ctx, func(s *PackStats) { s.UnpackedFiles += int64(len(ms)); s.UnpackedBytes += n })
 			continue
 		}
-		if err := u.extractPack(ctx, dir, p, names, m, existing); err != nil {
+		if err := u.extractPack(ctx, packPath(dir, p), m.Packs[p].SHA1, ms); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			u.fail("%q pack %s: %v", dir, p, err)
+			u.fail("pack %s: %v", packPath(dir, p), err)
 		}
 	}
 	return nil
 }
 
-// extractPack opens pack (fetching it whole, or by range when only a small
-// part of a big pack is wanted) and extracts the named members to dst.
-func (u *unpacker) extractPack(ctx context.Context, dir, pack string, names []string, m *manifest, existing map[string]fs.Object) error {
-	po, err := u.src.NewObject(ctx, packPath(dir, pack))
+// extractPack opens a pack (fetching it whole, or by range when only a small
+// part of a big pack is wanted) and extracts the given members to dst.
+func (u *unpacker) extractPack(ctx context.Context, packRemote, packSHA string, ms []member) error {
+	po, err := u.src.NewObject(ctx, packRemote)
 	if err != nil {
 		return err
 	}
 	var want int64
-	for _, n := range names {
-		want += m.Files[n].Size
+	for _, mb := range ms {
+		want += mb.e.Size
 	}
 	var zr *zip.Reader
 	if po.Size() >= rangeMinPack && want*rangeRatio < po.Size() {
@@ -276,8 +312,8 @@ func (u *unpacker) extractPack(ctx context.Context, dir, pack string, names []st
 		if err != nil {
 			return err
 		}
-		if w := m.Packs[pack].SHA1; w != "" && !strings.EqualFold(w, sum) {
-			return fmt.Errorf("pack is corrupt: sha1 %s, manifest says %s", sum, w)
+		if packSHA != "" && !strings.EqualFold(packSHA, sum) {
+			return fmt.Errorf("pack is corrupt: sha1 %s, manifest says %s", sum, packSHA)
 		}
 		f, err := os.Open(full)
 		if err != nil {
@@ -293,24 +329,28 @@ func (u *unpacker) extractPack(ctx context.Context, dir, pack string, names []st
 		}
 		addStats(ctx, func(s *PackStats) { s.PacksFetched++ })
 	}
-	members := map[string]*zip.File{}
+	zfiles := map[string]*zip.File{}
 	for _, zf := range zr.File {
-		members[zf.Name] = zf
+		zfiles[zf.Name] = zf
 	}
-	for _, name := range names {
+	for _, mb := range ms {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		zf := members[name]
+		zf := zfiles[mb.zipName]
 		if zf == nil {
-			u.fail("%q: %s is not in pack %s", dir, name, pack)
+			u.fail("%s is not in pack %s", mb.zipName, packRemote)
 			continue
 		}
-		if err := u.extractMember(ctx, dir, zf, m.Files[name], existing[name]); err != nil {
+		existing, err := u.dstDir(ctx, path.Dir(mb.remote))
+		if err != nil {
+			return err
+		}
+		if err := u.extractMember(ctx, zf, mb.remote, mb.e, existing[path.Base(mb.remote)]); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			u.fail("%q: %s: %v", dir, name, err)
+			u.fail("%s: %v", mb.remote, err)
 		}
 	}
 	return nil
@@ -318,7 +358,7 @@ func (u *unpacker) extractPack(ctx context.Context, dir, pack string, names []st
 
 // extractMember writes one member to staging, checks it against the manifest,
 // and only then copies it to dst, so a bad member never reaches dst.
-func (u *unpacker) extractMember(ctx context.Context, dir string, zf *zip.File, e fileEntry, existing fs.Object) error {
+func (u *unpacker) extractMember(ctx context.Context, zf *zip.File, remote string, e fileEntry, existing fs.Object) error {
 	if int64(zf.UncompressedSize64) != e.Size {
 		return fmt.Errorf("member is %d bytes, manifest says %d", zf.UncompressedSize64, e.Size)
 	}
@@ -356,7 +396,7 @@ func (u *unpacker) extractMember(ctx context.Context, dir string, zf *zip.File, 
 			return err
 		}
 	}
-	return u.put(ctx, rel, path.Join(dir, zf.Name), n, existing)
+	return u.put(ctx, rel, remote, n, existing)
 }
 
 // put copies a staged file to dst and checks the size dst reports.

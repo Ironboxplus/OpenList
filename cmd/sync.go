@@ -49,7 +49,6 @@ var syncFlags struct {
 
 	pack          bool
 	packThreshold string
-	packMinFiles  int
 	packMax       string
 	unpack        bool
 	unpackSync    bool
@@ -157,9 +156,8 @@ func runSync(cmd *cobra.Command, mode syncjob.Mode, args []string) error {
 
 func addPackFlags(f *pflag.FlagSet) {
 	d := syncjob.DefaultPackOptions()
-	f.BoolVar(&syncFlags.pack, "pack", false, "zip each directory's small files into packs at dst")
+	f.BoolVar(&syncFlags.pack, "pack", false, "zip all files below --pack-threshold into a few packs at dst, so none is uploaded on its own")
 	f.StringVar(&syncFlags.packThreshold, "pack-threshold", formatSize(d.Threshold), "with --pack: files smaller than this are packed (K, M, G suffixes)")
-	f.IntVar(&syncFlags.packMinFiles, "pack-min-files", d.MinFiles, "with --pack: don't pack a directory with fewer small files than this")
 	f.StringVar(&syncFlags.packMax, "pack-max", formatSize(d.MaxPackBytes), "with --pack: largest pack; more content goes into more packs (K, M, G suffixes)")
 	f.BoolVar(&syncFlags.unpack, "unpack", false, "extract packs (and legacy PACKED.tsv archives) found at src into plain files at dst")
 }
@@ -205,10 +203,10 @@ func applyPackFlags(spec *syncjob.Spec) error {
 	if err != nil {
 		return fmt.Errorf("--pack-max: %w", err)
 	}
-	if threshold <= 0 || maxPack <= 0 || syncFlags.packMinFiles <= 0 {
-		return fmt.Errorf("--pack-threshold, --pack-min-files and --pack-max must be positive")
+	if threshold <= 0 || maxPack <= 0 {
+		return fmt.Errorf("--pack-threshold and --pack-max must be positive")
 	}
-	spec.Pack = &syncjob.PackOptions{Enabled: true, Threshold: threshold, MinFiles: syncFlags.packMinFiles, MaxPackBytes: maxPack}
+	spec.Pack = &syncjob.PackOptions{Enabled: true, Threshold: threshold, MaxPackBytes: maxPack}
 	return nil
 }
 
@@ -594,11 +592,12 @@ func packLine(s syncjob.Snapshot) string {
 		return ""
 	}
 	if s.Spec.Unpack {
-		return fmt.Sprintf("unpack: %d dirs, %d files extracted (%s), %d packs fetched, %d read by range",
-			p.Dirs, p.UnpackedFiles, humanBytes(float64(p.UnpackedBytes)), p.PacksFetched, p.PacksRanged)
+		return fmt.Sprintf("unpack: %d files extracted (%s), %d packs fetched, %d read by range, %d name conflicts",
+			p.UnpackedFiles, humanBytes(float64(p.UnpackedBytes)), p.PacksFetched, p.PacksRanged, p.Conflicts)
 	}
-	return fmt.Sprintf("pack: %d dirs, %d files -> %d packs (%s read, %s written), %d dirs too small to pack, %d entries retired",
-		p.Dirs, p.PackedFiles, p.Packs, humanBytes(float64(p.BytesIn)), humanBytes(float64(p.BytesOut)), p.SkippedDirs, p.DeadRemoved)
+	return fmt.Sprintf("pack: %d small files, %d newly packed (%s read) in %d new packs (%s written), %d packs in total; %d entries retired, %d packs compacted, %d loose copies removed, %d conflicts, %d v1 dirs migrated",
+		p.SmallFiles, p.PackedFiles, humanBytes(float64(p.BytesIn)), p.PacksWritten, humanBytes(float64(p.BytesOut)), p.PacksTotal,
+		p.DeadRemoved, p.CompactedPacks, p.LooseRemoved, p.Conflicts, p.V1MigratedDirs)
 }
 
 func progressLine(s syncjob.Snapshot) string {
