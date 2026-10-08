@@ -49,6 +49,7 @@ func packUp(ctx context.Context, spec Spec, src, dst fs.Fs) (fs.Fs, fs.Fs, error
 		hidden:    map[string]struct{}{},
 		hiddenDst: map[string]struct{}{},
 		present:   map[string]struct{}{},
+		visited:   map[string]struct{}{},
 	}
 	if err := p.run(ctx); err != nil {
 		return nil, nil, err
@@ -87,8 +88,25 @@ type packer struct {
 	hidden  map[string]struct{} // their remotes: kept from the main pass
 	present map[string]struct{} // src files that are not small
 	loose   []loosePair
+	visited map[string]struct{} // src directories walked
+	v1      []v1Dir             // version 1 per-directory packs found at dst
 	// hiddenDst are loose dst files the main pass must not touch.
 	hiddenDst map[string]struct{}
+}
+
+// v1Dir is a directory at dst packed the version 1 way (dir/.oppack/index.json).
+type v1Dir struct {
+	dir string
+	m   *manifest
+}
+
+// migrant is a v1 member that has no source file left to repack from; it
+// moves into the job packs as it is.
+type migrant struct {
+	d      v1Dir
+	name   string
+	remote string
+	e      fileEntry
 }
 
 // loosePair is a small file at src that also exists loose at dst.
@@ -101,6 +119,9 @@ func (p *packer) run(ctx context.Context) error {
 	if err := walkDirs(ctx, p.src, func(dir string, files []fs.Object, _ []string) error {
 		return p.scan(ctx, dir, files)
 	}); err != nil {
+		return err
+	}
+	if err := p.findOrphanV1(ctx); err != nil {
 		return err
 	}
 	addStats(ctx, func(s *PackStats) { s.SmallFiles = int64(len(p.smalls)) })
@@ -146,6 +167,28 @@ func (p *packer) run(ctx context.Context) error {
 		}
 	}
 
+	// v1 members that exist only in their v1 pack. When src still has the file
+	// it is repacked from there (it is missing from the job manifest); when it
+	// is gone, sync lets it go and copy keeps it, moved over as it is.
+	var migrants []migrant
+	for _, d := range p.v1 {
+		names := make([]string, 0, len(d.m.Files))
+		for name := range d.m.Files {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			remote := path.Join(d.dir, name)
+			_, packed := m.Files[remote]
+			_, isSmall := small[remote]
+			_, there := p.present[remote]
+			if packed || isSmall || there || p.sync {
+				continue
+			}
+			migrants = append(migrants, migrant{d, name, remote, d.m.Files[name]})
+		}
+	}
+
 	m.recount()
 	var compact, obsolete []string
 	for name, pk := range m.Packs {
@@ -161,6 +204,7 @@ func (p *packer) run(ctx context.Context) error {
 	addStats(ctx, func(s *PackStats) { s.DeadRemoved += dropped })
 
 	if p.dry {
+		addStats(ctx, func(s *PackStats) { s.V1MigratedDirs += int64(len(p.v1)) })
 		var n int64
 		for _, o := range add {
 			n += o.Size()
@@ -172,22 +216,27 @@ func (p *packer) run(ctx context.Context) error {
 		})
 		return nil
 	}
-	if len(m.Files) == 0 && len(add) == 0 {
+	if len(m.Files) == 0 && len(add) == 0 && len(migrants) == 0 {
 		addStats(ctx, func(s *PackStats) { s.PacksTotal = 0 })
 		if p.mObj != nil {
 			// Nothing left to pack: the packs and manifests go.
-			return p.removeAll(ctx)
+			if err := p.removeAll(ctx); err != nil {
+				return err
+			}
 		}
-		return nil
+		return p.removeV1(ctx)
 	}
 
-	changedAny := len(add) > 0 || len(compact) > 0 || len(obsolete) > 0 || dirty
+	changedAny := len(add) > 0 || len(migrants) > 0 || len(compact) > 0 || len(obsolete) > 0 || dirty || len(p.v1) > 0
 	if changedAny {
 		b := &packBuilder{p: p, m: m}
 		for _, o := range add {
 			if err := b.add(ctx, o); err != nil {
 				return fmt.Errorf("pack: %w", err)
 			}
+		}
+		if err := b.migrate(ctx, migrants); err != nil {
+			return fmt.Errorf("pack: migrate v1 packs: %w", err)
 		}
 		for _, name := range compact {
 			if err := b.compact(ctx, name); err != nil {
@@ -215,6 +264,9 @@ func (p *packer) run(ctx context.Context) error {
 		}
 	}
 	addStats(ctx, func(s *PackStats) { s.PacksTotal = int64(len(m.Packs)) })
+	if err := p.removeV1(ctx); err != nil {
+		return err
+	}
 	return p.retireLoose(ctx)
 }
 
@@ -252,8 +304,16 @@ func (p *packer) loadManifest(ctx context.Context) error {
 // scan sorts one src directory's files into small and not, and notes the
 // small ones that also sit loose at dst.
 func (p *packer) scan(ctx context.Context, dir string, files []fs.Object) error {
-	var loose map[string]fs.Object
-	listed := false
+	p.visited[dir] = struct{}{}
+	loose, hasPack, err := p.dstFiles(ctx, dir)
+	if err != nil {
+		return err
+	}
+	if hasPack {
+		if err := p.noteV1(ctx, dir); err != nil {
+			return err
+		}
+	}
 	for _, o := range files {
 		if o.Size() < 0 || o.Size() >= p.opts.Threshold || !validRel(o.Remote()) {
 			p.present[o.Remote()] = struct{}{}
@@ -261,13 +321,6 @@ func (p *packer) scan(ctx context.Context, dir string, files []fs.Object) error 
 		}
 		p.smalls = append(p.smalls, o)
 		p.hidden[o.Remote()] = struct{}{}
-		if !listed {
-			var err error
-			if loose, err = p.dstFiles(ctx, dir); err != nil {
-				return err
-			}
-			listed = true
-		}
 		if d, ok := loose[path.Base(o.Remote())]; ok {
 			p.loose = append(p.loose, loosePair{o, d})
 		}
@@ -278,21 +331,111 @@ func (p *packer) scan(ctx context.Context, dir string, files []fs.Object) error 
 // dstFiles lists the loose files of dir at dst. The main pass lists the same
 // directories, and OpenList caches listings, so this is not a second round of
 // driver calls.
-func (p *packer) dstFiles(ctx context.Context, dir string) (map[string]fs.Object, error) {
+func (p *packer) dstFiles(ctx context.Context, dir string) (files map[string]fs.Object, hasPackDir bool, err error) {
 	entries, err := p.dst.List(ctx, dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrorDirNotFound) {
-			return nil, nil
+			return nil, false, nil
 		}
-		return nil, fmt.Errorf("list %q at dst: %w", dir, err)
+		return nil, false, fmt.Errorf("list %q at dst: %w", dir, err)
 	}
-	files := map[string]fs.Object{}
+	files = map[string]fs.Object{}
+	for _, e := range entries {
+		switch x := e.(type) {
+		case fs.Directory:
+			if path.Base(x.Remote()) == PackDirName {
+				hasPackDir = true
+			}
+		case fs.Object:
+			files[path.Base(x.Remote())] = x
+		}
+	}
+	return files, hasPackDir, nil
+}
+
+// noteV1 records dir's version 1 pack, if it has one.
+func (p *packer) noteV1(ctx context.Context, dir string) error {
+	m, _, err := loadV1(ctx, p.dst, dir)
+	if err != nil {
+		return fmt.Errorf("pack %q: read v1 index: %w", dir, err)
+	}
+	if m != nil {
+		p.v1 = append(p.v1, v1Dir{dir, m})
+	}
+	return nil
+}
+
+// findOrphanV1 finds version 1 packs in directories src no longer has.
+func (p *packer) findOrphanV1(ctx context.Context) error {
+	return walkDirs(ctx, p.dst, func(dir string, _ []fs.Object, subdirs []string) error {
+		if _, ok := p.visited[dir]; ok {
+			return nil
+		}
+		for _, d := range subdirs {
+			if d == PackDirName {
+				return p.noteV1(ctx, dir)
+			}
+		}
+		return nil
+	})
+}
+
+// removeV1 deletes the version 1 packs that now live in the job packs. The
+// root's v1 pack shares its directory with the job packs, so only its own
+// files go.
+func (p *packer) removeV1(ctx context.Context) error {
+	for _, d := range p.v1 {
+		if d.dir == "" {
+			if err := p.removeObject(ctx, packPath("", PackIndexName)); err != nil {
+				return fmt.Errorf("pack: remove v1 index: %w", err)
+			}
+			for name := range d.m.Packs {
+				if err := p.removeObject(ctx, packPath("", name)); err != nil {
+					return fmt.Errorf("pack: remove v1 pack %s: %w", name, err)
+				}
+			}
+		} else if err := p.removePackDir(ctx, d.dir); err != nil {
+			return err
+		}
+		addStats(ctx, func(s *PackStats) { s.V1MigratedDirs++ })
+	}
+	return nil
+}
+
+// removePackDir deletes dir's whole .oppack at dst, index first.
+func (p *packer) removePackDir(ctx context.Context, dir string) error {
+	pd := path.Join(dir, PackDirName)
+	entries, err := p.dst.List(ctx, pd)
+	if err != nil {
+		if errors.Is(err, fs.ErrorDirNotFound) {
+			return nil
+		}
+		return fmt.Errorf("pack %q: list %s: %w", dir, PackDirName, err)
+	}
+	var objs []fs.Object
 	for _, e := range entries {
 		if o, ok := e.(fs.Object); ok {
-			files[path.Base(o.Remote())] = o
+			objs = append(objs, o)
 		}
 	}
-	return files, nil
+	sort.SliceStable(objs, func(i, j int) bool {
+		return path.Base(objs[i].Remote()) == PackIndexName && path.Base(objs[j].Remote()) != PackIndexName
+	})
+	for _, o := range objs {
+		if err := o.Remove(ctx); err != nil {
+			return fmt.Errorf("pack %q: remove %s: %w", dir, o.Remote(), err)
+		}
+	}
+	// Local file systems (Windows) can briefly still list files just removed.
+	var rerr error
+	for i := 0; i < 5; i++ {
+		if rerr = p.dst.Rmdir(ctx, pd); rerr == nil {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	log.Warnf("[sync] pack: can't remove empty %s: %v", pd, rerr)
+	return nil
 }
 
 // changed compares a source file with its manifest entry: size and mtime
@@ -525,6 +668,85 @@ func (b *packBuilder) finish(ctx context.Context) error {
 		return fmt.Errorf("upload %s: %w", name, err)
 	}
 	addStats(ctx, func(s *PackStats) { s.PacksWritten++; s.BytesOut += w.n })
+	return nil
+}
+
+// migrate moves v1 members whose source is gone into the job packs without
+// recompressing them: the zip entry is copied raw under its full path.
+func (b *packBuilder) migrate(ctx context.Context, ms []migrant) error {
+	type key struct{ dir, pack string }
+	groups := map[key][]migrant{}
+	var keys []key
+	for _, mg := range ms {
+		k := key{mg.d.dir, mg.e.Pack}
+		if _, ok := groups[k]; !ok {
+			keys = append(keys, k)
+		}
+		groups[k] = append(groups[k], mg)
+	}
+	for _, k := range keys {
+		if err := b.migrateGroup(ctx, k.dir, k.pack, groups[k]); err != nil {
+			return fmt.Errorf("%s: %w", packPath(k.dir, k.pack), err)
+		}
+	}
+	return nil
+}
+
+func (b *packBuilder) migrateGroup(ctx context.Context, dir, pack string, ms []migrant) error {
+	o, err := b.p.dst.NewObject(ctx, packPath(dir, pack))
+	if err != nil {
+		return err
+	}
+	_, full := b.p.stage.newPath()
+	defer os.Remove(full)
+	sum, err := fetchTo(ctx, o, full)
+	if err != nil {
+		return err
+	}
+	if want := ms[0].d.m.Packs[pack].SHA1; want != "" && !strings.EqualFold(want, sum) {
+		return fmt.Errorf("pack is corrupt (sha1 %s, index says %s)", sum, want)
+	}
+	zr, err := zip.OpenReader(full)
+	if err != nil {
+		return err
+	}
+	defer zr.Close()
+	members := map[string]*zip.File{}
+	for _, zf := range zr.File {
+		members[zf.Name] = zf
+	}
+	for _, mg := range ms {
+		zf := members[mg.name]
+		if zf == nil {
+			return fmt.Errorf("%s is not in the pack", mg.name)
+		}
+		if int64(zf.UncompressedSize64) != mg.e.Size {
+			return fmt.Errorf("member %s is %d bytes, index says %d", mg.name, zf.UncompressedSize64, mg.e.Size)
+		}
+		if err := b.open(); err != nil {
+			return err
+		}
+		hdr := zf.FileHeader
+		hdr.Name = mg.remote
+		w, err := b.zw.CreateRaw(&hdr)
+		if err != nil {
+			return err
+		}
+		raw, err := zf.OpenRaw()
+		if err != nil {
+			return err
+		}
+		if _, err := io.Copy(w, raw); err != nil {
+			return err
+		}
+		mg.e.Pack = b.name
+		b.m.Files[mg.remote] = mg.e
+		b.members++
+		addStats(ctx, func(s *PackStats) { s.PackedFiles++ })
+		if err := b.rollIfFull(ctx); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 

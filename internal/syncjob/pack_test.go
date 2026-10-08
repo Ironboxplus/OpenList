@@ -652,3 +652,68 @@ func tempDir(t *testing.T) string {
 }
 
 var _ = io.EOF
+
+// --- migration from version 1 per-directory packs ---------------------------
+
+func TestPackMigratesVersion1DirectoryPacks(t *testing.T) {
+	mt := time.Date(2026, 9, 14, 10, 0, 0, 0, time.UTC)
+	for _, mode := range []syncjob.Mode{syncjob.ModeCopy, syncjob.ModeSync} {
+		m := newManager(t)
+		src, dst, out := tempDir(t), tempDir(t), tempDir(t)
+		// src still has a.json and b.json; c.json exists only in the v1 pack.
+		write(t, src, "old/dir/a.json", `{"a":1}`)
+		write(t, src, "old/dir/b.json", `{"b":2}`)
+		write(t, src, "rootfile.txt", "root")
+		write(t, src, "other/big.bin", strings.Repeat("B", 3000))
+		buildV1(t, dst, "old/dir", map[string]string{"a.json": `{"a":1}`, "b.json": `{"b":2}`, "c.json": `{"c":3}`}, mt)
+		buildV1(t, dst, "", map[string]string{"rootfile.txt": "root", "rootgone.txt": "only in v1"}, mt)
+		// A v1 directory src doesn't have any more.
+		buildV1(t, dst, "vanished", map[string]string{"x.json": `{"x":1}`}, mt)
+
+		s := mustSucceed(t, runJob(t, m, packSpec(mode, src, dst, syncjob.PackOptions{Threshold: 1024})))
+		if s.PackStats.V1MigratedDirs != 3 {
+			t.Fatalf("%s: v1_migrated_dirs = %d, want 3 (%+v)", mode, s.PackStats.V1MigratedDirs, s.PackStats)
+		}
+		for _, gone := range []string{"old/dir/.oppack", "vanished/.oppack", ".oppack/index.json", ".oppack/p-000001.zip"} {
+			if exists(dst, gone) {
+				t.Fatalf("%s: v1 leftover %s", mode, gone)
+			}
+		}
+		if !exists(dst, ".oppack/manifest.json.gz") || !exists(dst, "other/big.bin") {
+			t.Fatalf("%s: job manifest or large file missing", mode)
+		}
+		if loose := looseSmall(t, dst, 1024); len(loose) != 0 {
+			t.Fatalf("%s: loose small files %v", mode, loose)
+		}
+
+		mf := loadTestManifest(t, dst)
+		kept := "old/dir/a.json,old/dir/b.json,old/dir/c.json,rootfile.txt,rootgone.txt,vanished/x.json"
+		if mode == syncjob.ModeSync {
+			// Sync lets go of what src doesn't have.
+			kept = "old/dir/a.json,old/dir/b.json,rootfile.txt"
+		}
+		if got := strings.Join(fileNames(mf), ","); got != kept {
+			t.Fatalf("%s: manifest files = %s\nwant %s", mode, got, kept)
+		}
+		mustSucceed(t, runJob(t, m, unpackSpec(syncjob.ModeCopy, dst, out)))
+		for rel, want := range map[string]string{"old/dir/a.json": `{"a":1}`, "rootfile.txt": "root"} {
+			if got, _ := read(t, out, rel); got != want {
+				t.Fatalf("%s: %s = %q", mode, rel, got)
+			}
+		}
+		if mode == syncjob.ModeCopy {
+			// Members that existed only in v1 survive byte for byte.
+			for rel, want := range map[string]string{"old/dir/c.json": `{"c":3}`, "rootgone.txt": "only in v1", "vanished/x.json": `{"x":1}`} {
+				if got, _ := read(t, out, rel); got != want {
+					t.Fatalf("%s: migrated %s = %q, want %q", mode, rel, got, want)
+				}
+			}
+		}
+
+		// A second run has nothing left to migrate or write.
+		s = mustSucceed(t, runJob(t, m, packSpec(mode, src, dst, syncjob.PackOptions{Threshold: 1024})))
+		if s.PackStats.V1MigratedDirs != 0 || s.PackStats.PacksWritten != 0 {
+			t.Fatalf("%s: second run stats = %+v", mode, s.PackStats)
+		}
+	}
+}
