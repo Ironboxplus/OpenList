@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -30,6 +31,7 @@ import (
 var syncFlags struct {
 	server       string
 	token        string
+	tokenFile    string
 	dryRun       bool
 	sizeOnly     bool
 	trackRenames bool
@@ -264,6 +266,7 @@ func (c *syncClient) printEvents(id string) error {
 func addServerFlags(f *pflag.FlagSet) {
 	f.StringVar(&syncFlags.server, "server", "", "server base URL (default: this machine's server, from its config)")
 	f.StringVar(&syncFlags.token, "token", "", "admin token (default: read from the data directory)")
+	f.StringVar(&syncFlags.tokenFile, "token-file", "", "read the admin token from this file instead of --token")
 }
 
 // endpointArg normalises a command-line endpoint into the server's syntax:
@@ -290,6 +293,15 @@ type syncClient struct {
 
 func newSyncClient() (*syncClient, error) {
 	base, token := syncFlags.server, syncFlags.token
+	if token == "" && syncFlags.tokenFile != "" {
+		b, err := os.ReadFile(syncFlags.tokenFile)
+		if err != nil {
+			return nil, fmt.Errorf("read --token-file: %w", err)
+		}
+		if token = strings.TrimSpace(string(b)); token == "" {
+			return nil, fmt.Errorf("--token-file %s is empty", syncFlags.tokenFile)
+		}
+	}
 	if base == "" || token == "" {
 		bootstrap.InitConfig()
 		if base == "" {
@@ -345,8 +357,41 @@ func (c *syncClient) call(method, path string, body, out any) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", c.token)
 	req.Header.Set("Content-Type", "application/json")
+	return c.roundTrip(req, method, path, out)
+}
+
+// Call and Upload let the media commands use this client.
+func (c *syncClient) Call(method, path string, body, out any) error {
+	return c.call(method, path, body, out)
+}
+
+// Upload posts data as a multipart form file.
+func (c *syncClient) Upload(path, field, filename string, data []byte, out any) error {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, err := mw.CreateFormFile(field, filename)
+	if err != nil {
+		return err
+	}
+	if _, err := fw.Write(data); err != nil {
+		return err
+	}
+	if err := mw.Close(); err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, c.base+path, &buf)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	return c.roundTrip(req, http.MethodPost, path, out)
+}
+
+// roundTrip sends req with the admin token and unwraps the {code, message,
+// data} envelope.
+func (c *syncClient) roundTrip(req *http.Request, method, path string, out any) error {
+	req.Header.Set("Authorization", c.token)
 	resp, err := c.http.Do(req)
 	if err != nil {
 		return fmt.Errorf("can't reach the OpenList server at %s (is it running?): %w", c.base, err)
