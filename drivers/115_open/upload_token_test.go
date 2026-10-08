@@ -2,7 +2,9 @@ package _115_open
 
 import (
 	"context"
+	"github.com/OpenListTeam/OpenList/v4/internal/lane"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -87,8 +89,8 @@ func TestUploadTokenRefreshReplacesRejectedTokenOnlyOnce(t *testing.T) {
 }
 
 func TestFormatAPIStatsLine(t *testing.T) {
-	line := formatAPIStats(map[string]int64{"UploadInit": 5, "Get": 3, "MakeDir": 1, "Link": 2}, 12340*time.Millisecond)
-	want := "api 60s: total=11 UploadInit=5 Get=3 List=0 GetToken=0 Link=2 MakeDir=1 waited=12.3s"
+	line := formatAPIStats(map[string]int64{"UploadInit": 5, "Get": 3, "MakeDir": 1, "Link": 2}, 2340*time.Millisecond, 10*time.Second)
+	want := "api 60s: total=11 UploadInit=5 Get=3 List=0 GetToken=0 Link=2 MakeDir=1 waited=12.3s fg_waited=2.3s bg_waited=10.0s"
 	if line != want {
 		t.Fatalf("line = %q\nwant   %q", line, want)
 	}
@@ -102,11 +104,38 @@ func TestWaitAPICountsCallsAndTakeResets(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	counts, _ := takeAPIStats()
+	counts, _, _ := takeAPIStats()
 	if counts["List"] != 2 || counts["UploadInit"] != 1 {
 		t.Fatalf("counts = %v", counts)
 	}
-	if again, _ := takeAPIStats(); len(again) != 0 || strings.Contains(formatAPIStats(again, 0), "total=1") {
+	if again, _, _ := takeAPIStats(); len(again) != 0 || strings.Contains(formatAPIStats(again, 0, 0), "total=1") {
 		t.Fatalf("counts not reset: %v", again)
+	}
+}
+
+func TestWaitAPISplitsWaitByLaneAndForegroundJumpsTheQueue(t *testing.T) {
+	takeAPIStats()
+	d := &Open115{limiter: lane.NewLimiter(50)} // a token every 20ms
+	bg := lane.WithBackground(context.Background())
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = d.waitAPI(bg, "UploadInit")
+		}()
+	}
+	time.Sleep(60 * time.Millisecond)
+	start := time.Now()
+	if err := d.waitAPI(context.Background(), "List"); err != nil {
+		t.Fatal(err)
+	}
+	if waited := time.Since(start); waited > 80*time.Millisecond {
+		t.Fatalf("a UI List waited %v behind the sync queue", waited)
+	}
+	wg.Wait()
+	_, fg, bgWaited := takeAPIStats()
+	if bgWaited <= fg || bgWaited < 100*time.Millisecond {
+		t.Fatalf("fg waited %v, bg waited %v: the lanes aren't accounted separately", fg, bgWaited)
 	}
 }

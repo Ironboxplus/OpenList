@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/cmd/flags"
+	"github.com/OpenListTeam/OpenList/v4/internal/lane"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/rclonefs"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils/random"
@@ -211,7 +212,9 @@ func (m *Manager) Start(spec Spec) (Snapshot, error) {
 	if _, err := filter.NewFilter(&fo); err != nil {
 		return Snapshot{}, fmt.Errorf("filters: %w", err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	// A job's storage calls are bulk work: they queue behind interactive
+	// requests for a drive's rate limit.
+	ctx, cancel := context.WithCancel(lane.WithBackground(context.Background()))
 	src, err := resolve(ctx, spec.Src)
 	if err != nil {
 		cancel()

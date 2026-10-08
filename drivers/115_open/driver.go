@@ -1,6 +1,7 @@
 package _115_open
 
 import (
+	"github.com/OpenListTeam/OpenList/v4/internal/lane"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -33,7 +34,7 @@ type Open115 struct {
 	Addition
 	client     *sdk.Client
 	tokens     uploadTokenCache
-	limiter    *rate.Limiter
+	limiter    *lane.Limiter
 	parentPath string
 	// tokenInvalid records that this driver instance most recently reported the
 	// token dead. It is consumed only by shouldNotifyTokenValid, to detect an
@@ -167,7 +168,7 @@ func (d *Open115) shouldNotifyTokenValid() bool {
 
 func (d *Open115) initLimiter() {
 	if d.Addition.LimitRate > 0 {
-		d.limiter = rate.NewLimiter(rate.Limit(d.Addition.LimitRate), 1)
+		d.limiter = lane.NewLimiter(rate.Limit(d.Addition.LimitRate))
 		return
 	}
 	d.limiter = nil

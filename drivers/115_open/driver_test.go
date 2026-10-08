@@ -1,6 +1,7 @@
 package _115_open
 
 import (
+	"github.com/OpenListTeam/OpenList/v4/internal/lane"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1104,7 +1105,7 @@ func (m *mockFileStreamer) CacheFullAndWriter(_ *model.UpdateProgress, _ io.Writ
 func newTestOpen115WithRateLimit(t *testing.T, limitRate float64, responder http.HandlerFunc) (*Open115, func() []recordedRequest) {
 	t.Helper()
 	driver, requests := newTestOpen115(t, "trash", responder)
-	driver.limiter = rate.NewLimiter(rate.Limit(limitRate), 1)
+	driver.limiter = lane.NewLimiter(rate.Limit(limitRate))
 	return driver, requests
 }
 
