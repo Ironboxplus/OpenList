@@ -115,6 +115,10 @@ func Init(e *gin.Engine) {
 	api.GET("/plugin/manifest", handles.PluginManifest)
 	api.GET("/plugin/asset/:name", handles.PluginAsset)
 
+	// Media images: <img> can't send Authorization, so the URL carries a
+	// signature over "/media/asset/<id>" (see handles.MediaAsset).
+	api.GET("/media/asset/:id", handles.MediaAsset)
+
 	// Cluster storage-sync peer endpoint: a persistent WebSocket so NAT'd nodes
 	// can dial out and stay connected. Authentication/encryption come from the
 	// cluster pre-shared key (per-frame AEAD), not the HTTP layer.
@@ -176,6 +180,16 @@ func admin(g *gin.RouterGroup) {
 	syncGrp.GET("/history", handles.SyncHistory)
 	syncGrp.GET("/bwlimit", handles.SyncBwLimit)
 	syncGrp.POST("/bwlimit", handles.SyncBwLimit)
+
+	mediaGrp := g.Group("/media")
+	mediaGrp.POST("/set", handles.MediaSet)
+	mediaGrp.POST("/delete", handles.MediaDelete)
+	mediaGrp.GET("/list", handles.MediaAdminList)
+	mediaGrp.POST("/asset", handles.MediaAssetUpload)
+	mediaGrp.POST("/scrape", handles.MediaScrape)
+	mediaGrp.GET("/search", handles.MediaSearch)
+	mediaGrp.GET("/export", handles.MediaExport)
+	mediaGrp.POST("/import", handles.MediaImport)
 
 	// Admin-only user operations (create/delete/role-affecting). The profile-edit
 	// endpoints (list/get/update) live in a separate group that also accepts a
@@ -248,6 +262,8 @@ func fsAndShare(g *gin.RouterGroup) {
 	g.Any("/get", handles.FsGetSplit)
 	g.POST("/video_play", handles.FsVideoPlay)
 	g.POST("/video_subtitle", handles.FsVideoSubtitle)
+	// Media info of a directory: reads the database only, never the storage.
+	g.POST("/media", handles.FsMedia)
 	a := g.Group("/archive")
 	a.Any("/meta", handles.FsArchiveMetaSplit)
 	a.Any("/list", handles.FsArchiveListSplit)

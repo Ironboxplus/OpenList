@@ -25,14 +25,16 @@ func likeEscape(s string) string {
 
 // GetMediaItemByPath returns (nil, nil) when there is no item at path.
 func GetMediaItemByPath(path string) (*model.MediaItem, error) {
-	var it model.MediaItem
-	if err := db.Where("path = ?", path).First(&it).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, nil
-		}
+	// Find+Limit rather than First: a missing item is normal and must not
+	// log "record not found".
+	var items []model.MediaItem
+	if err := db.Where("path = ?", path).Limit(1).Find(&items).Error; err != nil {
 		return nil, errors.WithStack(err)
 	}
-	return &it, nil
+	if len(items) == 0 {
+		return nil, nil
+	}
+	return &items[0], nil
 }
 
 // GetMediaItemsByPaths returns the items at exactly these paths.
@@ -188,25 +190,25 @@ func deleteMediaItems(cond *gorm.DB) (int64, error) {
 // ---- assets ----
 
 func GetMediaAsset(id uint) (*model.MediaAsset, error) {
-	var a model.MediaAsset
-	if err := db.First(&a, id).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, nil
-		}
+	var as []model.MediaAsset
+	if err := db.Where("id = ?", id).Limit(1).Find(&as).Error; err != nil {
 		return nil, errors.WithStack(err)
 	}
-	return &a, nil
+	if len(as) == 0 {
+		return nil, nil
+	}
+	return &as[0], nil
 }
 
 func GetMediaAssetBySHA(sha string) (*model.MediaAsset, error) {
-	var a model.MediaAsset
-	if err := db.Where("sha256 = ?", sha).First(&a).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, nil
-		}
+	var as []model.MediaAsset
+	if err := db.Where("sha256 = ?", sha).Limit(1).Find(&as).Error; err != nil {
 		return nil, errors.WithStack(err)
 	}
-	return &a, nil
+	if len(as) == 0 {
+		return nil, nil
+	}
+	return &as[0], nil
 }
 
 func GetMediaAssets(ids []uint) ([]model.MediaAsset, error) {

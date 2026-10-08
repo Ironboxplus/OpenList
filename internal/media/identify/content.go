@@ -75,7 +75,7 @@ func episodeOf(name string) (epMatch, bool) {
 		if i == 0 {
 			return epMatch{Season: get(1), Episode: get(2), Cut: m[0]}, true
 		}
-		return epMatch{Season: 1, Episode: get(1), Cut: m[0]}, true
+		return epMatch{Episode: get(1), Cut: m[0]}, true
 	}
 	return epMatch{}, false
 }
@@ -248,4 +248,35 @@ func multiPart(videos []Entry) bool {
 		}
 	}
 	return n == len(videos)
+}
+
+// EpisodeOf finds the season and episode a file name carries. Season is 0
+// when the name has an episode number but no season ("S01E03" gives 1).
+func EpisodeOf(name string) (season, episode int, ok bool) {
+	m, ok := episodeOf(name)
+	return m.Season, m.Episode, ok
+}
+
+// IsSeasonDir reports whether a directory name is a season of a show.
+func IsSeasonDir(name string) bool { return seasonDirRe.MatchString(name) }
+
+// IsExtraDir reports whether a directory name holds extras, not a work.
+func IsExtraDir(name string) bool { return extraDirRe.MatchString(name) }
+
+// SeasonOfDir returns the season number a directory name carries ("Season 2",
+// "第3季"), or 0.
+func SeasonOfDir(name string) int {
+	if m := seasonRe.FindStringSubmatch(name); m != nil {
+		switch {
+		case m[1] != "":
+			n, _ := strconv.Atoi(m[1])
+			return n
+		case m[3] != "":
+			n, _ := strconv.Atoi(m[3])
+			return n
+		case m[4] != "":
+			return cnToInt(m[4])
+		}
+	}
+	return 0
 }
