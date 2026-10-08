@@ -60,6 +60,21 @@ type Searcher interface {
 	Identify(ctx context.Context, kind string, theatrical bool, q scraper.IdentifyQuery) ([]scraper.Candidate, error)
 }
 
+// TMDBResolver turns an inline id tag into a typed TMDB id ("tv/39218").
+// *scraper.Set is one; the remote searcher is not (the server has no such
+// endpoint), so a tmdb tag is then taken at its word and an imdb tag ignored.
+type TMDBResolver interface {
+	ResolveTMDB(ctx context.Context, hint, tmdb, imdb string) (string, error)
+}
+
+// tmdbHint is the TMDB type an identification most likely is.
+func tmdbHint(kind string, theatrical bool) string {
+	if kind == "movie" || (kind == "anime" && theatrical) {
+		return "movie"
+	}
+	return "tv"
+}
+
 // Downloader fetches an image.
 type Downloader func(ctx context.Context, url string) ([]byte, error)
 

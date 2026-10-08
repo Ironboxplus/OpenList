@@ -25,6 +25,8 @@ type NameInfo struct {
 	TVHint     bool   // season / episode markers in the name
 	Collection bool   // 合集 / 系列 / 三部曲 ...
 	Theatrical bool   // 剧场版 / 映画 / Movie in the name
+	TMDBID     string // inline {tmdb-123} tag: the number
+	IMDbID     string // inline {imdb-tt0112159} tag
 	Parsed     scraper.ParsedName
 }
 
@@ -85,6 +87,31 @@ var (
 	ostRe      = regexp.MustCompile(`(?i)\bOST\b|原声带|原声大碟|配乐|soundtrack`)
 	cnNumber   = map[rune]int{'一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10}
 )
+
+// idTagRe matches Jellyfin/Plex style tags: {tmdb-123}, {tmdbid-123},
+// [tmdbid=123], {imdb-tt0112159}, [imdbid-tt0112159].
+var idTagRe = regexp.MustCompile(`(?i)[\{\[\(]\s*(tmdb|imdb)(?:id)?\s*[-=:_ ]\s*(tt\d{5,}|\d+)\s*[\}\]\)]`)
+
+// ExtractIDTags removes inline provider id tags from a name and returns them.
+// A tmdb tag holds digits, an imdb tag "tt" and digits; a mismatched tag is
+// removed but ignored.
+func ExtractIDTags(name string) (clean, tmdb, imdb string) {
+	clean = idTagRe.ReplaceAllStringFunc(name, func(m string) string {
+		sm := idTagRe.FindStringSubmatch(m)
+		id := strings.ToLower(sm[2])
+		switch {
+		case strings.EqualFold(sm[1], "tmdb") && isAllDigits(id):
+			tmdb = id
+		case strings.EqualFold(sm[1], "imdb") && strings.HasPrefix(id, "tt"):
+			imdb = id
+		}
+		return " "
+	})
+	if clean != name {
+		clean = strings.Join(strings.Fields(clean), " ")
+	}
+	return clean, tmdb, imdb
+}
 
 func cnToInt(s string) int {
 	if n, err := strconv.Atoi(s); err == nil {
@@ -159,6 +186,7 @@ func ParseName(name string, isFile bool) NameInfo {
 	if isFile && IsVideo(name) {
 		name = stem(name)
 	}
+	name, ni.TMDBID, ni.IMDbID = ExtractIDTags(name)
 	ni.Collection = collRe.MatchString(name)
 	ni.Theatrical = theatreRe.MatchString(name)
 

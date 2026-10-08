@@ -567,3 +567,47 @@ func contains(ss []string, s string) bool {
 	}
 	return false
 }
+
+func TestResolveTMDBFromInlineTags(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/3/tv/39218", "/3/movie/550":
+			_, _ = w.Write([]byte(`{"id":1}`))
+		case "/3/find/tt0112159":
+			if r.URL.Query().Get("external_source") != "imdb_id" {
+				t.Error("find without external_source=imdb_id")
+			}
+			_, _ = w.Write([]byte(`{"movie_results":[{"id":9}],"tv_results":[{"id":890}]}`))
+		case "/3/find/tt0000001":
+			_, _ = w.Write([]byte(`{"movie_results":[],"tv_results":[]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	cfg := fastConfig(map[string]string{"tmdb": srv.URL + "/3"})
+	cfg.TMDBToken = fakeBearer
+	set, _ := NewSet(cfg)
+	ctx := context.Background()
+	for _, c := range []struct{ hint, tmdb, imdb, want string }{
+		{"tv", "39218", "", "tv/39218"},
+		{"movie", "39218", "", "tv/39218"}, // the hint's type doesn't exist: the other one does
+		{"movie", "550", "", "movie/550"},
+		{"tv", "", "tt0112159", "tv/890"},
+		{"movie", "", "tt0112159", "movie/9"},
+		{"tv", "404", "tt0112159", "tv/890"}, // unknown tmdb number: fall back to imdb
+	} {
+		got, err := set.ResolveTMDB(ctx, c.hint, c.tmdb, c.imdb)
+		if err != nil || got != c.want {
+			t.Errorf("%+v: got %q, %v", c, got, err)
+		}
+	}
+	if _, err := set.ResolveTMDB(ctx, "tv", "404", ""); ClassOf(err) != ClassNotFound {
+		t.Errorf("unknown id: %v", err)
+	}
+	if _, err := set.ResolveTMDB(ctx, "tv", "", "tt0000001"); ClassOf(err) != ClassNotFound {
+		t.Errorf("empty find: %v", err)
+	}
+}

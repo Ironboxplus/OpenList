@@ -176,3 +176,47 @@ func (s *Set) Episodes(ctx context.Context, tg *ScrapeTarget) ([]EpisodeInfo, er
 	}
 	return nil, nil
 }
+
+// ResolveTMDB turns an inline id tag into a TMDB id with its type ("tv/39218").
+// A tmdb number has no type, so the hint ("tv" or "movie") is tried first and
+// the other type second; an imdb id goes through TMDB's /find, preferring the
+// hint's type when it matches both. The tmdb number wins when both are given.
+func (s *Set) ResolveTMDB(ctx context.Context, hint, tmdb, imdb string) (string, error) {
+	if s.TMDB == nil {
+		return "", notConfigured(ProviderTMDB)
+	}
+	if hint != "tv" {
+		hint = "movie"
+	}
+	if tmdb != "" {
+		other := map[string]string{"tv": "movie", "movie": "tv"}[hint]
+		err := s.TMDB.Exists(ctx, hint, tmdb)
+		if err == nil {
+			return hint + "/" + tmdb, nil
+		}
+		if ClassOf(err) != ClassNotFound {
+			return "", err
+		}
+		if err2 := s.TMDB.Exists(ctx, other, tmdb); err2 == nil {
+			return other + "/" + tmdb, nil
+		} else if ClassOf(err2) != ClassNotFound {
+			return "", err2
+		}
+		if imdb == "" {
+			return "", err
+		}
+	}
+	ids, err := s.TMDB.FindIMDb(ctx, imdb)
+	if err != nil {
+		return "", err
+	}
+	if len(ids) == 0 {
+		return "", &Error{Provider: ProviderTMDB, Class: ClassNotFound, Msg: "no tmdb entry for " + imdb}
+	}
+	for _, id := range ids {
+		if strings.HasPrefix(id, hint+"/") {
+			return id, nil
+		}
+	}
+	return ids[0], nil
+}

@@ -84,7 +84,21 @@ func (o *Orchestrator) ScrapeOne(ctx context.Context, p string, opts ScrapeOpts)
 
 	req := model.MediaSetReq{Path: p, Kind: &r.Kind, Locked: &lock}
 
-	if !explicit {
+	inline := false
+	if !explicit && r.Kind != "ignore" && r.Kind != "collection" && (r.TMDBID != "" || r.IMDbID != "") {
+		id, rerr := o.Providers.ResolveTMDB(ctx, tmdbHint(r.Kind, r.Theatrical), r.TMDBID, r.IMDbID)
+		switch {
+		case rerr == nil:
+			opts.Provider, opts.ID, inline = scraper.ProviderTMDB, id, true
+			res.Confidence = 1
+		case fatal(rerr):
+			return nil, rerr
+		default:
+			o.logf("inline id tag of %s not usable: %v", p, rerr)
+		}
+	}
+
+	if !explicit && !inline {
 		if r.Kind == "ignore" || r.Kind == "collection" {
 			src := model.MediaSourceRule
 			req.Title, req.Year, req.Source, req.Confidence = ptr(r.Title), ptr(r.Year), &src, ptr(r.Confidence)
@@ -127,7 +141,7 @@ func (o *Orchestrator) ScrapeOne(ctx context.Context, p string, opts ScrapeOpts)
 		opts.Provider, opts.ID = best.Provider, best.ID
 		res.Confidence = best.Score
 		res.Candidates = nil
-	} else {
+	} else if explicit {
 		res.Confidence = 1
 	}
 

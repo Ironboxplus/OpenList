@@ -25,6 +25,8 @@ type Result struct {
 	Why        string
 	Parsed     scraper.ParsedName // for building search terms
 	Group      string
+	TMDBID     string // inline id tag in the name (digits); wins over any search
+	IMDbID     string
 }
 
 // Terms are the queries to send to a provider, best first.
@@ -52,7 +54,7 @@ func Classify(name string, isDir bool, entries []Entry) Result {
 	ni := ParseName(name, !isDir)
 	r := Result{
 		Title: ni.Title, English: ni.English, Year: ni.Year, Season: ni.Season,
-		Episodes: ni.Episodes, Parsed: ni.Parsed, Group: ni.Group,
+		Episodes: ni.Episodes, Parsed: ni.Parsed, Group: ni.Group, TMDBID: ni.TMDBID, IMDbID: ni.IMDbID,
 	}
 
 	var shape Shape

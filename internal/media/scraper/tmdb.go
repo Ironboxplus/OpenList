@@ -418,3 +418,35 @@ func firstNonEmpty(ss ...string) string {
 func round1(f float64) float64 {
 	return float64(int(f*10+0.5)) / 10
 }
+
+// Exists checks that kind ("tv" or "movie") has an entry num. A missing one is
+// class not_found.
+func (t *TMDB) Exists(ctx context.Context, kind, num string) error {
+	var d struct {
+		ID int `json:"id"`
+	}
+	return t.get(ctx, "/"+kind+"/"+url.PathEscape(num), nil, &d)
+}
+
+// FindIMDb maps an imdb id to TMDB ids ("movie/550", "tv/890"), movies first.
+func (t *TMDB) FindIMDb(ctx context.Context, imdb string) ([]string, error) {
+	var resp struct {
+		Movies []struct {
+			ID int `json:"id"`
+		} `json:"movie_results"`
+		TV []struct {
+			ID int `json:"id"`
+		} `json:"tv_results"`
+	}
+	if err := t.get(ctx, "/find/"+url.PathEscape(imdb), url.Values{"external_source": {"imdb_id"}}, &resp); err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, m := range resp.Movies {
+		out = append(out, "movie/"+strconv.Itoa(m.ID))
+	}
+	for _, m := range resp.TV {
+		out = append(out, "tv/"+strconv.Itoa(m.ID))
+	}
+	return out, nil
+}

@@ -122,6 +122,15 @@ func (o *Orchestrator) resolve(ctx context.Context, p string, r identify.Result)
 	if r.Kind == "ignore" || r.Kind == "collection" || o.search() == nil {
 		return row, nil
 	}
+	if r.TMDBID != "" || r.IMDbID != "" {
+		done, err := o.resolveInline(ctx, &row, r)
+		if err != nil {
+			return row, err
+		}
+		if done {
+			return row, nil
+		}
+	}
 	q := scraper.IdentifyQuery{Terms: r.Terms(), Year: r.Year, English: r.English}
 	cs, err := o.search().Identify(ctx, r.Kind, r.Theatrical, q)
 	if err != nil && fatal(err) {
@@ -161,6 +170,46 @@ func (o *Orchestrator) resolve(ctx context.Context, p string, r identify.Result)
 		row.Note += " [kind guessed from the name]"
 	}
 	return row, nil
+}
+
+// resolveInline settles a row from an id tag in the name: confidence 1, no
+// search. It reports done=false when the tag can't be used (the search then
+// runs as usual); only a network or auth failure is an error.
+func (o *Orchestrator) resolveInline(ctx context.Context, row *Row, r identify.Result) (done bool, err error) {
+	hint := tmdbHint(r.Kind, r.Theatrical)
+	var rs TMDBResolver
+	if o.Providers != nil {
+		rs = o.Providers
+	} else if x, ok := o.search().(TMDBResolver); ok {
+		rs = x
+	}
+	var id string
+	switch {
+	case rs != nil:
+		id, err = rs.ResolveTMDB(ctx, hint, r.TMDBID, r.IMDbID)
+		if err != nil {
+			if fatal(err) {
+				row.Confidence = 0
+				row.Note = "inline id lookup failed: " + err.Error()
+				return false, err
+			}
+			row.Note += "; inline id not usable: " + err.Error()
+			return false, nil
+		}
+	case r.TMDBID != "":
+		id = hint + "/" + r.TMDBID
+	default:
+		return false, nil
+	}
+	row.Provider, row.ID, row.Confidence = scraper.ProviderTMDB, id, 1
+	row.Note = "inline id tag in the name"
+	switch {
+	case strings.HasPrefix(id, "movie/") && row.Kind == "tv":
+		row.Kind = "movie"
+	case strings.HasPrefix(id, "tv/") && row.Kind == "movie":
+		row.Kind = "tv"
+	}
+	return true, nil
 }
 
 func candidateNote(cs []scraper.Candidate, n int) string {

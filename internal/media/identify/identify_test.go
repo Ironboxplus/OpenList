@@ -205,3 +205,31 @@ func TestUnlistedDirectoryIsLowConfidence(t *testing.T) {
 		t.Fatalf("collection word ignored: %+v", r)
 	}
 }
+
+func TestInlineIDTags(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		isDir      bool
+		title      string
+		year       int
+		tmdb, imdb string
+	}{
+		{"魔法少女小圆 (2011) {tmdb-39218}", true, "魔法少女小圆", 2011, "39218", ""},
+		{"杀戮都市 (2004) {tmdb-11279}", true, "杀戮都市", 2004, "11279", ""},
+		{"Fight Club (1999) {tmdbid-550}", true, "Fight Club", 1999, "550", ""},
+		{"Fight Club (1999) [tmdbid=550]", true, "Fight Club", 1999, "550", ""},
+		{"Se7en (1995) {imdb-tt0114369}", true, "Se7en", 1995, "", "tt0114369"},
+		{"Se7en (1995) [imdbid-tt0114369]", true, "Se7en", 1995, "", "tt0114369"},
+		{"盗梦空间 (2010) {tmdb-27205}.mkv", false, "盗梦空间", 2010, "27205", ""},
+		{"Alien (1979) {tmdb-348} {imdb-tt0078748}", true, "Alien", 1979, "348", "tt0078748"},
+		{"魔法少女小圆 (2011)", true, "魔法少女小圆", 2011, "", ""},
+	} {
+		r := Classify(c.name, c.isDir, []Entry{})
+		if r.TMDBID != c.tmdb || r.IMDbID != c.imdb || r.Title != c.title || r.Year != c.year {
+			t.Errorf("%s: tmdb=%q imdb=%q title=%q year=%d", c.name, r.TMDBID, r.IMDbID, r.Title, r.Year)
+		}
+	}
+	if clean, tm, im := ExtractIDTags("X {tmdb-abc} {imdb-12}"); tm != "" || im != "" || clean != "X {tmdb-abc}" {
+		t.Errorf("malformed tags: %q %q %q", clean, tm, im)
+	}
+}

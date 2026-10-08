@@ -351,3 +351,65 @@ func TestLibraryRootsAreNotPlannedOrScraped(t *testing.T) {
 		t.Fatalf("apply: %v %+v", err, rep)
 	}
 }
+
+// resolverSearch is a Searcher that must not be asked to search when an id tag
+// settles the row.
+type resolverSearch struct {
+	fakeSearch
+	resolved [][3]string
+}
+
+func (r *resolverSearch) ResolveTMDB(_ context.Context, hint, tmdb, imdb string) (string, error) {
+	r.resolved = append(r.resolved, [3]string{hint, tmdb, imdb})
+	if tmdb == "11279" {
+		return "tv/11279", nil
+	}
+	return "movie/550", nil
+}
+
+func TestPlanUsesInlineIDTags(t *testing.T) {
+	root := "/lib"
+	ls := &fakeLister{tree: map[string][]identify.Entry{
+		root: {
+			{Name: "杀戮都市 (2004) {tmdb-11279}", IsDir: true},
+			{Name: "Fight Club (1999) {imdb-tt0137523}.mkv", Size: 4 << 30},
+		},
+		root + "/杀戮都市 (2004) {tmdb-11279}": {{Name: "Season 1", IsDir: true}, {Name: "Season 2", IsDir: true}},
+	}}
+	s := &resolverSearch{}
+	o := &Orchestrator{Lister: ls, Writer: newMemWriter(), Search: s}
+	res, err := o.Plan(context.Background(), PlanOpts{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.queries != 0 {
+		t.Errorf("searched %d times although the names carry ids", s.queries)
+	}
+	byPath := map[string]Row{}
+	for _, r := range res.Rows {
+		byPath[r.Path] = r
+	}
+	a := byPath[root+"/杀戮都市 (2004) {tmdb-11279}"]
+	if a.Provider != "tmdb" || a.ID != "tv/11279" || a.Confidence != 1 || a.Kind != "tv" || a.Year != 2004 {
+		t.Errorf("folder row: %+v", a)
+	}
+	b := byPath[root+"/Fight Club (1999) {imdb-tt0137523}.mkv"]
+	if b.Provider != "tmdb" || b.ID != "movie/550" || b.Confidence != 1 || b.Kind != "movie" {
+		t.Errorf("file row: %+v", b)
+	}
+	if len(s.resolved) != 2 || s.resolved[0] != ([3]string{"movie", "", "tt0137523"}) || s.resolved[1] != ([3]string{"tv", "11279", ""}) {
+		t.Errorf("resolver calls: %v", s.resolved)
+	}
+
+	// without a resolver (the server-side search) a tmdb tag is taken as is
+	o2 := &Orchestrator{Lister: ls, Writer: newMemWriter(), Search: &fakeSearch{}}
+	res, err = o2.Plan(context.Background(), PlanOpts{Root: root})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range res.Rows {
+		if r.Path == root+"/杀戮都市 (2004) {tmdb-11279}" && (r.ID != "tv/11279" || r.Confidence != 1) {
+			t.Errorf("remote row: %+v", r)
+		}
+	}
+}
