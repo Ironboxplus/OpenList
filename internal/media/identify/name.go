@@ -284,6 +284,15 @@ func ParseName(name string, isFile bool) NameInfo {
 	if core == "" {
 		core = titleBracket
 	}
+	if core == "" && titleBracket == "" {
+		// a name that is only a number ("1917") is a title
+		for _, s := range segs {
+			if !s.bracket && isAllDigits(strings.TrimSpace(s.text)) {
+				core = strings.TrimSpace(s.text)
+				break
+			}
+		}
+	}
 	core = strings.TrimSpace(core)
 
 	// 6. years glued to Chinese titles: 傲慢与偏见2005, 三国演义94版
@@ -334,6 +343,12 @@ func ParseName(name string, isFile bool) NameInfo {
 		default:
 			ni.Title = core
 		}
+	}
+	if yearRe.MatchString(core) {
+		// "1917" alone is the title; only a bracketed year can be the year
+		year = yearBracket
+		ni.Title, ni.English, ni.Chinese = core, core, ""
+		ni.Parsed.English, ni.Parsed.Chinese = core, ""
 	}
 	ni.Year = year
 	// a bare number is a title, not a year ("1917")

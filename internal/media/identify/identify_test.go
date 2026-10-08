@@ -233,3 +233,32 @@ func TestInlineIDTags(t *testing.T) {
 		t.Errorf("malformed tags: %q %q %q", clean, tm, im)
 	}
 }
+
+func TestYearFirstNamesAndResolutionTokens(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		title string
+		year  int
+	}{
+		{"1995.Toy.Story.1920x1080.BDRip.x264.DTS-HD.MA.mkv", "Toy Story", 1995},
+		{"2001.Monsters,.Inc..1920x1036.BDRip.x264.DTS-HD.MA.mkv", "Monsters, Inc", 2001},
+		{"2008.WALL-E.1920x802.BDRip.x264.DTS-HD.MA.mkv", "WALL E", 2008},
+		{"1995 Toy Story 1920x1080 BDRip.mkv", "Toy Story", 1995},
+		{"2008.瓦力.WALL-E.1080p.mkv", "瓦力", 2008},
+		// numbers that are part of the title stay in it
+		{"1917.2019.1080p.BluRay.mkv", "1917", 2019},
+		{"1917.mkv", "1917", 0},
+		{"1917 (2019).mkv", "1917", 2019},
+		{"2001.A.Space.Odyssey.1968.1080p.mkv", "2001 A Space Odyssey", 1968},
+		{"300.斯巴达勇士.2006.mkv", "斯巴达勇士", 2006},
+		{"The.Dark.Knight.2008.1080p.BluRay.mkv", "The Dark Knight", 2008},
+	} {
+		r := Classify(c.name, false, nil)
+		if r.Kind != "movie" || r.Title != c.title || r.Year != c.year {
+			t.Errorf("%s: kind=%s title=%q year=%d, want %q %d", c.name, r.Kind, r.Title, r.Year, c.title, c.year)
+		}
+		if len(r.Terms()) == 0 {
+			t.Errorf("%s: no search terms", c.name)
+		}
+	}
+}
