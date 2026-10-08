@@ -249,6 +249,16 @@ func InitialSettings() []model.SettingItem {
 		{Key: conf.StreamMaxClientUploadSpeed, Value: "-1", Type: conf.TypeNumber, Group: model.TRAFFIC, Flag: model.PRIVATE},
 		{Key: conf.StreamMaxServerDownloadSpeed, Value: "-1", Type: conf.TypeNumber, Group: model.TRAFFIC, Flag: model.PRIVATE},
 		{Key: conf.StreamMaxServerUploadSpeed, Value: "-1", Type: conf.TypeNumber, Group: model.TRAFFIC, Flag: model.PRIVATE},
+
+		// media scraping settings. The keys are PRIVATE so they never reach
+		// /api/public/settings.
+		{Key: conf.MediaEnabled, Value: "true", Type: conf.TypeBool, Group: model.MEDIA, Flag: model.PUBLIC},
+		{Key: conf.MediaTMDBToken, Value: "", Type: conf.TypeString, Group: model.MEDIA, Flag: model.PRIVATE, Help: "TMDB v4 read token (Bearer) or v3 api key"},
+		{Key: conf.MediaOMDbKeys, Value: "", Type: conf.TypeString, Group: model.MEDIA, Flag: model.PRIVATE, Help: "OMDb api keys, comma separated; one is picked per request"},
+		{Key: conf.MediaDoubanAPIKey, Value: "", Type: conf.TypeString, Group: model.MEDIA, Flag: model.PRIVATE},
+		{Key: conf.MediaLanguage, Value: "zh-CN", Type: conf.TypeString, Group: model.MEDIA, Flag: model.PUBLIC},
+		{Key: conf.MediaHTTPProxy, Value: "", Type: conf.TypeString, Group: model.MEDIA, Flag: model.PRIVATE, Help: "outbound proxy for server-side scraping"},
+		{Key: conf.MediaScraperTimeout, Value: "15", Type: conf.TypeNumber, Group: model.MEDIA, Flag: model.PUBLIC},
 	}
 	additionalSettingItems := tool.Tools.Items()
 	// 固定顺序

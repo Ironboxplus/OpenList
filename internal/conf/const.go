@@ -161,6 +161,15 @@ const (
 	StreamMaxClientUploadSpeed            = "max_client_upload_speed"
 	StreamMaxServerDownloadSpeed          = "max_server_download_speed"
 	StreamMaxServerUploadSpeed            = "max_server_upload_speed"
+
+	// media (scraping)
+	MediaEnabled        = "media_enabled"
+	MediaTMDBToken      = "media_tmdb_token"
+	MediaOMDbKeys       = "media_omdb_keys"
+	MediaDoubanAPIKey   = "media_douban_apikey"
+	MediaLanguage       = "media_language"
+	MediaHTTPProxy      = "media_http_proxy"
+	MediaScraperTimeout = "media_scraper_timeout"
 )
 
 const (
