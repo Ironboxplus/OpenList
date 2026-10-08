@@ -78,6 +78,9 @@ type Spec struct {
 	// MaxDelete aborts a sync that would delete more than this many files at
 	// dst. Unset means no limit.
 	MaxDelete *int64 `json:"max_delete,omitempty"`
+	// Pack (copy / sync) zips each directory's small files into packs at dst;
+	// see PackOptions. Nil or disabled transfers every file on its own.
+	Pack *PackOptions `json:"pack,omitempty"`
 }
 
 type State string
@@ -103,6 +106,11 @@ type Snapshot struct {
 	// transfers, checks, deletes, renames, errors, and the files in flight
 	// with their individual progress.
 	Stats map[string]any `json:"stats,omitempty"`
+	// Stage says what the job is doing now: "packing" (or "unpacking") while
+	// small files are handled, then "transferring" for the rclone pass.
+	Stage string `json:"stage,omitempty"`
+	// PackStats is present on jobs that pack or unpack.
+	PackStats *PackStats `json:"pack_stats,omitempty"`
 	// Events is the per-file log, newest last; only filled by Get.
 	Events []Event `json:"events,omitempty"`
 }
@@ -113,12 +121,17 @@ type job struct {
 	log    eventLog
 	cancel context.CancelFunc
 	group  string
+	pack   PackStats
 }
 
 func (j *job) snapshot(ctx context.Context, withEvents bool) Snapshot {
 	j.mu.Lock()
 	s := j.snap
 	s.Counters = j.log.counters
+	if j.snap.PackStats != nil {
+		ps := j.pack
+		s.PackStats = &ps
+	}
 	if withEvents {
 		s.Events = j.log.events()
 	}
@@ -170,6 +183,19 @@ func (m *Manager) Start(spec Spec) (Snapshot, error) {
 	if spec.Transfers < 0 || spec.Checkers < 0 {
 		return Snapshot{}, fmt.Errorf("transfers and checkers can't be negative")
 	}
+	if spec.Pack != nil && !spec.Pack.Enabled {
+		spec.Pack = nil
+	}
+	if spec.Pack != nil {
+		if spec.Mode != ModeCopy && spec.Mode != ModeSync {
+			return Snapshot{}, fmt.Errorf("pack only works with copy and sync, not %s", spec.Mode)
+		}
+		p := *spec.Pack
+		if err := p.normalize(); err != nil {
+			return Snapshot{}, err
+		}
+		spec.Pack = &p
+	}
 	fo := newFilterOpt(spec.Filters)
 	if _, err := filter.NewFilter(&fo); err != nil {
 		return Snapshot{}, fmt.Errorf("filters: %w", err)
@@ -191,7 +217,22 @@ func (m *Manager) Start(spec Spec) (Snapshot, error) {
 		cancel: cancel,
 		group:  "openlist-sync-" + id,
 	}
+	if spec.Pack != nil {
+		j.snap.PackStats = &PackStats{}
+	}
 	ctx = accounting.WithStatsGroup(ctx, j.group)
+	ctx = withProgress(ctx, progress{
+		stage: func(s string) {
+			j.mu.Lock()
+			j.snap.Stage = s
+			j.mu.Unlock()
+		},
+		stats: func(fn func(*PackStats)) {
+			j.mu.Lock()
+			fn(&j.pack)
+			j.mu.Unlock()
+		},
+	})
 	ctx = operations.WithLogger(ctx, func(_ context.Context, sigil operations.Sigil, src, dst fs.DirEntry, err error) {
 		j.mu.Lock()
 		j.log.compared(sigil, src, dst, err)
@@ -397,11 +438,20 @@ func run(ctx context.Context, spec Spec, src, dst fs.Fs) error {
 	}
 	ctx = filter.ReplaceConfig(ctx, fi)
 
+	var deferred error
+	if spec.Pack != nil {
+		setStage(ctx, "packing")
+		if src, dst, err = packUp(ctx, spec, src, dst); err != nil {
+			return err
+		}
+	}
+	setStage(ctx, "transferring")
+
 	switch spec.Mode {
 	case ModeCopy:
-		return rsync.CopyDir(ctx, dst, src, true)
+		return errors.Join(rsync.CopyDir(ctx, dst, src, true), deferred)
 	case ModeSync:
-		return rsync.Sync(ctx, dst, src, true)
+		return errors.Join(rsync.Sync(ctx, dst, src, true), deferred)
 	case ModeCheck:
 		return operations.Check(ctx, &operations.CheckOpt{Fdst: dst, Fsrc: src})
 	case ModeBisync:
