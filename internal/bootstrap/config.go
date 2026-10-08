@@ -10,10 +10,10 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/cmd/flags"
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/mem"
 	"github.com/OpenListTeam/OpenList/v4/internal/net"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/caarlos0/env/v9"
-	"github.com/shirou/gopsutil/v4/mem"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -103,15 +103,15 @@ func InitConfig() {
 		net.DefaultConcurrencyLimit = &net.ConcurrencyLimit{Limit: uint32(conf.Conf.MaxConcurrency)}
 	}
 
-	memStat, _ := mem.VirtualMemory()
-	if memStat != nil {
-		log.Infof("total memory: %dMB, available: %dMB", memStat.Total>>20, memStat.Available>>20)
+	totalMem, availMem, memErr := mem.EffectiveMemory()
+	if memErr == nil {
+		log.Infof("total memory: %dMB, available: %dMB", totalMem>>20, availMem>>20)
 		if conf.Conf.MinFreeMemory < 0 {
 			conf.MinFreeMemory = 0
 			log.Info("disable memory cache")
 		} else {
 			if conf.Conf.MinFreeMemory < 16 {
-				t := (memStat.Total >> 20) / 10
+				t := (totalMem >> 20) / 10
 				conf.MinFreeMemory = max(16, min(t, 1024)) << 20
 			} else {
 				conf.MinFreeMemory = uint64(conf.Conf.MinFreeMemory) << 20
@@ -120,7 +120,7 @@ func InitConfig() {
 		}
 
 		if conf.Conf.MaxBlockLimit < 4 {
-			t := (memStat.Total >> 20) * 3 / 100
+			t := (totalMem >> 20) * 3 / 100
 			conf.MaxBlockLimit = max(4, min(uint64(t), 64)) << 20
 		} else {
 			conf.MaxBlockLimit = uint64(conf.Conf.MaxBlockLimit) << 20

@@ -8,7 +8,6 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/pkg/singleflight"
-	"github.com/shirou/gopsutil/v4/mem"
 )
 
 var ErrNotEnoughMemory = errors.New("not enough memory")
@@ -18,25 +17,25 @@ func MemoryGrowCheck(growSize uint64) error {
 		return ErrNotEnoughMemory
 	}
 	m, err, _ := singleflight.AnyGroup.Do("MemoryGrowCheck", func() (any, error) {
-		m, err := mem.VirtualMemory()
+		_, available, err := EffectiveMemory()
 		if err != nil {
 			return nil, err
 		}
-		if m.Available < conf.MinFreeMemory {
+		if available < conf.MinFreeMemory {
 			return nil, ErrNotEnoughMemory
 		}
-		return m, nil
+		return &available, nil
 	})
 	if err != nil {
 		return err
 	}
-	memStat := m.(*mem.VirtualMemoryStat)
+	avail := m.(*uint64)
 	for {
-		available := atomic.LoadUint64(&memStat.Available)
+		available := atomic.LoadUint64(avail)
 		if available < growSize || available-growSize < conf.MinFreeMemory {
 			return ErrNotEnoughMemory
 		}
-		if atomic.CompareAndSwapUint64(&memStat.Available, available, available-growSize) {
+		if atomic.CompareAndSwapUint64(avail, available, available-growSize) {
 			return nil
 		}
 	}
