@@ -72,6 +72,7 @@ type EpisodeInfo struct {
 	Title    string
 	Overview string
 	StillURL string
+	Aired    string // air date YYYY-MM-DD, "" = unknown
 }
 
 // Candidate is one search hit.

@@ -34,6 +34,9 @@ type fakeOP struct {
 	lists   []string
 	uploads int
 	scrapes []map[string]any
+	ids     map[string]map[string]string // path -> external ids, for /api/fs/media
+	rawURL  string                       // what /api/fs/get answers
+	gets    []string
 }
 
 func newFakeOP(t *testing.T) (*fakeOP, *httptest.Server) {
@@ -104,6 +107,15 @@ func (f *fakeOP) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		reply(200, "success", []scraper.Candidate{{Provider: "tmdb", ID: "tv/1", Title: "Something", Year: 2001, Score: 0.31}, {Provider: "tmdb", ID: "tv/2", Title: "Other", Year: 2002, Score: 0.3}})
+	case "/api/fs/media":
+		var req struct{ Path string }
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		reply(200, "success", map[string]any{"item": map[string]any{"path": req.Path, "external_ids": f.ids[req.Path]}})
+	case "/api/fs/get":
+		var req struct{ Path string }
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		f.gets = append(f.gets, req.Path)
+		reply(200, "success", map[string]any{"raw_url": f.rawURL})
 	case "/api/admin/media/scrape":
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
@@ -328,3 +340,87 @@ func TestTokenFile(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// tinyMKV is an EBML header, an unknown-size Segment and a Tracks element with
+// one ASS subtitle track.
+func tinyMKV() []byte {
+	b := []byte{0x1A, 0x45, 0xDF, 0xA3, 0x84, 0x42, 0x82, 0x81, 'm'}
+	b = append(b, 0x18, 0x53, 0x80, 0x67, 0xFF)
+	entry := append([]byte{0xD7, 0x81, 0x01, 0x83, 0x81, 0x11, 0x86, 0x8A}, []byte("S_TEXT/ASS")...)
+	entry = append(entry, 0x22, 0xB5, 0x9C, 0x83, 'c', 'h', 'i')
+	tracks := append([]byte{0xAE, 0x80 | byte(len(entry))}, entry...)
+	b = append(b, 0x16, 0x54, 0xAE, 0x6B, 0x80|byte(len(tracks)))
+	b = append(b, tracks...)
+	return append(b, 0x1F, 0x43, 0xB6, 0x75, 0x80)
+}
+
+func TestCheckReportsMissingEpisodesAndProbes(t *testing.T) {
+	f, srv := newFakeOP(t)
+	pointAtFakeOP(t, srv)
+	var storageAuth, storageRange string
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		storageAuth, storageRange = r.Header.Get("Authorization"), r.Header.Get("Range")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(tinyMKV())
+	}))
+	defer storage.Close()
+	prov := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/3/tv/1":
+			_, _ = w.Write([]byte(`{"id":1,"name":"Show","first_air_date":"2020-01-01","seasons":[{"season_number":1}]}`))
+		case "/3/tv/1/season/1":
+			_, _ = w.Write([]byte(`{"episodes":[{"episode_number":1,"air_date":"2020-01-01"},{"episode_number":2,"air_date":"2020-01-08"},{"episode_number":3,"air_date":"2020-01-15"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer prov.Close()
+	mediaConfigHook = func(c *scraper.Config) {
+		c.BaseURLs = map[string]string{"tmdb": prov.URL + "/3"}
+		c.RatePerSec = map[string]float64{"tmdb": 1000}
+		c.OMDbKeys, c.DoubanAPIKey = nil, ""
+	}
+	t.Cleanup(func() { mediaConfigHook = nil })
+	envFile := filepath.Join(t.TempDir(), "media.env")
+	_ = os.WriteFile(envFile, []byte("TMDB_READ_TOKEN=eyJfake.token.value\n"), 0o600)
+	out := filepath.Join(t.TempDir(), "report.md")
+	mediaFlags.env, mediaFlags.root, mediaFlags.probe, mediaFlags.out = envFile, "/lib", true, out
+
+	f.rawURL = storage.URL + "/raw"
+	f.items["/lib/Show"] = mm.MediaSetReq{Path: "/lib/Show", Kind: ptr("tv")}
+	f.items["/lib/Skip"] = mm.MediaSetReq{Path: "/lib/Skip", Kind: ptr("ignore")}
+	f.ids = map[string]map[string]string{"/lib/Show": {"tmdb": "tv/1"}}
+	f.dir("/lib/Show", d("Season 1"))
+	f.dir("/lib/Show/Season 1", v("Show.S01E01.mkv"), v("Show.S01E03.mkv"))
+
+	if _, err := run(t, runMediaCheck); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep := string(b)
+	for _, want := range []string{"⚠️缺集", "缺 S01：2", "预期 3 集（来源：tmdb）", "S_TEXT/ASS/chi", "/lib/Show"} {
+		if !strings.Contains(rep, want) {
+			t.Errorf("report lacks %q:\n%s", want, rep)
+		}
+	}
+	if strings.Contains(rep, "/lib/Skip") {
+		t.Error("an ignored item was checked")
+	}
+	if len(f.gets) != 1 || f.gets[0] != "/lib/Show/Season 1/Show.S01E01.mkv" {
+		t.Errorf("one get on the first episode expected: %v", f.gets)
+	}
+	if storageRange == "" || storageAuth != "" {
+		t.Errorf("storage saw Range=%q Authorization=%q", storageRange, storageAuth)
+	}
+	for _, l := range f.lists {
+		if l != "/lib/Show" && l != "/lib/Show/Season 1" {
+			t.Errorf("unexpected listing %s", l)
+		}
+	}
+	if len(f.sets) != 0 || f.uploads != 0 {
+		t.Error("check must not write")
+	}
+}

@@ -389,6 +389,7 @@ func (t *TMDB) Season(ctx context.Context, tvID string, season int) ([]EpisodeIn
 			Name          string `json:"name"`
 			Overview      string `json:"overview"`
 			StillPath     string `json:"still_path"`
+			AirDate       string `json:"air_date"`
 		} `json:"episodes"`
 	}
 	if err := t.get(ctx, "/tv/"+num+"/season/"+strconv.Itoa(season), v, &resp); err != nil {
@@ -396,7 +397,7 @@ func (t *TMDB) Season(ctx context.Context, tvID string, season int) ([]EpisodeIn
 	}
 	out := make([]EpisodeInfo, 0, len(resp.Episodes))
 	for _, e := range resp.Episodes {
-		ei := EpisodeInfo{Season: season, Episode: e.EpisodeNumber, Title: e.Name, Overview: e.Overview}
+		ei := EpisodeInfo{Season: season, Episode: e.EpisodeNumber, Title: e.Name, Overview: e.Overview, Aired: e.AirDate}
 		if e.StillPath != "" {
 			ei.StillURL = t.image + "/w300" + e.StillPath
 		}

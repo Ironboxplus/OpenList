@@ -9,9 +9,11 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/apply"
+	"github.com/OpenListTeam/OpenList/v4/internal/media/check"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/scraper"
 	"github.com/spf13/cobra"
 )
@@ -34,6 +36,9 @@ var mediaFlags struct {
 	force    bool
 	prefix   string
 	pending  bool
+	rules    string
+	probe    bool
+	out      string
 }
 
 // Test hooks: point the providers at local servers and allow loopback image
@@ -104,11 +109,37 @@ func init() {
 	ls.Flags().StringVar(&mediaFlags.prefix, "prefix", "", "only items at or below this path")
 	ls.Flags().BoolVar(&mediaFlags.pending, "pending", false, "only items that still need a look (unlocked, low confidence or with candidates)")
 
-	for _, c := range []*cobra.Command{plan, app, scrape, ls} {
+	chk := &cobra.Command{
+		Use:   "check",
+		Short: "Report missing episodes, unmatched files and subtitles of stored works (writes nothing)",
+		Long: `For every stored work under --root (kind ignore and collection are skipped),
+list its directory (up to 3 levels, one request at a time), match the video
+files to episode numbers, compare them with the episodes TMDB or Bangumi
+list, and look at subtitles. The report is markdown.
+
+  openlist media check --root /115/downloads --env media.env --out report.md
+  openlist media check --root /115/downloads --env media.env --rules rules.yaml --probe-embedded --out report.md
+
+--env gives the provider keys; without it the expectation comes from rules
+or from the episode numbers found. --rules overrides the defaults per work
+(files: rclone filter rules, episode: regexp with (?P<ep>..), expect:
+"S1: 1-12", subs: {langs, mode}). --probe-embedded reads the first 4 MB of the
+first mkv of a work whose subtitles are not settled by outside files: at most
+one /api/fs/get and one Range request per work.`,
+		Args: cobra.NoArgs,
+		RunE: runMediaCheck,
+	}
+	chk.Flags().StringVar(&mediaFlags.root, "root", "", "directory holding the works, e.g. /115/downloads (required)")
+	chk.Flags().StringVar(&mediaFlags.rules, "rules", "", "rules.yaml with per-work overrides")
+	chk.Flags().BoolVar(&mediaFlags.probe, "probe-embedded", false, "read the head of the first mkv of each work to find built-in subtitle tracks")
+	chk.Flags().StringVar(&mediaFlags.out, "out", "", "write the markdown report here (default: stdout)")
+	_ = chk.MarkFlagRequired("root")
+
+	for _, c := range []*cobra.Command{plan, app, scrape, ls, chk} {
 		addServerFlags(c.Flags())
 		mediaCmd.AddCommand(c)
 	}
-	for _, c := range []*cobra.Command{plan, app, scrape} {
+	for _, c := range []*cobra.Command{plan, app, scrape, chk} {
 		c.Flags().StringVar(&mediaFlags.env, "env", "", "KEY=VALUE file with TMDB_READ_TOKEN, OMDB_KEYS, DOUBAN_APIKEY (default: use the server's keys)")
 	}
 }
@@ -251,6 +282,54 @@ func runMediaScrape(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	return printScrape(cmd.OutOrStdout(), res)
+}
+
+func runMediaCheck(cmd *cobra.Command, args []string) error {
+	var rules check.Rules
+	if mediaFlags.rules != "" {
+		var err error
+		if rules, err = check.LoadRules(mediaFlags.rules); err != nil {
+			return err
+		}
+	}
+	c, err := newSyncClient()
+	if err != nil {
+		return err
+	}
+	o, err := mediaOrchestrator(c)
+	if err != nil {
+		return err
+	}
+	if o.Providers == nil {
+		fmt.Fprintln(os.Stderr, "note: no --env, so expected episodes come from rules or from the numbers found only")
+	}
+	ck := &check.Checker{
+		Items: check.RemoteItems{API: c}, Lister: o.Lister, Providers: o.Providers, Rules: rules,
+		Logf: o.Logf,
+	}
+	if mediaFlags.probe {
+		ck.Prober = check.RemoteProber{API: c, Base: c.base, Token: c.token, HTTP: c.http}
+	}
+	ctx, stop := mediaContext()
+	defer stop()
+	results, err := ck.Run(ctx, mediaFlags.root)
+	if len(results) == 0 && err != nil {
+		return err
+	}
+	w := cmd.OutOrStdout()
+	if mediaFlags.out != "" {
+		f, ferr := os.Create(mediaFlags.out)
+		if ferr != nil {
+			return ferr
+		}
+		defer f.Close()
+		w = f
+	}
+	// a run cut short still reports what it saw
+	if werr := check.WriteReport(w, mediaFlags.root, results, time.Now()); werr != nil && err == nil {
+		err = werr
+	}
+	return err
 }
 
 func printScrape(w io.Writer, r *apply.ScrapeResult) error {

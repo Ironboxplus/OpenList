@@ -225,6 +225,7 @@ func (b *Bangumi) Episodes(ctx context.Context, id string) ([]EpisodeInfo, error
 				Name   string  `json:"name"`
 				NameCN string  `json:"name_cn"`
 				Desc   string  `json:"desc"`
+				Date   string  `json:"airdate"`
 			} `json:"data"`
 		}
 		path := "/v0/episodes?type=0&limit=100&offset=" + strconv.Itoa(offset) + "&subject_id=" + url.QueryEscape(id)
@@ -236,7 +237,7 @@ func (b *Bangumi) Episodes(ctx context.Context, id string) ([]EpisodeInfo, error
 			if n == 0 {
 				n = int(e.Ep)
 			}
-			out = append(out, EpisodeInfo{Season: 1, Episode: n, Title: firstNonEmpty(e.NameCN, e.Name), Overview: e.Desc})
+			out = append(out, EpisodeInfo{Season: 1, Episode: n, Title: firstNonEmpty(e.NameCN, e.Name), Overview: e.Desc, Aired: e.Date})
 		}
 		offset += 100
 		if len(resp.Data) == 0 || offset >= resp.Total {
