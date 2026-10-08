@@ -400,24 +400,7 @@ func (b *packBuilder) compact(ctx context.Context, name string) error {
 
 // fetchTo downloads o into the local file path and returns its sha1.
 func fetchTo(ctx context.Context, o fs.Object, path string) (string, error) {
-	rc, err := o.Open(ctx)
-	if err != nil {
-		return "", err
-	}
-	defer rc.Close()
-	f, err := os.Create(path)
-	if err != nil {
-		return "", err
-	}
-	h := sha1.New()
-	_, err = io.Copy(io.MultiWriter(f, h), rc)
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return fetchHash(ctx, o, path, sha1.New())
 }
 
 // upload copies a staged file to dst, replacing existing when given, and

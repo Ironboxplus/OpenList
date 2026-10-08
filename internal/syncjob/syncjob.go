@@ -81,6 +81,9 @@ type Spec struct {
 	// Pack (copy / sync) zips each directory's small files into packs at dst;
 	// see PackOptions. Nil or disabled transfers every file on its own.
 	Pack *PackOptions `json:"pack,omitempty"`
+	// Unpack (copy / sync) extracts the packs and legacy PACKED.tsv archives
+	// found at src into plain files at dst. Not combinable with Pack.
+	Unpack bool `json:"unpack,omitempty"`
 }
 
 type State string
@@ -196,6 +199,14 @@ func (m *Manager) Start(spec Spec) (Snapshot, error) {
 		}
 		spec.Pack = &p
 	}
+	if spec.Unpack {
+		if spec.Mode != ModeCopy && spec.Mode != ModeSync {
+			return Snapshot{}, fmt.Errorf("unpack only works with copy and sync, not %s", spec.Mode)
+		}
+		if spec.Pack != nil {
+			return Snapshot{}, fmt.Errorf("pack and unpack can't be combined")
+		}
+	}
 	fo := newFilterOpt(spec.Filters)
 	if _, err := filter.NewFilter(&fo); err != nil {
 		return Snapshot{}, fmt.Errorf("filters: %w", err)
@@ -217,7 +228,7 @@ func (m *Manager) Start(spec Spec) (Snapshot, error) {
 		cancel: cancel,
 		group:  "openlist-sync-" + id,
 	}
-	if spec.Pack != nil {
+	if spec.Pack != nil || spec.Unpack {
 		j.snap.PackStats = &PackStats{}
 	}
 	ctx = accounting.WithStatsGroup(ctx, j.group)
@@ -444,6 +455,14 @@ func run(ctx context.Context, spec Spec, src, dst fs.Fs) error {
 		if src, dst, err = packUp(ctx, spec, src, dst); err != nil {
 			return err
 		}
+	}
+	if spec.Unpack {
+		setStage(ctx, "unpacking")
+		res, err := unpackDown(ctx, spec, src, dst)
+		if err != nil {
+			return err
+		}
+		src, dst, deferred = res.src, res.dst, res.deferred
 	}
 	setStage(ctx, "transferring")
 
