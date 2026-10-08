@@ -162,6 +162,8 @@ type packer struct {
 
 	// Job pack file names found under .oppack when the manifest was loaded.
 	packFiles []string
+	// hadManifest: a v2 manifest (or its prev) was at dst when the run started.
+	hadManifest bool
 }
 
 // v1Dir is a directory at dst packed the version 1 way (dir/.oppack/index.json).
@@ -373,12 +375,10 @@ var jobPackRE = regexp.MustCompile(`^p-\d{6}\.zip$`)
 
 // removeOrphanPacks deletes the packs under .oppack that the committed
 // manifest doesn't refer to: what a run that died before its commit left. The
-// root's v1 packs are spared (removeV1 owns them), and with no manifest at dst
-// there is nothing to judge against.
+// root's v1 packs are spared (removeV1 owns them). Without a manifest at dst
+// when the run started nothing can be judged: packs may hold the only copy of
+// a file src no longer has.
 func (p *packer) removeOrphanPacks(ctx context.Context) error {
-	if p.mObj == nil {
-		return nil
-	}
 	keep := map[string]struct{}{}
 	for name := range p.m.Packs {
 		keep[name] = struct{}{}
@@ -397,10 +397,19 @@ func (p *packer) removeOrphanPacks(ctx context.Context) error {
 		// A root v1 index we couldn't read: its packs are unknown.
 		return nil
 	}
+	var orphans []string
 	for _, name := range p.packFiles {
-		if _, ok := keep[name]; ok {
-			continue
+		if _, ok := keep[name]; !ok {
+			orphans = append(orphans, name)
 		}
+	}
+	if !p.hadManifest {
+		if len(orphans) > 0 {
+			log.Warnf("[sync] pack: kept %d unreferenced packs under %s: no manifest was there when the run started", len(orphans), PackDirName)
+		}
+		return nil
+	}
+	for _, name := range orphans {
 		if !p.dry {
 			if err := p.removeObject(ctx, packPath("", name)); err != nil {
 				log.Warnf("[sync] pack: can't remove orphan %s: %v", packPath("", name), err)
@@ -506,6 +515,9 @@ func (p *packer) loadManifest(ctx context.Context) error {
 	for _, n := range names {
 		if jobPackRE.MatchString(n) {
 			p.packFiles = append(p.packFiles, n)
+		}
+		if n == PackManifestName || n == PackManifestPrevName {
+			p.hadManifest = true
 		}
 		if n == PackIndexName {
 			// The root's version 1 pack lives beside the job packs.

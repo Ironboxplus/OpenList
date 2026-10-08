@@ -498,10 +498,8 @@ func TestPackNeverReusesAPackName(t *testing.T) {
 	if got := loadTestManifest(t, dst).Files["a/x.txt"].Pack; got != "p-000002.zip" {
 		t.Fatalf("a/x.txt in %s, want a fresh p-000002.zip", got)
 	}
-	// The old pack was not reused; with no manifest left to refer to it, it is
-	// an orphan and goes once the new manifest is committed.
-	if exists(dst, ".oppack/p-000001.zip") {
-		t.Fatalf("orphan pack kept")
+	if !exists(dst, ".oppack/p-000001.zip") {
+		t.Fatalf("existing pack overwritten or removed")
 	}
 }
 
@@ -845,5 +843,48 @@ func TestPackOrphanCleanupSparesRootV1PackBeforeMigration(t *testing.T) {
 	mustSucceed(t, runJob(t, m, unpackSpec(syncjob.ModeCopy, dst, out)))
 	if got, _ := read(t, out, "rootgone.txt"); got != "only in v1" {
 		t.Fatalf("migrated member lost: %q", got)
+	}
+}
+
+// With the manifest lost the run can't tell orphans from the only copy of a
+// file src no longer has: every pack is kept. With only manifest.json.gz lost
+// the prev still says what is referenced, so a stray pack goes.
+func TestPackOrphanCleanupNeedsAManifestAtStart(t *testing.T) {
+	m := newManager(t)
+	src, dst := tempDir(t), tempDir(t)
+	write(t, src, "a/x.txt", "x")
+	write(t, src, "a/y.txt", "y")
+	opts := syncjob.PackOptions{Threshold: 1024}
+	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, dst, opts)))
+	write(t, src, "a/z.txt", "z")
+	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, dst, opts))) // makes manifest.prev
+	if !exists(dst, ".oppack/manifest.prev.json.gz") {
+		t.Fatal("no manifest.prev to recover from")
+	}
+	prevPacks := readTestManifest(t, dst, "manifest.prev.json.gz").Packs
+
+	_ = os.Remove(filepath.Join(dst, ".oppack", "manifest.json.gz"))
+	write(t, dst, ".oppack/p-000009.zip", "stray")
+	s := mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, dst, opts)))
+	if s.PackStats.OrphanPacksRemoved < 1 || exists(dst, ".oppack/p-000009.zip") {
+		t.Fatalf("stray pack kept: %+v", s.PackStats)
+	}
+	for name := range prevPacks {
+		if !exists(dst, ".oppack/"+name) {
+			t.Fatalf("referenced pack %s removed", name)
+		}
+	}
+
+	_ = os.Remove(filepath.Join(dst, ".oppack", "manifest.json.gz"))
+	_ = os.Remove(filepath.Join(dst, ".oppack", "manifest.prev.json.gz"))
+	before := packNames(t, dst)
+	s = mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, dst, opts)))
+	if s.PackStats.OrphanPacksRemoved != 0 {
+		t.Fatalf("packs removed without a manifest: %+v", s.PackStats)
+	}
+	for _, name := range before {
+		if !exists(dst, ".oppack/"+name) {
+			t.Fatalf("pack %s removed although no manifest was there", name)
+		}
 	}
 }
