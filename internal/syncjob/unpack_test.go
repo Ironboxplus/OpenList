@@ -96,7 +96,7 @@ func buildRoundTripTree(t *testing.T, src string) {
 
 func TestPackUnpackRoundTrip(t *testing.T) {
 	m := newManager(t)
-	src, packed, out := t.TempDir(), t.TempDir(), t.TempDir()
+	src, packed, out := tempDir(t), tempDir(t), tempDir(t)
 	buildRoundTripTree(t, src)
 
 	s := mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, packed, syncjob.PackOptions{Threshold: 1024, MinFiles: 3})))
@@ -132,7 +132,7 @@ func TestPackUnpackRoundTrip(t *testing.T) {
 
 func TestUnpackSyncDeletesExtrasButKeepsPackedFiles(t *testing.T) {
 	m := newManager(t)
-	src, packed, out := t.TempDir(), t.TempDir(), t.TempDir()
+	src, packed, out := tempDir(t), tempDir(t), tempDir(t)
 	for i := 0; i < 4; i++ {
 		write(t, src, fmt.Sprintf("d/f%d.txt", i), "small")
 	}
@@ -158,7 +158,7 @@ func TestUnpackSyncDeletesExtrasButKeepsPackedFiles(t *testing.T) {
 func TestUnpackByRangeReadsOnlyWhatItNeeds(t *testing.T) {
 	defer syncjob.SetRangeThresholds(1, 2, 4096)()
 	m := newManager(t)
-	src, packed, out := t.TempDir(), t.TempDir(), t.TempDir()
+	src, packed, out := tempDir(t), tempDir(t), tempDir(t)
 	rng := rand.New(rand.NewSource(1))
 	for i := 0; i < 60; i++ {
 		b := make([]byte, 2000)
@@ -209,7 +209,7 @@ func TestUnpackByRangeReadsOnlyWhatItNeeds(t *testing.T) {
 
 func TestUnpackRefusesCorruptPack(t *testing.T) {
 	m := newManager(t)
-	src, packed, out := t.TempDir(), t.TempDir(), t.TempDir()
+	src, packed, out := tempDir(t), tempDir(t), tempDir(t)
 	for i := 0; i < 4; i++ {
 		write(t, src, fmt.Sprintf("bad/f%d.txt", i), "damaged soon")
 		write(t, src, fmt.Sprintf("good/f%d.txt", i), "healthy")
@@ -310,7 +310,7 @@ func TestUnpackLegacyPackedTSV(t *testing.T) {
 		{"PACKED2.tsv", "x/y/proj2.zip", "x/y/proj2\tx/y/proj2.zip\t1\t7\t" + sha256hex(zp) + "\n", zp,
 			map[string]string{"x/y/proj2/c.txt": "charlie"}},
 	} {
-		src, out := t.TempDir(), t.TempDir()
+		src, out := tempDir(t), tempDir(t)
 		write(t, src, c.index, c.rows)
 		writeBytes(t, src, c.archive, c.archiveBytes)
 		write(t, src, "plain.txt", "ordinary")
@@ -337,7 +337,7 @@ func TestUnpackLegacyPackedTSV(t *testing.T) {
 func TestUnpackLegacyRefusesWrongSha256(t *testing.T) {
 	m := newManager(t)
 	tgz := makeTarGz(t, map[string]string{"proj/a.txt": "alpha"})
-	src, out := t.TempDir(), t.TempDir()
+	src, out := tempDir(t), tempDir(t)
 	write(t, src, "PACKED.tsv", "proj\tproj.tar.gz\t1\t5\t"+strings.Repeat("0", 64)+"\n")
 	writeBytes(t, src, "proj.tar.gz", tgz)
 	s := runJob(t, m, unpackSpec(syncjob.ModeCopy, src, out))
@@ -352,7 +352,7 @@ func TestUnpackLegacyRefusesWrongSha256(t *testing.T) {
 func TestUnpackLegacyRefusesEscapingEntries(t *testing.T) {
 	m := newManager(t)
 	tgz := makeTarGz(t, map[string]string{"proj/ok.txt": "fine", "proj/../../escape.txt": "evil"})
-	base := t.TempDir()
+	base := tempDir(t)
 	src, out := filepath.Join(base, "src"), filepath.Join(base, "out")
 	_ = os.MkdirAll(src, 0o755)
 	_ = os.MkdirAll(out, 0o755)

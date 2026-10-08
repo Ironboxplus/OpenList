@@ -83,6 +83,22 @@ type packer struct {
 	srcDirs map[string]struct{}
 }
 
+func (p *packer) hasPackDir(ctx context.Context, dir string) (bool, error) {
+	entries, err := p.dst.List(ctx, dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrorDirNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("list %q at dst: %w", dir, err)
+	}
+	for _, e := range entries {
+		if _, ok := e.(fs.Directory); ok && path.Base(e.Remote()) == PackDirName {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // removeOrphans deletes the .oppack of directories sync is about to delete
 // because src no longer has them; hidden from the main pass, it would keep
 // the directory alive. Directories the filter excludes are not visited, so
@@ -136,7 +152,15 @@ func (p *packer) removePackDir(ctx context.Context, dir string) error {
 			return fmt.Errorf("pack %q: remove %s: %w", dir, o.Remote(), err)
 		}
 	}
-	if err := p.dst.Rmdir(ctx, pd); err != nil {
+	// Local file systems (Windows) can briefly still list files just removed.
+	var err2 error
+	for i := 0; i < 5; i++ {
+		if err2 = p.dst.Rmdir(ctx, pd); err2 == nil {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := err2; err != nil {
 		log.Warnf("[sync] pack: can't remove empty %s: %v", pd, err)
 	}
 	return nil
@@ -153,9 +177,17 @@ func (p *packer) dir(ctx context.Context, dir string, files []fs.Object) error {
 		}
 	}
 	p.srcDirs[dir] = struct{}{}
-	m, mObj, err := loadManifest(ctx, p.dst, dir, p.opts.Threshold)
-	if err != nil {
-		return fmt.Errorf("pack %q: read manifest: %w", dir, err)
+	// Whether dst has a pack is read off its listing of dir, which the main
+	// pass needs anyway and OpenList caches; asking for index.json directly
+	// would be a driver lookup per directory.
+	m, mObj := newManifest(p.opts.Threshold), fs.Object(nil)
+	if has, err := p.hasPackDir(ctx, dir); err != nil {
+		return fmt.Errorf("pack %q: %w", dir, err)
+	} else if has {
+		var err error
+		if m, mObj, err = loadManifest(ctx, p.dst, dir, p.opts.Threshold); err != nil {
+			return fmt.Errorf("pack %q: read manifest: %w", dir, err)
+		}
 	}
 	// MinFiles only decides whether to start packing a directory. Once dst
 	// has a manifest the directory stays packed, or loose and packed copies

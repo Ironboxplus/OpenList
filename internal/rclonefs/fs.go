@@ -76,7 +76,11 @@ func isNotFound(err error) bool {
 
 func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	full := f.fullPath(dir)
-	if dir != "" {
+	// A directory this Fs already resolved needn't be looked up again: the
+	// listing below fails by itself if it has since vanished. Listing the
+	// same directory twice in a job (a pre-scan, then the transfer) then
+	// costs one lookup, not two.
+	if _, known := f.dirs.Load(utils.FixAndCleanPath(full)); dir != "" && !known {
 		obj, err := olfs.Get(ctx, full, &olfs.GetArgs{NoLog: true})
 		if err != nil {
 			if isNotFound(err) {

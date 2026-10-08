@@ -2,6 +2,7 @@ package syncjob_test
 
 import (
 	"archive/zip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,7 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/syncjob"
+	"github.com/OpenListTeam/OpenList/v4/internal/testutil/fakedriver"
 )
 
 type testManifest struct {
@@ -77,7 +81,7 @@ func mustSucceed(t *testing.T, s syncjob.Snapshot) syncjob.Snapshot {
 
 func TestPackLayoutAndCompression(t *testing.T) {
 	m := newManager(t)
-	src, dst := t.TempDir(), t.TempDir()
+	src, dst := tempDir(t), tempDir(t)
 	for i := 0; i < 6; i++ {
 		write(t, src, fmt.Sprintf("d/a%d.txt", i), strings.Repeat("text ", 40))
 	}
@@ -129,7 +133,7 @@ func TestPackLayoutAndCompression(t *testing.T) {
 }
 
 func TestPackThresholds(t *testing.T) {
-	src := t.TempDir()
+	src := tempDir(t)
 	for _, sz := range []int{500, 2048, 20 << 10} {
 		for i := 0; i < 3; i++ {
 			write(t, src, fmt.Sprintf("d/f%d-%d.dat", sz, i), strings.Repeat("x", sz))
@@ -139,7 +143,7 @@ func TestPackThresholds(t *testing.T) {
 		threshold int64
 		want      int
 	}{{1024, 3}, {4096, 6}, {64 << 10, 9}} {
-		dst := t.TempDir()
+		dst := tempDir(t)
 		mustSucceed(t, runJob(t, newManager(t), packSpec(syncjob.ModeCopy, src, dst, syncjob.PackOptions{Threshold: c.threshold, MinFiles: 3})))
 		if got := len(loadTestManifest(t, dst, "d").Files); got != c.want {
 			t.Errorf("threshold %d packed %d files, want %d", c.threshold, got, c.want)
@@ -149,7 +153,7 @@ func TestPackThresholds(t *testing.T) {
 
 func TestPackIncrementalDeadCountsAndCompaction(t *testing.T) {
 	m := newManager(t)
-	src, dst := t.TempDir(), t.TempDir()
+	src, dst := tempDir(t), tempDir(t)
 	old := time.Now().Add(-48 * time.Hour)
 	for i := 0; i < 8; i++ {
 		rel := fmt.Sprintf("d/f%d.txt", i)
@@ -227,7 +231,7 @@ func TestPackIncrementalDeadCountsAndCompaction(t *testing.T) {
 }
 
 func TestPackRollsOverAtMaxPackBytes(t *testing.T) {
-	src, dst := t.TempDir(), t.TempDir()
+	src, dst := tempDir(t), tempDir(t)
 	for i := 0; i < 12; i++ {
 		write(t, src, fmt.Sprintf("d/f%02d.bin", i), strings.Repeat(string(rune('a'+i)), 4000))
 	}
@@ -243,7 +247,7 @@ func TestPackRollsOverAtMaxPackBytes(t *testing.T) {
 
 func TestPackSyncKeepsOppackAndRemovesStrays(t *testing.T) {
 	m := newManager(t)
-	src, dst := t.TempDir(), t.TempDir()
+	src, dst := tempDir(t), tempDir(t)
 	for i := 0; i < 4; i++ {
 		write(t, src, fmt.Sprintf("d/f%d.txt", i), "small")
 	}
@@ -265,7 +269,7 @@ func TestPackSyncKeepsOppackAndRemovesStrays(t *testing.T) {
 }
 
 func TestPackDryRunWritesNothing(t *testing.T) {
-	src, dst := t.TempDir(), t.TempDir()
+	src, dst := tempDir(t), tempDir(t)
 	for i := 0; i < 4; i++ {
 		write(t, src, fmt.Sprintf("d/f%d.txt", i), "small")
 	}
@@ -304,7 +308,7 @@ func TestPackDefaultsAreInOnePlace(t *testing.T) {
 	}
 	// Unset fields in a request mean those defaults.
 	m := newManager(t)
-	src, dst := t.TempDir(), t.TempDir()
+	src, dst := tempDir(t), tempDir(t)
 	for i := 0; i < 8; i++ {
 		write(t, src, fmt.Sprintf("f%d.txt", i), "x")
 	}
@@ -316,7 +320,7 @@ func TestPackDefaultsAreInOnePlace(t *testing.T) {
 
 func TestPackIsStickyBelowMinFiles(t *testing.T) {
 	m := newManager(t)
-	src, dst := t.TempDir(), t.TempDir()
+	src, dst := tempDir(t), tempDir(t)
 	for i := 0; i < 5; i++ {
 		write(t, src, fmt.Sprintf("d/f%d.txt", i), "small")
 	}
@@ -353,7 +357,7 @@ func TestPackOrphanOppackFollowsSyncOnly(t *testing.T) {
 	opts := syncjob.PackOptions{Threshold: 1024, MinFiles: 3}
 	for _, mode := range []syncjob.Mode{syncjob.ModeSync, syncjob.ModeCopy} {
 		m := newManager(t)
-		src, dst := t.TempDir(), t.TempDir()
+		src, dst := tempDir(t), tempDir(t)
 		for i := 0; i < 4; i++ {
 			write(t, src, fmt.Sprintf("gone/sub/f%d.txt", i), "small")
 			write(t, src, fmt.Sprintf("keep/f%d.txt", i), "small")
@@ -377,4 +381,85 @@ func TestPackOrphanOppackFollowsSyncOnly(t *testing.T) {
 			t.Fatalf("%s: unrelated .oppack removed", mode)
 		}
 	}
+}
+
+// Finding out whether dst has a pack must not cost a driver Get per directory
+// (115 pays a rate-limited call for each): a pack-mode run over a tree with no
+// packs makes no more Gets than a plain run.
+func TestPackDetectionCostsNoExtraDriverGets(t *testing.T) {
+	m := newManager(t)
+	src := tempDir(t)
+	for d := 0; d < 12; d++ {
+		for f := 0; f < 3; f++ {
+			write(t, src, fmt.Sprintf("d%02d/s%d/f%d.txt", d, d%3, f), "x")
+		}
+	}
+	newMount := func(mount string) *fakedriver.Driver {
+		id, err := op.CreateStorage(context.Background(), model.Storage{Driver: fakedriver.DriverName, MountPath: mount, Addition: "{}", CacheExpiration: 30})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = op.DeleteStorageById(context.Background(), id) })
+		s, _ := op.GetStorageByMountPath(mount)
+		return s.(*fakedriver.Driver)
+	}
+	plainDrv, packDrv := newMount("/fk-plain"), newMount("/fk-pack")
+	spec := func(dst string, pack bool) syncjob.Spec {
+		sp := syncjob.Spec{Mode: syncjob.ModeSync, Src: "local:" + src, Dst: dst}
+		if pack {
+			sp.Pack = &syncjob.PackOptions{Enabled: true, MinFiles: 8}
+		}
+		return sp
+	}
+	// Both destinations already hold the tree (no writes, so no hooks or
+	// uploads move the counts) and start with a cold dir cache.
+	for _, drv := range []*fakedriver.Driver{plainDrv, packDrv} {
+		for d := 0; d < 12; d++ {
+			drv.AddDir(fmt.Sprintf("/d%02d", d))
+			drv.AddDir(fmt.Sprintf("/d%02d/s%d", d, d%3))
+			for f := 0; f < 3; f++ {
+				drv.AddFile(fmt.Sprintf("/d%02d/s%d/f%d.txt", d, d%3, f), "x")
+			}
+		}
+	}
+	count := func(drv *fakedriver.Driver, dst string, pack bool) int32 {
+		op.Cache.ClearAll()
+		drv.ResetCounts()
+		s := mustSucceed(t, runJob(t, m, spec(dst, pack)))
+		if s.Counters.Match == 0 || s.Counters.OnlyInSrc != 0 || s.Counters.Uploaded != 0 {
+			t.Fatalf("dst should already match src: %+v", s.Counters)
+		}
+		if pack && s.PackStats.Packs != 0 {
+			t.Fatalf("test tree was packed: %+v", s.PackStats)
+		}
+		return drv.Gets.Load()
+	}
+	plain := count(plainDrv, "/fk-plain", false)
+	packed := count(packDrv, "/fk-pack", true)
+	t.Logf("driver Gets: plain=%d pack=%d", plain, packed)
+	if packed > plain {
+		t.Fatalf("pack mode made %d driver Gets, plain run %d", packed, plain)
+	}
+}
+
+// tempDir is t.TempDir with a cleanup that retries: on Windows removal of a
+// just-written directory tree intermittently fails with "directory not
+// empty" while the file system lets go of the files.
+func tempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "syncjob-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		var err error
+		for i := 0; i < 20; i++ {
+			if err = os.RemoveAll(dir); err == nil {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Errorf("cleanup %s: %v", dir, err)
+	})
+	return dir
 }
