@@ -215,8 +215,10 @@ func (u *unpacker) unpackDir(ctx context.Context, dir string, loose map[string]s
 	needed := map[string][]string{}
 	for name, e := range m.Files {
 		if _, ok := loose[name]; ok {
-			// An ordinary file next to the pack is newer than the pack entry.
-			continue
+			// Two sources for one name: the pack member wins, and the loose
+			// file is kept out of the transfer so it can't overwrite it.
+			u.hiddenSrc[path.Join(dir, name)] = struct{}{}
+			addStats(ctx, func(s *PackStats) { s.Conflicts++ })
 		}
 		u.hiddenDst[path.Join(dir, name)] = struct{}{}
 		if !u.upToDate(ctx, existing[name], e) {

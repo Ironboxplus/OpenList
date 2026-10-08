@@ -463,3 +463,43 @@ func tempDir(t *testing.T) string {
 	})
 	return dir
 }
+
+func TestPackRemovesSupersededLooseCopiesAndKeepsConflicts(t *testing.T) {
+	when := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	for _, mode := range []syncjob.Mode{syncjob.ModeCopy, syncjob.ModeSync} {
+		m := newManager(t)
+		src, dst := tempDir(t), tempDir(t)
+		for i := 0; i < 5; i++ {
+			rel := fmt.Sprintf("d/f%d.txt", i)
+			write(t, src, rel, "content")
+			setMTime(t, src, rel, when)
+			// An earlier non-pack run left the same file loose at dst.
+			write(t, dst, rel, "content")
+			setMTime(t, dst, rel, when)
+		}
+		// f3: dst copy has other content; f4: same content, other time.
+		write(t, dst, "d/f3.txt", "different size!")
+		setMTime(t, dst, "d/f4.txt", when.Add(time.Hour))
+
+		s := mustSucceed(t, runJob(t, m, packSpec(mode, src, dst, syncjob.PackOptions{Threshold: 1024, MinFiles: 3})))
+		for _, gone := range []string{"f0", "f1", "f2"} {
+			if exists(dst, "d/"+gone+".txt") {
+				t.Fatalf("%s: superseded loose copy %s kept", mode, gone)
+			}
+		}
+		for _, kept := range []string{"f3", "f4"} {
+			if !exists(dst, "d/"+kept+".txt") {
+				t.Fatalf("%s: conflicting loose copy %s deleted", mode, kept)
+			}
+		}
+		if got, _ := read(t, dst, "d/f3.txt"); got != "different size!" {
+			t.Fatalf("%s: conflicting file content changed: %q", mode, got)
+		}
+		if s.PackStats.Conflicts != 2 {
+			t.Fatalf("%s: conflicts = %d, want 2", mode, s.PackStats.Conflicts)
+		}
+		if len(loadTestManifest(t, dst, "d").Files) != 5 {
+			t.Fatalf("%s: not all files packed", mode)
+		}
+	}
+}

@@ -117,6 +117,9 @@ type PackStats struct {
 	BytesOut    int64 `json:"bytes_out"`
 	SkippedDirs int64 `json:"skipped_dirs"`
 	DeadRemoved int64 `json:"dead_removed"`
+	// Conflicts: a name that exists both loose and in a pack with different
+	// content. Packing keeps the loose dst copy; unpacking takes the pack.
+	Conflicts int64 `json:"conflicts"`
 	// Unpacking: files extracted to dst and their bytes, and packs fetched in
 	// full / read by range.
 	UnpackedFiles int64 `json:"unpacked_files,omitempty"`

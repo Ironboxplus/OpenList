@@ -366,3 +366,23 @@ func TestUnpackLegacyRefusesEscapingEntries(t *testing.T) {
 		t.Fatalf("an archive entry escaped the target directory")
 	}
 }
+
+func TestUnpackPrefersPackMemberOverLooseSameName(t *testing.T) {
+	m := newManager(t)
+	src, packed, out := tempDir(t), tempDir(t), tempDir(t)
+	for i := 0; i < 4; i++ {
+		write(t, src, fmt.Sprintf("d/f%d.txt", i), "from the pack")
+	}
+	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, packed, syncjob.PackOptions{Threshold: 1024, MinFiles: 3})))
+	write(t, packed, "d/f1.txt", "loose impostor")
+
+	for _, mode := range []syncjob.Mode{syncjob.ModeCopy, syncjob.ModeSync} {
+		s := mustSucceed(t, runJob(t, m, unpackSpec(mode, packed, out)))
+		if s.PackStats.Conflicts != 1 {
+			t.Fatalf("%s: conflicts = %d, want 1", mode, s.PackStats.Conflicts)
+		}
+		if got, _ := read(t, out, "d/f1.txt"); got != "from the pack" {
+			t.Fatalf("%s: d/f1.txt = %q, want the pack member", mode, got)
+		}
+	}
+}

@@ -40,14 +40,15 @@ func packUp(ctx context.Context, spec Spec, src, dst fs.Fs) (fs.Fs, fs.Fs, error
 	}
 	defer stage.close()
 	p := &packer{
-		opts:    spec.Pack,
-		src:     src,
-		dst:     dst,
-		stage:   stage,
-		sync:    spec.Mode == ModeSync,
-		dry:     spec.DryRun,
-		hidden:  map[string]struct{}{},
-		srcDirs: map[string]struct{}{},
+		opts:      spec.Pack,
+		src:       src,
+		dst:       dst,
+		stage:     stage,
+		sync:      spec.Mode == ModeSync,
+		dry:       spec.DryRun,
+		hidden:    map[string]struct{}{},
+		hiddenDst: map[string]struct{}{},
+		srcDirs:   map[string]struct{}{},
 	}
 	if err := walkDirs(ctx, src, func(dir string, files []fs.Object, _ []string) error {
 		return p.dir(ctx, dir, files)
@@ -67,7 +68,14 @@ func packUp(ctx context.Context, spec Spec, src, dst fs.Fs) (fs.Fs, fs.Fs, error
 		_, ok := hidden[remote]
 		return ok
 	})
-	dstView := newViewFs(ctx, dst, func(remote string, isDir bool) bool { return isDir && isPackDir(remote) })
+	hiddenDst := p.hiddenDst
+	dstView := newViewFs(ctx, dst, func(remote string, isDir bool) bool {
+		if isDir {
+			return isPackDir(remote)
+		}
+		_, ok := hiddenDst[remote]
+		return ok
+	})
 	return srcView, dstView, nil
 }
 
@@ -79,24 +87,78 @@ type packer struct {
 	sync   bool
 	dry    bool
 	hidden map[string]struct{}
+	// hiddenDst are loose dst files the main pass must not touch.
+	hiddenDst map[string]struct{}
 	// srcDirs are the directories that exist at src (and pass the filter).
 	srcDirs map[string]struct{}
 }
 
-func (p *packer) hasPackDir(ctx context.Context, dir string) (bool, error) {
+// scanDst lists dir at dst: whether it has a .oppack, and its loose files.
+func (p *packer) scanDst(ctx context.Context, dir string) (bool, map[string]fs.Object, error) {
 	entries, err := p.dst.List(ctx, dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrorDirNotFound) {
-			return false, nil
+			return false, nil, nil
 		}
-		return false, fmt.Errorf("list %q at dst: %w", dir, err)
+		return false, nil, fmt.Errorf("list %q at dst: %w", dir, err)
 	}
+	has := false
+	files := map[string]fs.Object{}
 	for _, e := range entries {
-		if _, ok := e.(fs.Directory); ok && path.Base(e.Remote()) == PackDirName {
-			return true, nil
+		switch x := e.(type) {
+		case fs.Directory:
+			if path.Base(x.Remote()) == PackDirName {
+				has = true
+			}
+		case fs.Object:
+			files[path.Base(x.Remote())] = x
 		}
 	}
-	return false, nil
+	return has, files, nil
+}
+
+// sameLoose says whether the loose dst file is the very file just packed:
+// same size and, where dst keeps modification times, the same time to within
+// a second; where it doesn't (115), the same SHA1 — without one to compare,
+// it is not provably the same.
+func (p *packer) sameLoose(ctx context.Context, srcObj, dstObj fs.Object) bool {
+	if srcObj.Size() != dstObj.Size() {
+		return false
+	}
+	if p.dst.Precision() != fs.ModTimeNotSupported {
+		d := srcObj.ModTime(ctx).Sub(dstObj.ModTime(ctx))
+		if d < 0 {
+			d = -d
+		}
+		return d <= max(time.Second, p.dst.Precision())
+	}
+	a, errA := srcObj.Hash(ctx, rhash.SHA1)
+	b, errB := dstObj.Hash(ctx, rhash.SHA1)
+	return errA == nil && errB == nil && a != "" && strings.EqualFold(a, b)
+}
+
+// retireLoose removes the loose dst copies of files that now live in a pack.
+// A copy that differs from what was packed is somebody's other data: it is
+// kept, counted as a conflict, and hidden from the main pass so sync leaves
+// it alone too.
+func (p *packer) retireLoose(ctx context.Context, dir string, packed []fs.Object, loose map[string]fs.Object) error {
+	for _, o := range packed {
+		name := path.Base(o.Remote())
+		d, ok := loose[name]
+		if !ok {
+			continue
+		}
+		if p.sameLoose(ctx, o, d) {
+			if err := d.Remove(ctx); err != nil {
+				return fmt.Errorf("remove superseded %s: %w", d.Remote(), err)
+			}
+			continue
+		}
+		log.Warnf("[sync] pack: %s exists loose at dst with different content than the packed copy; keeping both", d.Remote())
+		p.hiddenDst[d.Remote()] = struct{}{}
+		addStats(ctx, func(s *PackStats) { s.Conflicts++ })
+	}
+	return nil
 }
 
 // removeOrphans deletes the .oppack of directories sync is about to delete
@@ -181,10 +243,11 @@ func (p *packer) dir(ctx context.Context, dir string, files []fs.Object) error {
 	// pass needs anyway and OpenList caches; asking for index.json directly
 	// would be a driver lookup per directory.
 	m, mObj := newManifest(p.opts.Threshold), fs.Object(nil)
-	if has, err := p.hasPackDir(ctx, dir); err != nil {
+	has, dstFiles, err := p.scanDst(ctx, dir)
+	if err != nil {
 		return fmt.Errorf("pack %q: %w", dir, err)
-	} else if has {
-		var err error
+	}
+	if has {
 		if m, mObj, err = loadManifest(ctx, p.dst, dir, p.opts.Threshold); err != nil {
 			return fmt.Errorf("pack %q: read manifest: %w", dir, err)
 		}
@@ -297,6 +360,10 @@ func (p *packer) dir(ctx context.Context, dir string, files []fs.Object) error {
 	m.recount()
 	if err := p.commitManifest(ctx, dir, m, mObj); err != nil {
 		return fmt.Errorf("pack %q: write manifest: %w", dir, err)
+	}
+	// The new members are committed: loose copies at dst are now duplicates.
+	if err := p.retireLoose(ctx, dir, add, dstFiles); err != nil {
+		return fmt.Errorf("pack %q: %w", dir, err)
 	}
 	// Only now that no manifest refers to them.
 	for _, name := range obsolete {
