@@ -225,3 +225,19 @@ func GetMediaAssets(ids []uint) ([]model.MediaAsset, error) {
 func CreateMediaAsset(a *model.MediaAsset) error {
 	return errors.WithStack(db.Create(a).Error)
 }
+
+// ListMediaPostersUnder returns, in one query, every item below parent that
+// has a poster (path, title, year, poster_id only). The caller groups them per
+// collection.
+func ListMediaPostersUnder(parent string) ([]model.MediaItem, error) {
+	prefix := strings.TrimRight(parent, "/") + "/"
+	var items []model.MediaItem
+	err := db.Select("id", "path", "title", "year", "poster_id").
+		Where("poster_id > 0").
+		Where("path LIKE ? ESCAPE '!'", likeEscape(prefix)+"%").
+		Find(&items).Error
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return items, nil
+}

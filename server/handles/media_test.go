@@ -783,3 +783,77 @@ func TestLibraryRootOpensWithItsChildren(t *testing.T) {
 		t.Fatal("admin list by kind=library lost the root")
 	}
 }
+
+func TestCollectionsGetAChildPosterMosaic(t *testing.T) {
+	m := newMediaEnv(t)
+	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib", "kind": "library", "title": "Lib"})
+	for _, c := range []string{"/lib/C", "/lib/D"} {
+		m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": c, "kind": "collection", "title": c})
+	}
+	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib/M", "kind": "movie", "title": "M"})
+	// five posters under C (one nested deeper), ids by year
+	type kid struct {
+		path  string
+		year  int
+		color uint8
+	}
+	ids := map[int]uint{}
+	for _, k := range []kid{{"/lib/C/a", 2005, 10}, {"/lib/C/b", 1999, 40}, {"/lib/C/deep/c", 2010, 70}, {"/lib/C/d", 2001, 100}, {"/lib/C/e", 2003, 130}, {"/lib/C/f", 0, 160}} {
+		id := m.upload(testPNG(t, 40, 60, color.RGBA{k.color, 1, 2, 255}))
+		ids[k.year] = id
+		m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": k.path, "kind": "movie", "title": k.path, "year": k.year, "poster_id": id})
+	}
+	// an item without a poster adds nothing
+	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib/C/nopic", "kind": "movie", "title": "x", "year": 1990})
+
+	assetOf := func(u string) uint {
+		var id uint
+		if _, err := fmt.Sscanf(u[strings.Index(u, "/api/media/asset/"):], "/api/media/asset/%d", &id); err != nil {
+			t.Fatalf("poster url %q", u)
+		}
+		if !strings.Contains(u, "v=thumb") || !strings.Contains(u, "sign=") {
+			t.Errorf("not a signed thumb url: %s", u)
+		}
+		return id
+	}
+	raw := m.ok("POST", "/api/fs/media", "alice", map[string]any{"path": "/lib"})
+	var got struct {
+		Children []map[string]any `json:"children"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	by := map[string]map[string]any{}
+	for _, ch := range got.Children {
+		by[ch["path"].(string)] = ch
+	}
+	cp, ok := by["/lib/C"]["child_posters"].([]any)
+	if !ok || len(cp) != 4 {
+		t.Fatalf("C child_posters: %s", raw)
+	}
+	for i, want := range []int{1999, 2001, 2003, 2005} {
+		if g := assetOf(cp[i].(string)); g != ids[want] {
+			t.Errorf("poster %d is asset %d, want the one of year %d (%d)", i, g, want, ids[want])
+		}
+	}
+	if d, ok := by["/lib/D"]["child_posters"].([]any); !ok || len(d) != 0 {
+		t.Errorf("an empty collection still carries child_posters: %v", by["/lib/D"])
+	}
+	if _, has := by["/lib/M"]["child_posters"]; has {
+		t.Error("a movie got child_posters")
+	}
+
+	// the collection's own detail carries the mosaic too; a non-collection item doesn't
+	var detail struct {
+		Item map[string]any `json:"item"`
+	}
+	_ = json.Unmarshal(m.ok("POST", "/api/fs/media", "alice", map[string]any{"path": "/lib/C"}), &detail)
+	if cp, ok := detail.Item["child_posters"].([]any); !ok || len(cp) != 4 {
+		t.Errorf("item.child_posters: %v", detail.Item)
+	}
+	detail.Item = nil
+	_ = json.Unmarshal(m.ok("POST", "/api/fs/media", "alice", map[string]any{"path": "/lib/M"}), &detail)
+	if _, has := detail.Item["child_posters"]; has {
+		t.Error("a movie item got child_posters")
+	}
+}

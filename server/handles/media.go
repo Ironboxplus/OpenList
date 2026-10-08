@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -109,6 +110,7 @@ type MediaItemResp struct {
 	Overview      string                 `json:"overview"`
 	PosterURL     string                 `json:"poster_url"`
 	BackdropURL   string                 `json:"backdrop_url"`
+	ChildPosters  *[]string              `json:"child_posters,omitempty"` // collections: up to 4 posters of what is inside
 	Source        string                 `json:"source"`
 	Confidence    float32                `json:"confidence"`
 	Locked        bool                   `json:"locked"`
@@ -126,6 +128,9 @@ type MediaListResp struct {
 	Year      int            `json:"year"`
 	Ratings   map[string]any `json:"ratings"`
 	PosterURL string         `json:"poster_url"`
+	// ChildPosters is set for collections only: up to 4 signed thumb URLs of
+	// the posters of the items below, by year then title.
+	ChildPosters *[]string `json:"child_posters,omitempty"`
 }
 
 // MediaAdminListResp adds the review fields the admin list needs.
@@ -297,6 +302,14 @@ func FsMedia(c *gin.Context) {
 		common.ErrorResp(c, err, 500, true)
 		return
 	}
+	posters, err := collectionPosters(user, reqPath, item, kids)
+	if err != nil {
+		common.ErrorResp(c, err, 500, true)
+		return
+	}
+	if resp.Item != nil && item.Kind == model.MediaKindCollection {
+		resp.Item.ChildPosters = posters[""]
+	}
 	for i := range kids {
 		k := &kids[i]
 		// the same rules as the listing: hide patterns of this directory's
@@ -307,9 +320,77 @@ func FsMedia(c *gin.Context) {
 		if cm, err := op.GetNearestMeta(k.Path); (err == nil || errors.Is(errors.Cause(err), errs.MetaNotFound)) && !common.CanRead(user, cm, k.Path) {
 			continue
 		}
-		resp.Children = append(resp.Children, toListResp(k, rel))
+		lr := toListResp(k, rel)
+		if k.Kind == model.MediaKindCollection {
+			lr.ChildPosters = posters[k.Path]
+		}
+		resp.Children = append(resp.Children, lr)
 	}
 	common.SuccessResp(c, resp)
+}
+
+// collectionPosters finds up to 4 poster URLs for the collection at reqPath
+// (key "") and for each collection among kids (key: its path). One query reads
+// every poster below reqPath; the rest is grouping. An item the user may not
+// read is skipped, so a poster never shows what the listing would hide.
+func collectionPosters(user *model.User, reqPath string, item *model.MediaItem, kids []model.MediaItem) (map[string]*[]string, error) {
+	out := map[string]*[]string{}
+	var owners []string // the collections that want a mosaic
+	if item != nil && item.Kind == model.MediaKindCollection {
+		owners = append(owners, "")
+	}
+	for i := range kids {
+		if kids[i].Kind == model.MediaKindCollection {
+			owners = append(owners, kids[i].Path)
+		}
+	}
+	if len(owners) == 0 {
+		return out, nil
+	}
+	rows, err := db.ListMediaPostersUnder(reqPath)
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(rows, func(i, j int) bool {
+		yi, yj := rows[i].Year, rows[j].Year
+		if (yi == 0) != (yj == 0) {
+			return yj == 0 // unknown years last
+		}
+		if yi != yj {
+			return yi < yj
+		}
+		if rows[i].Title != rows[j].Title {
+			return rows[i].Title < rows[j].Title
+		}
+		return rows[i].Path < rows[j].Path
+	})
+	readable := map[string]bool{}
+	canRead := func(p string) bool {
+		if v, ok := readable[p]; ok {
+			return v
+		}
+		cm, err := op.GetNearestMeta(p)
+		ok := (err == nil || errors.Is(errors.Cause(err), errs.MetaNotFound)) && common.CanRead(user, cm, p)
+		readable[p] = ok
+		return ok
+	}
+	for _, owner := range owners {
+		urls := []string{}
+		for i := range rows {
+			if len(urls) == 4 {
+				break
+			}
+			if owner != "" && !strings.HasPrefix(rows[i].Path, owner+"/") {
+				continue
+			}
+			if !canRead(rows[i].Path) {
+				continue
+			}
+			urls = append(urls, assetURL(rows[i].PosterID, true))
+		}
+		out[owner] = &urls
+	}
+	return out, nil
 }
 
 // assetFail answers with a real HTTP status: an <img> only sees the status,
