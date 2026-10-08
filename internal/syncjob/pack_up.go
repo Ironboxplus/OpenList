@@ -6,6 +6,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -39,18 +40,24 @@ func packUp(ctx context.Context, spec Spec, src, dst fs.Fs) (fs.Fs, fs.Fs, error
 	}
 	defer stage.close()
 	p := &packer{
-		opts:   spec.Pack,
-		src:    src,
-		dst:    dst,
-		stage:  stage,
-		sync:   spec.Mode == ModeSync,
-		dry:    spec.DryRun,
-		hidden: map[string]struct{}{},
+		opts:    spec.Pack,
+		src:     src,
+		dst:     dst,
+		stage:   stage,
+		sync:    spec.Mode == ModeSync,
+		dry:     spec.DryRun,
+		hidden:  map[string]struct{}{},
+		srcDirs: map[string]struct{}{},
 	}
 	if err := walkDirs(ctx, src, func(dir string, files []fs.Object, _ []string) error {
 		return p.dir(ctx, dir, files)
 	}); err != nil {
 		return nil, nil, err
+	}
+	if p.sync && !p.dry {
+		if err := p.removeOrphans(ctx); err != nil {
+			return nil, nil, err
+		}
 	}
 	hidden := p.hidden
 	srcView := newViewFs(ctx, src, func(remote string, isDir bool) bool {
@@ -72,6 +79,67 @@ type packer struct {
 	sync   bool
 	dry    bool
 	hidden map[string]struct{}
+	// srcDirs are the directories that exist at src (and pass the filter).
+	srcDirs map[string]struct{}
+}
+
+// removeOrphans deletes the .oppack of directories sync is about to delete
+// because src no longer has them; hidden from the main pass, it would keep
+// the directory alive. Directories the filter excludes are not visited, so
+// they are left alone like any other file there.
+func (p *packer) removeOrphans(ctx context.Context) error {
+	var orphans []string
+	err := walkDirs(ctx, p.dst, func(dir string, _ []fs.Object, subdirs []string) error {
+		if _, ok := p.srcDirs[dir]; ok {
+			return nil
+		}
+		for _, d := range subdirs {
+			if d == PackDirName {
+				orphans = append(orphans, dir)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, dir := range orphans {
+		if err := p.removePackDir(ctx, dir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// removePackDir deletes dir's .oppack at dst, manifest first so nothing ever
+// points at a missing pack.
+func (p *packer) removePackDir(ctx context.Context, dir string) error {
+	pd := path.Join(dir, PackDirName)
+	entries, err := p.dst.List(ctx, pd)
+	if err != nil {
+		if errors.Is(err, fs.ErrorDirNotFound) {
+			return nil
+		}
+		return fmt.Errorf("pack %q: list %s: %w", dir, PackDirName, err)
+	}
+	var objs []fs.Object
+	for _, e := range entries {
+		if o, ok := e.(fs.Object); ok {
+			objs = append(objs, o)
+		}
+	}
+	sort.Slice(objs, func(i, j int) bool {
+		return path.Base(objs[i].Remote()) == PackIndexName && path.Base(objs[j].Remote()) != PackIndexName
+	})
+	for _, o := range objs {
+		if err := o.Remove(ctx); err != nil {
+			return fmt.Errorf("pack %q: remove %s: %w", dir, o.Remote(), err)
+		}
+	}
+	if err := p.dst.Rmdir(ctx, pd); err != nil {
+		log.Warnf("[sync] pack: can't remove empty %s: %v", pd, err)
+	}
+	return nil
 }
 
 func (p *packer) dir(ctx context.Context, dir string, files []fs.Object) error {
@@ -84,16 +152,22 @@ func (p *packer) dir(ctx context.Context, dir string, files []fs.Object) error {
 			small[name] = o
 		}
 	}
-	if len(small) == 0 {
-		return nil
-	}
-	if len(small) < p.opts.MinFiles {
-		addStats(ctx, func(s *PackStats) { s.SkippedDirs++ })
-		return nil
-	}
+	p.srcDirs[dir] = struct{}{}
 	m, mObj, err := loadManifest(ctx, p.dst, dir, p.opts.Threshold)
 	if err != nil {
 		return fmt.Errorf("pack %q: read manifest: %w", dir, err)
+	}
+	// MinFiles only decides whether to start packing a directory. Once dst
+	// has a manifest the directory stays packed, or loose and packed copies
+	// of the same names would coexist at dst.
+	if mObj == nil {
+		if len(small) == 0 {
+			return nil
+		}
+		if len(small) < p.opts.MinFiles {
+			addStats(ctx, func(s *PackStats) { s.SkippedDirs++ })
+			return nil
+		}
 	}
 	for _, o := range small {
 		p.hidden[o.Remote()] = struct{}{}
@@ -161,6 +235,10 @@ func (p *packer) dir(ctx context.Context, dir string, files []fs.Object) error {
 		}
 		addStats(ctx, func(s *PackStats) { s.PackedFiles += int64(len(add)); s.BytesIn += n })
 		return nil
+	}
+	if mObj != nil && len(m.Files) == 0 && len(add) == 0 {
+		// Nothing left to pack: the whole .oppack goes.
+		return p.removePackDir(ctx, dir)
 	}
 	if len(add) == 0 && len(compact) == 0 && len(obsolete) == 0 && !dirty {
 		return nil

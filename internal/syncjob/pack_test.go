@@ -313,3 +313,68 @@ func TestPackDefaultsAreInOnePlace(t *testing.T) {
 		t.Fatalf("8 small files with default options were not packed")
 	}
 }
+
+func TestPackIsStickyBelowMinFiles(t *testing.T) {
+	m := newManager(t)
+	src, dst := t.TempDir(), t.TempDir()
+	for i := 0; i < 5; i++ {
+		write(t, src, fmt.Sprintf("d/f%d.txt", i), "small")
+	}
+	opts := syncjob.PackOptions{Threshold: 1024, MinFiles: 4}
+	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeSync, src, dst, opts)))
+
+	// Down to 2 small files (< MinFiles): still packed, nothing loose.
+	for i := 2; i < 5; i++ {
+		_ = os.Remove(filepath.Join(src, "d", fmt.Sprintf("f%d.txt", i)))
+	}
+	write(t, src, "d/f0.txt", "edited")
+	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeSync, src, dst, opts)))
+	if exists(dst, "d/f0.txt") || exists(dst, "d/f1.txt") {
+		t.Fatalf("small files went up loose next to a manifest")
+	}
+	if got := strings.Join(fileNames(loadTestManifest(t, dst, "d")), ","); got != "f0.txt,f1.txt" {
+		t.Fatalf("manifest = %s", got)
+	}
+
+	// Down to none: the whole .oppack goes.
+	_ = os.Remove(filepath.Join(src, "d", "f0.txt"))
+	_ = os.Remove(filepath.Join(src, "d", "f1.txt"))
+	write(t, src, "d/big.bin", strings.Repeat("B", 3000))
+	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeSync, src, dst, opts)))
+	if exists(dst, "d/.oppack") {
+		t.Fatalf(".oppack still at dst with no live files")
+	}
+	if !exists(dst, "d/big.bin") {
+		t.Fatalf("big file missing")
+	}
+}
+
+func TestPackOrphanOppackFollowsSyncOnly(t *testing.T) {
+	opts := syncjob.PackOptions{Threshold: 1024, MinFiles: 3}
+	for _, mode := range []syncjob.Mode{syncjob.ModeSync, syncjob.ModeCopy} {
+		m := newManager(t)
+		src, dst := t.TempDir(), t.TempDir()
+		for i := 0; i < 4; i++ {
+			write(t, src, fmt.Sprintf("gone/sub/f%d.txt", i), "small")
+			write(t, src, fmt.Sprintf("keep/f%d.txt", i), "small")
+		}
+		mustSucceed(t, runJob(t, m, packSpec(mode, src, dst, opts)))
+		if !exists(dst, "gone/sub/.oppack/index.json") {
+			t.Fatalf("%s: setup: no pack", mode)
+		}
+		if err := os.RemoveAll(filepath.Join(src, "gone")); err != nil {
+			t.Fatal(err)
+		}
+		mustSucceed(t, runJob(t, m, packSpec(mode, src, dst, opts)))
+		if mode == syncjob.ModeSync {
+			if exists(dst, "gone") {
+				t.Fatalf("sync left the deleted directory (or its .oppack) at dst")
+			}
+		} else if !exists(dst, "gone/sub/.oppack/index.json") {
+			t.Fatalf("copy removed .oppack of a deleted directory")
+		}
+		if !exists(dst, "keep/.oppack/index.json") {
+			t.Fatalf("%s: unrelated .oppack removed", mode)
+		}
+	}
+}
