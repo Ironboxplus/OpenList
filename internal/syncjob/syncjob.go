@@ -497,6 +497,13 @@ func run(ctx context.Context, spec Spec, src, dst fs.Fs) error {
 	return fmt.Errorf("unknown mode %q", spec.Mode)
 }
 
+// NewFilter parses rclone filter rules ("- SPs/**", "+ *.mkv") into a filter,
+// for callers outside a sync that want the same syntax.
+func NewFilter(rules []string) (*filter.Filter, error) {
+	fopt := newFilterOpt(rules)
+	return filter.NewFilter(&fopt)
+}
+
 // newFilterOpt copies rclone's default filter options (MinAge/MaxAge are
 // DurationOff there) instead of using the zero value, whose 0s/0s ages make
 // NewFilter fail whenever the two clock reads differ (e.g. on Linux).
