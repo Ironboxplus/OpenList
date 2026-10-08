@@ -692,6 +692,37 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 	if model.ObjHasMask(parentDir, model.NoWrite) {
 		return errors.WithStack(errs.PermissionDenied)
 	}
+	err = PutInDir(ctx, storage, parentDir, dstDirPath, file, up)
+	log.Debugf("put file [%s] done", file.GetName())
+	if storage.Config().NoOverwriteUpload && fi != nil && fi.GetSize() > 0 {
+		if err != nil {
+			// upload failed, recover old obj
+			err := Rename(ctx, storage, tempPath, file.GetName())
+			if err != nil {
+				log.Errorf("failed recover old obj: %+v", err)
+			}
+		} else {
+			// upload success, remove old obj
+			err = Remove(ctx, storage, tempPath)
+		}
+	}
+	return errors.WithStack(err)
+}
+
+// PutInDir uploads file into parentDir, which the caller has already resolved
+// (dstDirPath is parentDir's path inside storage). Unlike Put it looks nothing
+// up: no existence check on the target, no MakeDir, no parent Get. It is for a
+// caller that knows the target does not exist and holds the directory object;
+// the caller also owns closing file.
+func PutInDir(ctx context.Context, storage driver.Driver, parentDir model.Obj, dstDirPath string, file model.FileStreamer, up driver.UpdateProgress) error {
+	if storage.Config().CheckStatus && storage.GetStorage().Status != WORK {
+		return errors.WithMessagef(errs.StorageNotInit, "storage status: %s", storage.GetStorage().Status)
+	}
+	if model.ObjHasMask(parentDir, model.NoWrite) {
+		return errors.WithStack(errs.PermissionDenied)
+	}
+	dstDirPath = utils.FixAndCleanPath(dstDirPath)
+	dstPath := stdpath.Join(dstDirPath, file.GetName())
 	// if up is nil, set a default to prevent panic
 	if up == nil {
 		up = func(p float64) {}
@@ -703,7 +734,10 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 		file.CacheFullAndWriter(nil, nil)
 	}
 
-	var newObj model.Obj
+	var (
+		newObj model.Obj
+		err    error
+	)
 	switch s := storage.(type) {
 	case driver.PutResult:
 		newObj, err = s.Put(ctx, parentDir, file, up)
@@ -735,20 +769,7 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 			go objsUpdateHook(context.WithoutCancel(ctx), storage, dstDirPath, false)
 		}
 	}
-	log.Debugf("put file [%s] done", file.GetName())
-	if storage.Config().NoOverwriteUpload && fi != nil && fi.GetSize() > 0 {
-		if err != nil {
-			// upload failed, recover old obj
-			err := Rename(ctx, storage, tempPath, file.GetName())
-			if err != nil {
-				log.Errorf("failed recover old obj: %+v", err)
-			}
-		} else {
-			// upload success, remove old obj
-			err = Remove(ctx, storage, tempPath)
-		}
-	}
-	return errors.WithStack(err)
+	return err
 }
 
 func PutURL(ctx context.Context, storage driver.Driver, dstDirPath, dstName, url string) error {

@@ -32,6 +32,8 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 		return fs.ErrorCantDirMove
 	}
 	dstFull := f.fullPath(dstRemote)
+	srcFs.forgetDir(srcFs.fullPath(srcRemote))
+	f.forgetDir(dstFull)
 	if _, err := olfs.Get(ctx, dstFull, &olfs.GetArgs{NoLog: true}); err == nil {
 		return fs.ErrorDirExists
 	}

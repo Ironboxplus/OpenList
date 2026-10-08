@@ -101,7 +101,7 @@ func (o *Object) openRange(ctx context.Context, r http_range.Range) (io.ReadClos
 }
 
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	newObj, err := o.fs.Put(ctx, in, fs.NewOverrideRemote(src, o.remote), options...)
+	newObj, err := o.fs.upload(ctx, in, fs.NewOverrideRemote(src, o.remote), true)
 	if err != nil {
 		return err
 	}

@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"io"
 	stdpath "path"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
@@ -28,6 +30,13 @@ import (
 type Fs struct {
 	root     string
 	features *fs.Features
+	// dirs maps a directory's full path to the object a driver needs as the
+	// parent of a Put. It lives as long as the Fs (one job), unlike op's dir
+	// cache which expires mid-job, and unlike op.Get which, on drivers with a
+	// Getter, never caches the directory at all. Without it every uploaded
+	// file costs two or three directory lookups on top of the upload.
+	dirs  sync.Map
+	dirMu sync.Mutex
 }
 
 var (
@@ -78,6 +87,7 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 		if !obj.IsDir() {
 			return nil, fs.ErrorIsFile
 		}
+		f.rememberDir(full, obj)
 	}
 	objs, err := olfs.List(ctx, full, &olfs.ListArgs{NoLog: true})
 	if err != nil {
@@ -122,9 +132,35 @@ func (f *Fs) newObject(remote string, obj model.Obj) *Object {
 	}
 }
 
+// rememberDir records dir for Put. Virtual objects (a mount point seen from
+// its parent) carry no driver ID, so they can't be a Put parent.
+func (f *Fs) rememberDir(full string, obj model.Obj) {
+	if !obj.IsDir() || model.ObjHasMask(obj, model.Virtual) {
+		return
+	}
+	f.dirs.Store(utils.FixAndCleanPath(full), model.UnwrapObjName(obj))
+}
+
+// forgetDir drops dir and everything remembered below it.
+func (f *Fs) forgetDir(full string) {
+	full = utils.FixAndCleanPath(full)
+	f.dirs.Range(func(k, _ any) bool {
+		if p := k.(string); p == full || strings.HasPrefix(p, strings.TrimSuffix(full, "/")+"/") {
+			f.dirs.Delete(k)
+		}
+		return true
+	})
+}
+
+// Put is only called by rclone for a destination that does not exist, so it
+// goes straight to the driver; Object.Update takes the checked path.
 func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	return f.upload(ctx, in, src, false)
+}
+
+func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, exists bool) (fs.Object, error) {
 	remote := src.Remote()
-	obj, read, err := f.put(ctx, in, src)
+	obj, read, err := f.put(ctx, in, src, exists)
 	observeUpload(ctx, Upload{Remote: remote, Size: src.Size(), SourceRead: read, Err: err})
 	if err != nil {
 		return nil, err
@@ -132,7 +168,7 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	return obj, nil
 }
 
-func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo) (*Object, int64, error) {
+func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, exists bool) (*Object, int64, error) {
 	remote := src.Remote()
 	full := f.fullPath(remote)
 	dir, name := stdpath.Split(full)
@@ -149,10 +185,25 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo) (*Object,
 		_ = file.Close()
 		return nil, 0, errors.WithStack(errs.UploadNotSupported)
 	}
-	// Remember what we already know about the content before op.Put closes
-	// the stream: a driver that doesn't return the new object leaves only a
+	// Remember what we already know about the content before the stream is
+	// closed: a driver that doesn't return the new object leaves only a
 	// hashless placeholder in the dir cache.
 	known := file.GetHash()
+	if !exists {
+		if parent, err := f.ensureDir(ctx, dir); err == nil {
+			defer func() {
+				if err := file.Close(); err != nil {
+					fs.Logf(f, "close upload stream: %v", err)
+				}
+			}()
+			if err := op.PutInDir(ctx, storage, parent, actualDir, file, nil); err != nil {
+				return nil, read.Load(), err
+			}
+			// Everything about the new object is already known; asking the
+			// drive for it again would cost another lookup per file.
+			return &Object{fs: f, remote: remote, size: src.Size(), modTime: src.ModTime(ctx), hashes: known}, read.Load(), nil
+		}
+	}
 	if err := op.Put(ctx, storage, actualDir, file, nil); err != nil {
 		return nil, read.Load(), err
 	}
@@ -167,11 +218,42 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo) (*Object,
 	return obj, read.Load(), nil
 }
 
-func (f *Fs) Mkdir(ctx context.Context, dir string) error {
-	err := olfs.MakeDir(ctx, f.fullPath(dir))
-	if err != nil && errs.IsObjectAlreadyExists(err) {
-		return nil
+// ensureDir makes sure the directory at full exists and returns its object,
+// from dirs when it is there. Otherwise it creates the directory if need be
+// and looks it up once, then remembers it. Transfers run in parallel and all
+// miss at the start of a job, as does rclone's own Mkdir, so the miss path is
+// serialised: the first caller resolves the directory, the rest find it in
+// dirs.
+func (f *Fs) ensureDir(ctx context.Context, full string) (model.Obj, error) {
+	key := utils.FixAndCleanPath(full)
+	if v, ok := f.dirs.Load(key); ok {
+		return v.(model.Obj), nil
 	}
+	f.dirMu.Lock()
+	defer f.dirMu.Unlock()
+	if v, ok := f.dirs.Load(key); ok {
+		return v.(model.Obj), nil
+	}
+	storage, actualDir, err := op.GetStorageAndActualPath(key)
+	if err != nil {
+		return nil, errors.WithMessage(err, "failed get storage")
+	}
+	if err := op.MakeDir(ctx, storage, actualDir); err != nil && !errs.IsObjectAlreadyExists(err) {
+		return nil, err
+	}
+	obj, err := op.GetUnwrap(ctx, storage, actualDir)
+	if err != nil {
+		return nil, err
+	}
+	if !obj.IsDir() {
+		return nil, errors.WithStack(errs.NotFolder)
+	}
+	f.dirs.Store(key, obj)
+	return obj, nil
+}
+
+func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+	_, err := f.ensureDir(ctx, f.fullPath(dir))
 	return err
 }
 
@@ -183,5 +265,6 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	if len(entries) > 0 {
 		return fs.ErrorDirectoryNotEmpty
 	}
+	f.forgetDir(f.fullPath(dir))
 	return olfs.Remove(ctx, f.fullPath(dir))
 }

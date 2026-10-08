@@ -182,7 +182,7 @@ func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer,
 			retry.OnRetry(func(n uint, err error) {
 				if isTokenExpiredError(err) {
 					log.Warnf("115 OSS token expired, refreshing token...")
-					if newToken, refreshErr := d.client.UploadGetToken(ctx); refreshErr == nil {
+					if newToken, refreshErr := d.refreshUploadToken(ctx, tokenResp); refreshErr == nil {
 						tokenResp = newToken
 						if newBucket, bucketErr := createBucket(tokenResp); bucketErr == nil {
 							bucket = newBucket

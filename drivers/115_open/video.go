@@ -55,7 +55,7 @@ func toVideoSubtitleInfos(list []sdk.SubtitleItem) []driver.VideoSubtitleInfo {
 // serves them as standalone files, so these work on every play source —
 // including the transcoded HLS streams that drop the original embedded tracks.
 func (d *Open115) VideoSubtitle(ctx context.Context, file model.Obj) ([]driver.VideoSubtitleInfo, error) {
-	if err := d.WaitLimit(ctx); err != nil {
+	if err := d.waitAPI(ctx, "VideoSubtitle"); err != nil {
 		return nil, err
 	}
 	obj, ok := file.(*Obj)
@@ -82,7 +82,7 @@ func (d *Open115) VideoSubtitle(ctx context.Context, file model.Obj) ([]driver.V
 // VideoPlay returns the official online-play (transcoded streaming) sources
 // for a video at multiple resolutions.
 func (d *Open115) VideoPlay(ctx context.Context, file model.Obj) ([]driver.VideoPlayInfo, error) {
-	if err := d.WaitLimit(ctx); err != nil {
+	if err := d.waitAPI(ctx, "VideoPlay"); err != nil {
 		return nil, err
 	}
 	obj, ok := file.(*Obj)

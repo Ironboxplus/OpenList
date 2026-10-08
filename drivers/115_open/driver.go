@@ -32,6 +32,7 @@ type Open115 struct {
 	model.Storage
 	Addition
 	client     *sdk.Client
+	tokens     uploadTokenCache
 	limiter    *rate.Limiter
 	parentPath string
 	// tokenInvalid records that this driver instance most recently reported the
@@ -116,7 +117,7 @@ func (d *Open115) Init(ctx context.Context) error {
 		d.client.SetDebug(true)
 	}
 	d.initLimiter()
-	if err := d.WaitLimit(ctx); err != nil {
+	if err := d.waitAPI(ctx, "UserInfo"); err != nil {
 		return err
 	}
 	_, err := d.client.UserInfo(ctx)
@@ -132,7 +133,7 @@ func (d *Open115) Init(ctx context.Context) error {
 	// add parent path
 	d.parentPath = "/"
 	if d.GetRootId() != d.Config().DefaultRoot {
-		if err := d.WaitLimit(ctx); err != nil {
+		if err := d.waitAPI(ctx, "FolderInfo"); err != nil {
 			return err
 		}
 		folderInfo, err := d.client.GetFolderInfo(ctx, d.GetRootId())
@@ -204,7 +205,7 @@ func (d *Open115) List(ctx context.Context, dir model.Obj, args model.ListArgs) 
 	pageCount := 0
 
 	for {
-		if err := d.WaitLimit(ctx); err != nil {
+		if err := d.waitAPI(ctx, "List"); err != nil {
 			return nil, err
 		}
 
@@ -246,7 +247,7 @@ func (d *Open115) Link(ctx context.Context, file model.Obj, args model.LinkArgs)
 	start := time.Now()
 	log.Infof("[115] Link request started for file: %s", file.GetName())
 
-	if err := d.WaitLimit(ctx); err != nil {
+	if err := d.waitAPI(ctx, "Link"); err != nil {
 		return nil, err
 	}
 	var ua string
@@ -297,7 +298,7 @@ func (d *Open115) Link(ctx context.Context, file model.Obj, args model.LinkArgs)
 }
 
 func (d *Open115) Get(ctx context.Context, path string) (model.Obj, error) {
-	if err := d.WaitLimit(ctx); err != nil {
+	if err := d.waitAPI(ctx, "Get"); err != nil {
 		return nil, err
 	}
 	path = stdpath.Join(d.parentPath, path)
@@ -314,7 +315,7 @@ func (d *Open115) Get(ctx context.Context, path string) (model.Obj, error) {
 }
 
 func (d *Open115) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) (model.Obj, error) {
-	if err := d.WaitLimit(ctx); err != nil {
+	if err := d.waitAPI(ctx, "MakeDir"); err != nil {
 		return nil, err
 	}
 	resp, err := d.client.Mkdir(ctx, parentDir.GetID(), dirName)
@@ -333,7 +334,7 @@ func (d *Open115) MakeDir(ctx context.Context, parentDir model.Obj, dirName stri
 }
 
 func (d *Open115) Move(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
-	if err := d.WaitLimit(ctx); err != nil {
+	if err := d.waitAPI(ctx, "Move"); err != nil {
 		return nil, err
 	}
 	_, err := d.client.Move(ctx, &sdk.MoveReq{
@@ -347,7 +348,7 @@ func (d *Open115) Move(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj
 }
 
 func (d *Open115) Rename(ctx context.Context, srcObj model.Obj, newName string) (model.Obj, error) {
-	if err := d.WaitLimit(ctx); err != nil {
+	if err := d.waitAPI(ctx, "Rename"); err != nil {
 		return nil, err
 	}
 	_, err := d.client.UpdateFile(ctx, &sdk.UpdateFileReq{
@@ -365,7 +366,7 @@ func (d *Open115) Rename(ctx context.Context, srcObj model.Obj, newName string) 
 }
 
 func (d *Open115) Copy(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj, error) {
-	if err := d.WaitLimit(ctx); err != nil {
+	if err := d.waitAPI(ctx, "Copy"); err != nil {
 		return nil, err
 	}
 	_, err := d.client.Copy(ctx, &sdk.CopyReq{
@@ -380,7 +381,7 @@ func (d *Open115) Copy(ctx context.Context, srcObj, dstDir model.Obj) (model.Obj
 }
 
 func (d *Open115) Remove(ctx context.Context, obj model.Obj) error {
-	if err := d.WaitLimit(ctx); err != nil {
+	if err := d.waitAPI(ctx, "Remove"); err != nil {
 		return err
 	}
 	_obj, ok := obj.(*Obj)
@@ -431,7 +432,7 @@ func (d *Open115) removePermanently(ctx context.Context, obj *Obj, deleteResp []
 }
 
 func (d *Open115) deleteRecycleBinEntry(ctx context.Context, tid string) error {
-	if err := d.WaitLimit(ctx); err != nil {
+	if err := d.waitAPI(ctx, "RbDelete"); err != nil {
 		return err
 	}
 	_, err := d.client.RbDelete(ctx, tid)
@@ -448,7 +449,7 @@ func (d *Open115) findRecycleBinEntry(ctx context.Context, obj *Obj) (*sdk.RbLis
 
 	offset := int64(0)
 	for {
-		if err := d.WaitLimit(ctx); err != nil {
+		if err := d.waitAPI(ctx, "RbList"); err != nil {
 			return nil, err
 		}
 		resp, err := d.client.RbList(ctx, pageSize, offset)
@@ -558,7 +559,7 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 
 	// 如果有预计算的 hash，先尝试秒传
 	if len(sha1) == utils.SHA1.Width && len(sha1128k) == utils.SHA1_128K.Width {
-		if err := d.WaitLimit(ctx); err != nil {
+		if err := d.waitAPI(ctx, "UploadInit"); err != nil {
 			return err
 		}
 		resp, err := d.client.UploadInit(ctx, &sdk.UploadInitReq{
@@ -643,7 +644,7 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 	}
 
 	// 1. Init（SeekableStream 或已缓存的 FileStream）
-	if err := d.WaitLimit(ctx); err != nil {
+	if err := d.waitAPI(ctx, "UploadInit"); err != nil {
 		return err
 	}
 	resp, err := d.client.UploadInit(ctx, &sdk.UploadInitReq{
@@ -679,7 +680,7 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		if err != nil {
 			return err
 		}
-		if err := d.WaitLimit(ctx); err != nil {
+		if err := d.waitAPI(ctx, "UploadInit"); err != nil {
 			return err
 		}
 		resp, err = d.client.UploadInit(ctx, &sdk.UploadInitReq{
@@ -700,10 +701,7 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		}
 	}
 	// 3. get upload token
-	if err := d.WaitLimit(ctx); err != nil {
-		return err
-	}
-	tokenResp, err := d.client.UploadGetToken(ctx)
+	tokenResp, err := d.uploadToken(ctx)
 	if err != nil {
 		return err
 	}
