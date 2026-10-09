@@ -60,30 +60,37 @@ func packAndTransfer(ctx context.Context, spec Spec, src, dst fs.Fs, transfer fu
 	}
 	defer stage.close()
 	p := &packer{
-		opts:    spec.Pack,
-		src:     src,
-		dst:     dst,
-		stage:   stage,
-		sync:    spec.Mode == ModeSync,
-		dry:     spec.DryRun,
-		hidden:  map[string]struct{}{},
-		present: map[string]struct{}{},
-		v1Dirs:  map[string]struct{}{},
-		loose:   map[string]fs.Object{},
+		opts:     spec.Pack,
+		src:      src,
+		dst:      dst,
+		stage:    stage,
+		sync:     spec.Mode == ModeSync,
+		dry:      spec.DryRun,
+		hidden:   map[string]struct{}{},
+		packOnly: map[string]struct{}{},
+		tree:     map[string]uint8{},
+		dstOnce:  map[string]*dstVerdict{},
+		present:  map[string]struct{}{},
+		v1Dirs:   map[string]struct{}{},
+		loose:    map[string]fs.Object{},
 	}
 	if err := p.plan(ctx); err != nil {
 		return err
 	}
+	p.mainDst = mainDst
+	// Directories whose files all live in packs are hidden from src too, or
+	// rclone would create them (empty-looking) at dst; see packOnly.
 	srcView := newViewFs(ctx, src, func(remote string, isDir bool) bool {
 		if isDir {
-			return isPackDir(remote)
+			_, only := p.packOnly[remote]
+			return only || isPackDir(remote)
 		}
 		_, ok := p.hidden[remote]
 		return ok
 	})
 	dstView := newViewFs(ctx, mainDst, func(remote string, isDir bool) bool {
 		if isDir {
-			return isPackDir(remote)
+			return isPackDir(remote) || p.dstHides(ctx, remote)
 		}
 		_, ok := p.packed[remote]
 		return ok
@@ -144,6 +151,15 @@ type packer struct {
 	small   map[string]fs.Object
 	hidden  map[string]struct{} // their remotes: kept from the main pass
 	present map[string]struct{} // src files that are not small
+	// packOnly: src directories whose subtree has small files but nothing the
+	// main pass would carry (no large file, no genuinely empty directory).
+	// Everything in them lives in packs, so hiding them from src stops rclone
+	// from creating them at dst.
+	packOnly map[string]struct{}
+	tree     map[string]uint8 // per src directory: what it holds itself (treeKeep, treeSmall)
+	mainDst  fs.Fs            // dst as the main pass lists it
+	dstMu    sync.Mutex
+	dstOnce  map[string]*dstVerdict // dstHides' answers
 
 	// What the decision step settled, for the pack line to carry out.
 	add      []fs.Object
@@ -187,12 +203,13 @@ func (p *packer) plan(ctx context.Context) error {
 	if err := p.loadManifest(ctx); err != nil {
 		return err
 	}
-	if err := walkDirs(ctx, p.src, func(_ string, files []fs.Object, _ []string) error {
-		p.scan(files)
+	if err := walkDirs(ctx, p.src, func(dir string, files []fs.Object, subdirs []string) error {
+		p.scan(dir, files, subdirs)
 		return nil
 	}); err != nil {
 		return err
 	}
+	p.findPackOnly()
 	addStats(ctx, func(s *PackStats) { s.SmallFiles = int64(len(p.smalls)) })
 
 	m := p.m
@@ -527,16 +544,121 @@ func (p *packer) loadManifest(ctx context.Context) error {
 	return nil
 }
 
-// scan sorts one src directory's files into small and not.
-func (p *packer) scan(files []fs.Object) {
+const (
+	treeKeep  uint8 = 1 << iota // a file the main pass carries, or an empty directory
+	treeSmall                   // a small file
+)
+
+// scan sorts one src directory's files into small and not, and notes what the
+// directory holds for findPackOnly.
+func (p *packer) scan(dir string, files []fs.Object, subdirs []string) {
+	var flags uint8
 	for _, o := range files {
 		if o.Size() < 0 || o.Size() >= p.opts.Threshold || !validRel(o.Remote()) {
 			p.present[o.Remote()] = struct{}{}
+			flags |= treeKeep
 			continue
 		}
 		p.smalls = append(p.smalls, o)
 		p.hidden[o.Remote()] = struct{}{}
+		flags |= treeSmall
 	}
+	if len(files) == 0 {
+		// Nothing at all (a .oppack alone doesn't count): createEmptySrcDirs
+		// should still recreate it.
+		empty := true
+		for _, n := range subdirs {
+			if n != PackDirName {
+				empty = false
+			}
+		}
+		if empty {
+			flags |= treeKeep
+		}
+	}
+	p.tree[dir] |= flags
+}
+
+// findPackOnly spreads the per-directory flags up the tree and picks the
+// directories that hold small files and nothing else worth creating. It uses
+// only what the walk in plan saw.
+func (p *packer) findPackOnly() {
+	up := make(map[string]uint8, len(p.tree))
+	for dir, f := range p.tree {
+		for d := dir; ; d = path.Dir(d) {
+			if d == "." {
+				d = ""
+			}
+			up[d] |= f
+			if d == "" {
+				break
+			}
+		}
+	}
+	for dir, f := range up {
+		if dir != "" && f&treeSmall != 0 && f&treeKeep == 0 {
+			p.packOnly[dir] = struct{}{}
+		}
+	}
+}
+
+// dstVerdict is the lazily computed answer of dstHides for one directory.
+type dstVerdict struct {
+	once  sync.Once
+	clean bool
+}
+
+// dstHides says whether the main pass is kept away from dir at dst. Src hides
+// the pack-only directories, so to rclone's sync a dst copy of one would be an
+// extra to purge. It is hidden from dst as well, but only when everything in
+// it is ours to ignore: files the manifest holds (the loose copies the tail
+// retires), .oppack directories, and subdirectories hidden by this same rule.
+// Anything else (a file the packs know nothing of, a directory src has no
+// pack-only twin for) leaves it visible, and rclone treats it as it did before
+// directories were hidden.
+//
+// The check lists dst through mainDst, not the view, and feeds the listings to
+// observe: rclone never lists a hidden directory, but its loose copies and v1
+// .oppack directories still have to be found. These are the listings rclone
+// would have made of it, so a hidden directory costs nothing extra; one that
+// stays visible is listed a second time.
+func (p *packer) dstHides(ctx context.Context, dir string) bool {
+	if _, ok := p.packOnly[dir]; !ok {
+		return false
+	}
+	p.dstMu.Lock()
+	v := p.dstOnce[dir]
+	if v == nil {
+		v = &dstVerdict{}
+		p.dstOnce[dir] = v
+	}
+	p.dstMu.Unlock()
+	v.once.Do(func() { v.clean = p.dstClean(ctx, dir) })
+	return v.clean
+}
+
+func (p *packer) dstClean(ctx context.Context, dir string) bool {
+	entries, err := p.mainDst.List(ctx, dir)
+	if err != nil {
+		// Not there: nothing to purge. Any other error: let rclone meet it.
+		return errors.Is(err, fs.ErrorDirNotFound)
+	}
+	p.observe(entries)
+	clean := true
+	for _, e := range entries {
+		switch x := e.(type) {
+		case fs.Object:
+			if _, ok := p.packed[x.Remote()]; !ok {
+				clean = false
+			}
+		case fs.Directory:
+			// No early exit: every subdirectory has to be listed and observed.
+			if !isPackDir(x.Remote()) && !p.dstHides(ctx, x.Remote()) {
+				clean = false
+			}
+		}
+	}
+	return clean
 }
 
 // removeV1 deletes the version 1 packs that now live in the job packs. The
