@@ -64,6 +64,7 @@ func packAndTransfer(ctx context.Context, spec Spec, src, dst fs.Fs, transfer fu
 		src:      src,
 		dst:      dst,
 		stage:    stage,
+		uploads:  newPackUploads(ctx, fs.GetConfig(ctx).Transfers),
 		sync:     spec.Mode == ModeSync,
 		dry:      spec.DryRun,
 		hidden:   map[string]struct{}{},
@@ -74,6 +75,9 @@ func packAndTransfer(ctx context.Context, spec Spec, src, dst fs.Fs, transfer fu
 		v1Dirs:   map[string]struct{}{},
 		loose:    map[string]fs.Object{},
 	}
+	// No upload may outlive the staging area it reads from (runs before
+	// stage.close); failures are reported by commit.
+	defer func() { _ = p.uploads.wait() }()
 	if err := p.plan(ctx); err != nil {
 		return err
 	}
@@ -140,7 +144,9 @@ type packer struct {
 	src   fs.Fs
 	dst   fs.Fs
 	stage *stagingArea
-	sync  bool
+	// uploads sends the finished packs to dst; see packUploads.
+	uploads *packUploads
+	sync    bool
 	dry   bool
 
 	m      *manifest
@@ -799,8 +805,12 @@ func (p *packer) retireLoose(ctx context.Context) error {
 }
 
 // commit saves the previous manifest as manifest.prev, then uploads the new
-// one. Uploading the new manifest is what makes the run count.
+// one. Uploading the new manifest is what makes the run count, so every pack
+// it lists has to be at dst first.
 func (p *packer) commit(ctx context.Context) error {
+	if err := p.uploads.wait(); err != nil {
+		return err
+	}
 	if p.oldRaw != nil {
 		rel, full := p.stage.newPath()
 		if err := os.WriteFile(full, p.oldRaw, 0o644); err != nil {
@@ -947,7 +957,8 @@ func (b *packBuilder) rollIfFull(ctx context.Context) error {
 	return nil
 }
 
-// finish closes the current pack and uploads it.
+// finish closes the current pack and hands it to the uploads; commit waits for
+// them.
 func (b *packBuilder) finish(ctx context.Context) error {
 	if b.zw == nil {
 		return nil
@@ -962,11 +973,13 @@ func (b *packBuilder) finish(ctx context.Context) error {
 		return err
 	}
 	b.m.Packs[name] = packEntry{Bytes: w.n, SHA1: hex.EncodeToString(w.h.Sum(nil)), Live: members}
-	if _, err := b.p.upload(ctx, rel, packPath("", name), nil); err != nil {
-		return fmt.Errorf("upload %s: %w", name, err)
-	}
-	addStats(ctx, func(s *PackStats) { s.PacksWritten++; s.BytesOut += w.n })
-	return nil
+	return b.p.uploads.start(ctx, func(ctx context.Context) error {
+		if _, err := b.p.upload(ctx, rel, packPath("", name), nil); err != nil {
+			return fmt.Errorf("upload %s: %w", name, err)
+		}
+		addStats(ctx, func(s *PackStats) { s.PacksWritten++; s.BytesOut += w.n })
+		return nil
+	})
 }
 
 // migrate moves v1 members whose source is gone into the job packs without

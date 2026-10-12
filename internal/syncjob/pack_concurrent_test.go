@@ -201,3 +201,65 @@ func TestPackV1MigrantsGetASecondCommit(t *testing.T) {
 		}
 	}
 }
+
+// putGateFs holds each pack's upload for a moment and counts how many are in
+// flight at once.
+type putGateFs struct {
+	rfs.Fs
+	features      *rfs.Features
+	inFlight, max *atomic.Int32
+}
+
+func newPutGateFs(inner rfs.Fs, inFlight, max *atomic.Int32) *putGateFs {
+	c := &putGateFs{Fs: inner, inFlight: inFlight, max: max}
+	c.features = (&rfs.Features{CanHaveEmptyDirectories: inner.Features().CanHaveEmptyDirectories}).Fill(context.Background(), c)
+	return c
+}
+
+func (c *putGateFs) Features() *rfs.Features { return c.features }
+
+func (c *putGateFs) Put(ctx context.Context, in io.Reader, src rfs.ObjectInfo, opts ...rfs.OpenOption) (rfs.Object, error) {
+	if strings.HasSuffix(src.Remote(), ".zip") {
+		n := c.inFlight.Add(1)
+		defer c.inFlight.Add(-1)
+		for {
+			m := c.max.Load()
+			if n <= m || c.max.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	return c.Fs.Put(ctx, in, src, opts...)
+}
+
+// Packs go up side by side, as many as the job's transfers, while the next
+// one is being built; the manifest still lists every one of them.
+func TestPackUploadsRunSideBySide(t *testing.T) {
+	m := newManager(t)
+	src, dst := tempDir(t), tempDir(t)
+	const packs = 8
+	for i := 0; i < packs; i++ {
+		write(t, src, fmt.Sprintf("d/s%d.json", i), strings.Repeat("x", 300+i))
+	}
+	var inFlight, peak atomic.Int32
+	restore := syncjob.SetDstWrapper(func(f rfs.Fs, packLine bool) rfs.Fs {
+		if packLine {
+			return newPutGateFs(f, &inFlight, &peak)
+		}
+		return f
+	})
+	defer restore()
+	spec := packSpec(syncjob.ModeCopy, src, dst, syncjob.PackOptions{Threshold: 1024, MaxPackBytes: 1})
+	spec.Transfers = 3
+	s := mustSucceed(t, runJob(t, m, spec))
+	if s.PackStats.PacksWritten != packs {
+		t.Fatalf("stats %+v, want %d packs", s.PackStats, packs)
+	}
+	if got := peak.Load(); got != 3 {
+		t.Fatalf("at most %d packs uploaded at once, want 3 (the job's transfers)", got)
+	}
+	if mf := loadTestManifest(t, dst); len(mf.Files) != packs || len(mf.Packs) != packs {
+		t.Fatalf("manifest has %d files in %d packs, want %d each", len(mf.Files), len(mf.Packs), packs)
+	}
+}

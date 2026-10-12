@@ -60,7 +60,8 @@ type PackOptions struct {
 	// Threshold: files smaller than this are small. Default 8 MiB.
 	Threshold int64 `json:"threshold"`
 	// MaxPackBytes caps one pack; more content goes into further packs.
-	// Default 1 GiB. Staging on disk stays within twice this.
+	// Default 1 GiB. Packs upload as many at a time as the job's transfers,
+	// so staging on disk stays within (transfers+1) times this.
 	MaxPackBytes int64 `json:"max_pack_bytes"`
 	// StoreSuffixes are stored uncompressed. Default DefaultStoreSuffixes.
 	StoreSuffixes []string `json:"store_suffixes"`
