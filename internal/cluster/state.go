@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"sort"
 	"sync"
+
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 )
 
 // ----------------------------------------------------------------------------
@@ -298,6 +301,27 @@ type storageInfo struct {
 	MountPath string `json:"mount_path"`
 	Driver    string `json:"driver"`
 	Status    string `json:"status"`
+}
+
+// storageStatusError is what any storage status other than work/disabled is
+// reported as.
+const storageStatusError = "error"
+
+// publicStatus is the only form of a storage status that leaves this node or
+// is kept about another: the driver's own status text can hold provider
+// error bodies, URLs and tokens.
+func publicStatus(raw string) string {
+	switch raw {
+	case op.WORK, op.DISABLED:
+		return raw
+	default:
+		return storageStatusError
+	}
+}
+
+// storageInfoOf is the inventory entry for one locally loaded storage.
+func storageInfoOf(st model.Storage) storageInfo {
+	return storageInfo{MountPath: st.MountPath, Driver: st.Driver, Status: publicStatus(st.Status)}
 }
 
 type nodeInfo struct {
@@ -990,11 +1014,27 @@ func (s *store) recoveryCandidates(groupID, mount, failedHash string) []*credRec
 
 // ---- inventory ----
 
+// putInventory is the only writer of s.inventory. It stores a copy whose storage
+// statuses are reduced to publicStatus, so raw status text from older peers or
+// older state files is dropped on entry (and never persisted again). Callers
+// hold s.mu.
+func (s *store) putInventory(info *nodeInfo, seenAt int64) {
+	cp := *info
+	cp.seenAt = seenAt
+	if info.Storages != nil {
+		cp.Storages = make([]storageInfo, len(info.Storages))
+		for i, st := range info.Storages {
+			st.Status = publicStatus(st.Status)
+			cp.Storages[i] = st
+		}
+	}
+	s.inventory[info.NodeID] = &cp
+}
+
 func (s *store) setLocalInventory(info *nodeInfo) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	info.seenAt = info.UpdatedAt
-	s.inventory[info.NodeID] = info
+	s.putInventory(info, info.UpdatedAt)
 }
 
 // mergeInventory integrates a peer's inventory entry (LWW by version). seenAt is
@@ -1007,9 +1047,7 @@ func (s *store) mergeInventory(info *nodeInfo, now int64) bool {
 		cur.seenAt = now // still heard about it; keep liveness fresh
 		return false
 	}
-	cp := *info
-	cp.seenAt = now
-	s.inventory[info.NodeID] = &cp
+	s.putInventory(info, now)
 	return true
 }
 
@@ -1167,8 +1205,7 @@ func (s *store) load(ps persistedState) {
 		if n == nil || n.NodeID == "" {
 			continue
 		}
-		cp := *n
-		s.inventory[n.NodeID] = &cp
+		s.putInventory(n, n.seenAt)
 	}
 }
 

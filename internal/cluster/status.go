@@ -91,7 +91,8 @@ func (m *Manager) isOnline(nodeID string, seenAt int64) bool {
 	return seenAt > 0 && now()-seenAt < peerLivenessSec
 }
 
-// Status returns a redaction-safe snapshot for the admin UI.
+// Status returns a redaction-safe snapshot for the admin UI. Node storage
+// statuses are read from the store, which only ever holds publicStatus values.
 func (m *Manager) Status() Status {
 	cfg := m.cfgStore.get()
 

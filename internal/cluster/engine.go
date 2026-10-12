@@ -265,7 +265,7 @@ func (m *Manager) selfNodeInfo() *nodeInfo {
 	var sts []storageInfo
 	for _, d := range op.GetAllStorages() {
 		st := d.GetStorage()
-		sts = append(sts, storageInfo{MountPath: st.MountPath, Driver: st.Driver, Status: st.Status})
+		sts = append(sts, storageInfoOf(*st))
 	}
 	sort.Slice(sts, func(i, j int) bool { return sts[i].MountPath < sts[j].MountPath })
 
