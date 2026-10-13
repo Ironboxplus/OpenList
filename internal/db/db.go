@@ -12,7 +12,7 @@ var db *gorm.DB
 
 func Init(d *gorm.DB) {
 	db = d
-	err := AutoMigrate(new(model.Storage), new(model.User), new(model.Meta), new(model.SettingItem), new(model.SearchNode), new(model.TaskItem), new(model.SSHPublicKey), new(model.SharingDB), new(model.Favorite), new(model.MediaItem), new(model.MediaEpisode), new(model.MediaAsset))
+	err := AutoMigrate(new(model.Storage), new(model.User), new(model.Meta), new(model.SettingItem), new(model.SearchNode), new(model.TaskItem), new(model.SSHPublicKey), new(model.SharingDB), new(model.Favorite), new(model.MediaItem), new(model.MediaEpisode), new(model.MediaAsset), new(model.TrafficDaily))
 	if err != nil {
 		log.Fatalf("failed migrate database: %s", err.Error())
 	}

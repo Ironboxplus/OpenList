@@ -6,6 +6,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
+	"github.com/OpenListTeam/OpenList/v4/internal/stats"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"golang.org/x/time/rate"
 )
@@ -36,9 +37,10 @@ func streamFilterNegative(limit int) (rate.Limit, int) {
 	return rate.Limit(limit) * 1024.0, limit * 1024
 }
 
-func initLimiter(limiter *stream.Limiter, s string) {
+func initLimiter(limiter *stream.Limiter, s string, kind stats.Kind) {
 	clientDownLimit, burst := streamFilterNegative(setting.GetInt(s, -1))
-	*limiter = blockBurstLimiter{Limiter: rate.NewLimiter(clientDownLimit, burst)}
+	// Counted here, once, for every byte that passes (see internal/stats).
+	*limiter = stats.Wrap(kind, blockBurstLimiter{Limiter: rate.NewLimiter(clientDownLimit, burst)})
 	op.RegisterSettingChangingCallback(func() {
 		newLimit, newBurst := streamFilterNegative(setting.GetInt(s, -1))
 		(*limiter).SetLimit(newLimit)
@@ -47,8 +49,12 @@ func initLimiter(limiter *stream.Limiter, s string) {
 }
 
 func InitStreamLimit() {
-	initLimiter(&stream.ClientDownloadLimit, conf.StreamMaxClientDownloadSpeed)
-	initLimiter(&stream.ClientUploadLimit, conf.StreamMaxClientUploadSpeed)
-	initLimiter(&stream.ServerDownloadLimit, conf.StreamMaxServerDownloadSpeed)
-	initLimiter(&stream.ServerUploadLimit, conf.StreamMaxServerUploadSpeed)
+	initLimiter(&stream.ClientDownloadLimit, conf.StreamMaxClientDownloadSpeed, stats.ClientDownload)
+	initLimiter(&stream.ClientUploadLimit, conf.StreamMaxClientUploadSpeed, stats.ClientUpload)
+	initLimiter(&stream.ServerDownloadLimit, conf.StreamMaxServerDownloadSpeed, stats.ServerDownload)
+	initLimiter(&stream.ServerUploadLimit, conf.StreamMaxServerUploadSpeed, stats.ServerUpload)
 }
+
+// InitStats starts the traffic counters' sampling and saving. The database
+// must be up; Release saves what is still pending.
+func InitStats() { stats.Start(stats.DBStore{}) }

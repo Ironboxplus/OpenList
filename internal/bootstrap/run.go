@@ -17,6 +17,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/frontend"
 	"github.com/OpenListTeam/OpenList/v4/internal/plugin"
+	"github.com/OpenListTeam/OpenList/v4/internal/stats"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server"
 	"github.com/OpenListTeam/OpenList/v4/server/middlewares"
@@ -37,6 +38,7 @@ func Init() {
 	InitDB()
 	data.InitData()
 	InitStreamLimit()
+	InitStats()
 	InitIndex()
 	InitUpgradePatch()
 	InitPlugins()
@@ -47,6 +49,8 @@ func Release() {
 	if plugin.Default != nil {
 		_ = plugin.Default.Close()
 	}
+	// Before the database closes: the last minute of traffic is still pending.
+	stats.Stop()
 	db.Close()
 }
 
