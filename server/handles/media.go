@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -312,12 +314,7 @@ func FsMedia(c *gin.Context) {
 	}
 	for i := range kids {
 		k := &kids[i]
-		// the same rules as the listing: hide patterns of this directory's
-		// meta, and the child's own read restriction
-		if !common.CanAccess(user, meta, k.Path, req.Password) {
-			continue
-		}
-		if cm, err := op.GetNearestMeta(k.Path); (err == nil || errors.Is(errors.Cause(err), errs.MetaNotFound)) && !common.CanRead(user, cm, k.Path) {
+		if !mediaItemVisible(user, k, meta, req.Password) {
 			continue
 		}
 		lr := toListResp(k, rel)
@@ -327,6 +324,21 @@ func FsMedia(c *gin.Context) {
 		resp.Children = append(resp.Children, lr)
 	}
 	common.SuccessResp(c, resp)
+}
+
+// mediaItemVisible is the one rule for whether a user may see an item in a
+// media listing: the hide patterns and password of the directory it sits in
+// (parentMeta, the nearest meta of that directory), and the read restriction
+// of its own nearest meta.
+func mediaItemVisible(user *model.User, item *model.MediaItem, parentMeta *model.Meta, password string) bool {
+	if !common.CanAccess(user, parentMeta, item.Path, password) {
+		return false
+	}
+	cm, err := op.GetNearestMeta(item.Path)
+	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+		return false
+	}
+	return common.CanRead(user, cm, item.Path)
 }
 
 // collectionPosters finds up to 4 poster URLs for the collection at reqPath
@@ -391,6 +403,62 @@ func collectionPosters(user *model.User, reqPath string, item *model.MediaItem, 
 		out[owner] = &urls
 	}
 	return out, nil
+}
+
+// libraryKinds are what the library lists when no kind is asked for; "ignore"
+// is never listed, and "library" is only a root that opens as a poster wall.
+var libraryKinds = []string{model.MediaKindMovie, model.MediaKindTV, model.MediaKindAnime, model.MediaKindCollection}
+
+// MediaLibrary answers /api/media/library: the scraped items under the user's
+// base path that the user may see, filtered before paging. Media off gives an
+// empty list, like /api/fs/media.
+func MediaLibrary(c *gin.Context) {
+	user := c.Request.Context().Value(conf.UserKey).(*model.User)
+	kinds := libraryKinds
+	if k := c.Query("kind"); k != "" {
+		if !slices.Contains(libraryKinds, k) {
+			common.ErrorStrResp(c, "unsupported kind", 400)
+			return
+		}
+		kinds = []string{k}
+	}
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	per, _ := strconv.Atoi(c.DefaultQuery("per_page", "100"))
+	out := []MediaListResp{}
+	if !mediaEnabled() {
+		common.SuccessResp(c, gin.H{"content": out, "total": 0})
+		return
+	}
+	parentMetas := map[string]*model.Meta{}
+	var metaErr error
+	parentMeta := func(dir string) *model.Meta {
+		if m, ok := parentMetas[dir]; ok {
+			return m
+		}
+		m, err := op.GetNearestMeta(dir)
+		if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+			metaErr, m = err, nil
+		}
+		parentMetas[dir] = m
+		return m
+	}
+	items, total, err := db.ListMediaItemsFiltered(
+		db.MediaListFilter{Prefix: utils.FixAndCleanPath(user.BasePath), Kinds: kinds, Page: page, PerPage: per},
+		func(it *model.MediaItem) bool {
+			return mediaItemVisible(user, it, parentMeta(pathpkg.Dir(it.Path)), "")
+		})
+	if err == nil {
+		err = metaErr
+	}
+	if err != nil {
+		common.ErrorResp(c, err, 500, true)
+		return
+	}
+	rel := userRelPath(user)
+	for i := range items {
+		out = append(out, toListResp(&items[i], rel))
+	}
+	common.SuccessResp(c, gin.H{"content": out, "total": total})
 }
 
 // assetFail answers with a real HTTP status: an <img> only sees the status,

@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -102,6 +103,7 @@ func newMediaEnv(t *testing.T) *mediaEnv {
 	})
 	api := e.Group("/api")
 	api.POST("/fs/media", FsMedia)
+	api.GET("/media/library", MediaLibrary)
 	api.GET("/media/asset/:id", MediaAsset)
 	api.Any("/public/settings", PublicSettings)
 	ad := api.Group("/admin", middlewares.AuthAdmin)
@@ -855,5 +857,111 @@ func TestCollectionsGetAChildPosterMosaic(t *testing.T) {
 	_ = json.Unmarshal(m.ok("POST", "/api/fs/media", "alice", map[string]any{"path": "/lib/M"}), &detail)
 	if _, has := detail.Item["child_posters"]; has {
 		t.Error("a movie item got child_posters")
+	}
+}
+
+type libraryPage struct {
+	Content []struct {
+		Path string `json:"path"`
+		Kind string `json:"kind"`
+	} `json:"content"`
+	Total int `json:"total"`
+}
+
+func (m *mediaEnv) library(query, user string) (paths []string, kinds []string, total int) {
+	m.t.Helper()
+	var p libraryPage
+	if err := json.Unmarshal(m.ok("GET", "/api/media/library"+query, user, nil), &p); err != nil {
+		m.t.Fatal(err)
+	}
+	for _, c := range p.Content {
+		paths = append(paths, c.Path)
+		kinds = append(kinds, c.Kind)
+	}
+	return paths, kinds, p.Total
+}
+
+func (m *mediaEnv) setItems(kind string, paths ...string) {
+	m.t.Helper()
+	for _, p := range paths {
+		m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": p, "kind": kind, "title": "T" + p})
+	}
+}
+
+func TestMediaLibraryIsScopedToBasePathAndRelative(t *testing.T) {
+	m := newMediaEnv(t)
+	m.setItems("movie", "/lib/A", "/lib/B", "/other/C")
+	paths, _, total := m.library("", "bob")
+	if total != 2 || !slices.Equal(paths, []string{"/A", "/B"}) {
+		t.Fatalf("bob (base /lib) got %v total %d", paths, total)
+	}
+	if _, _, total := m.library("", "alice"); total != 3 {
+		t.Fatalf("alice (base /) total %d, want 3", total)
+	}
+}
+
+func TestMediaLibraryHidesWhatTheListingHides(t *testing.T) {
+	m := newMediaEnv(t)
+	m.setItems("movie", "/open/Show", "/open/.hidden", "/secret/Movie", "/readers/Movie")
+	if err := op.CreateMeta(&model.Meta{Path: "/secret", Password: "pw", PSub: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := op.CreateMeta(&model.Meta{Path: "/open", Hide: `^.hidden$`, HSub: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := op.CreateMeta(&model.Meta{Path: "/readers", ReadUsers: []uint{99}, ReadUsersSub: true}); err != nil {
+		t.Fatal(err)
+	}
+	paths, _, total := m.library("", "alice")
+	if total != 1 || !slices.Equal(paths, []string{"/open/Show"}) {
+		t.Fatalf("alice sees %v total %d", paths, total)
+	}
+	// an admin sees hidden names and needs no password, but a read-users list
+	// binds everyone not on it, as in the directory listing (fs.List)
+	adminPaths, _, total := m.library("", "admin")
+	if total != 3 || !slices.Equal(adminPaths, []string{"/open/.hidden", "/open/Show", "/secret/Movie"}) {
+		t.Fatalf("admin sees %v total %d", adminPaths, total)
+	}
+}
+
+func TestMediaLibraryFiltersBeforePaging(t *testing.T) {
+	m := newMediaEnv(t)
+	// the denied items sort first, so a page cut before the filter would be empty
+	m.setItems("movie", "/p/1", "/p/2", "/p/3", "/q/1", "/q/2", "/q/3")
+	if err := op.CreateMeta(&model.Meta{Path: "/p", Password: "pw", PSub: true}); err != nil {
+		t.Fatal(err)
+	}
+	p1, _, total := m.library("?page=1&per_page=2", "alice")
+	if total != 3 || !slices.Equal(p1, []string{"/q/1", "/q/2"}) {
+		t.Fatalf("page 1: %v total %d", p1, total)
+	}
+	p2, _, total := m.library("?page=2&per_page=2", "alice")
+	if total != 3 || !slices.Equal(p2, []string{"/q/3"}) {
+		t.Fatalf("page 2: %v total %d", p2, total)
+	}
+}
+
+func TestMediaLibraryKindsAndSwitch(t *testing.T) {
+	m := newMediaEnv(t)
+	m.setItems("movie", "/m")
+	m.setItems("tv", "/t")
+	m.setItems("anime", "/a")
+	m.setItems("collection", "/c")
+	m.setItems("ignore", "/i")
+	m.setItems("library", "/l")
+	paths, _, total := m.library("", "alice")
+	if total != 4 || slices.Contains(paths, "/i") || slices.Contains(paths, "/l") {
+		t.Fatalf("default kinds: %v total %d", paths, total)
+	}
+	paths, kinds, total := m.library("?kind=tv", "alice")
+	if total != 1 || paths[0] != "/t" || kinds[0] != "tv" {
+		t.Fatalf("kind=tv: %v", paths)
+	}
+	if env, _ := m.call("GET", "/api/media/library?kind=ignore", "alice", nil); env.Code != 400 {
+		t.Fatalf("kind=ignore must be refused, got %d", env.Code)
+	}
+	_ = op.SaveSettingItem(&model.SettingItem{Key: conf.MediaEnabled, Value: "false", Type: conf.TypeBool, Group: model.MEDIA})
+	if paths, _, total := m.library("", "admin"); total != 0 || len(paths) != 0 {
+		t.Fatalf("media off still lists %v", paths)
 	}
 }

@@ -124,6 +124,10 @@ func Init(e *gin.Engine) {
 	// cluster pre-shared key (per-frame AEAD), not the HTTP layer.
 	api.GET("/cluster/ws", handles.ClusterWS)
 
+	// The library listing of scraped media: any signed-in user (a disabled
+	// guest gets 401 from Auth), filtered by the same rule as /fs/media.
+	auth.GET("/media/library", handles.MediaLibrary)
+
 	_fs(auth.Group("/fs"))
 	fsAndShare(api.Group("/fs", middlewares.Auth(true)))
 	_task(auth.Group("/task", middlewares.AuthNotGuest))

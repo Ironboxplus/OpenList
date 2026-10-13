@@ -68,6 +68,7 @@ func ListMediaChildren(parent string) ([]model.MediaItem, error) {
 type MediaListFilter struct {
 	Prefix  string // path or directory prefix; "" or "/" = everything
 	Kind    string
+	Kinds   []string // any of these; combined with Kind by AND
 	Pending bool
 	Page    int
 	PerPage int
@@ -79,6 +80,9 @@ func (f MediaListFilter) apply(q *gorm.DB) *gorm.DB {
 	}
 	if f.Kind != "" {
 		q = q.Where("kind = ?", f.Kind)
+	}
+	if len(f.Kinds) > 0 {
+		q = q.Where("kind IN ?", f.Kinds)
 	}
 	if f.Pending {
 		// not locked, and either low confidence or candidates waiting for a choice
@@ -106,6 +110,52 @@ func ListMediaItems(f MediaListFilter) ([]model.MediaItem, int64, error) {
 		return nil, 0, errors.WithStack(err)
 	}
 	return items, total, nil
+}
+
+// mediaFilterBatch is a variable so a test can cross batch boundaries cheaply.
+var mediaFilterBatch = 500
+
+// ListMediaItemsFiltered pages through the items keep accepts: it reads them
+// in path order a batch at a time, drops what keep rejects and only then takes
+// the page, so a page is never short of items a caller may see and total is
+// the filtered count. Page and PerPage are normalised like ListMediaItems.
+func ListMediaItemsFiltered(f MediaListFilter, keep func(*model.MediaItem) bool) ([]model.MediaItem, int64, error) {
+	if f.Page < 1 {
+		f.Page = 1
+	}
+	if f.PerPage < 1 || f.PerPage > 1000 {
+		f.PerPage = 100
+	}
+	from := int64(f.Page-1) * int64(f.PerPage)
+	to := from + int64(f.PerPage)
+	var (
+		out   []model.MediaItem
+		total int64
+		last  string
+	)
+	for {
+		var batch []model.MediaItem
+		q := f.apply(db.Select(mediaChildColumns))
+		if last != "" {
+			q = q.Where("path > ?", last)
+		}
+		if err := q.Order("path").Limit(mediaFilterBatch).Find(&batch).Error; err != nil {
+			return nil, 0, errors.WithStack(err)
+		}
+		for i := range batch {
+			if keep != nil && !keep(&batch[i]) {
+				continue
+			}
+			if total >= from && total < to {
+				out = append(out, batch[i])
+			}
+			total++
+		}
+		if len(batch) < mediaFilterBatch {
+			return out, total, nil
+		}
+		last = batch[len(batch)-1].Path
+	}
 }
 
 // AllMediaItems is for export.
