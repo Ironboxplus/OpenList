@@ -65,6 +65,23 @@ func SharingGet(c *gin.Context, req *FsGetReq) {
 	})
 }
 
+// SharingVideoSubtitle is FsVideoSubtitle for a /@s/<sid>/<path> video: the
+// sidecar subtitles next to it inside the share. Shares have no provider tracks.
+// It lists through the sharing layer directly, so it does not count as a share
+// access (SharingList/SharingGet already count the page view).
+func SharingVideoSubtitle(c *gin.Context, req *FsVideoSubtitleReq) {
+	sid, path, _ := strings.Cut(strings.TrimPrefix(strings.TrimPrefix(req.Path, "/@s"), "/"), "/")
+	if sid == "" {
+		common.ErrorStrResp(c, "invalid share id", 400)
+		return
+	}
+	subs, err := sharedSidecarSubtitles(c, sid, path, req.Password)
+	if dealError(c, err) {
+		return
+	}
+	common.SuccessResp(c, subs)
+}
+
 func SharingList(c *gin.Context, req *ListReq) {
 	sid, path, _ := strings.Cut(strings.TrimPrefix(req.Path, "/"), "/")
 	if sid == "" {

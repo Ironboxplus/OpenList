@@ -497,6 +497,10 @@ func FsVideoSubtitle(c *gin.Context) {
 		common.ErrorResp(c, err, 400)
 		return
 	}
+	if strings.HasPrefix(req.Path, "/@s") {
+		SharingVideoSubtitle(c, &req)
+		return
+	}
 	user := c.Request.Context().Value(conf.UserKey).(*model.User)
 	if user.IsGuest() && user.Disabled {
 		common.ErrorStrResp(c, "Guest user is disabled, login please", 401)

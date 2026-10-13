@@ -11,6 +11,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/sharing"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
@@ -202,16 +203,25 @@ func collectSidecarSubtitles(videoName string, listing map[string]dirListing) []
 	return out
 }
 
-// resolveSidecarSubtitles lists the video's folder (and, only when present, its
-// subtitle folders) and returns the matching subtitle files as VideoSubtitleInfo
-// with signed same-origin /p proxy URLs (mirroring the frontend proxyLink + FsGet
-// rawURL construction).
-func resolveSidecarSubtitles(c *gin.Context, reqPath string, video model.Obj) []driver.VideoSubtitleInfo {
-	parentPath := stdpath.Dir(reqPath)
+// sidecarSource is where the video's folders come from: the storage tree for a
+// normal path, the sharing tree for a shared one. Both go through the same
+// matcher; only listing and link building differ.
+type sidecarSource struct {
+	// list returns the entries of a folder relative to the video's folder
+	// ("" = the video's own folder).
+	list func(rel string) ([]model.Obj, error)
+	// url is the link of a subtitle file found in folder rel.
+	url func(rel string, o model.Obj) string
+}
+
+// resolveSidecar lists the video's folder (and, only when present, its subtitle
+// folders) through src and returns the matching subtitle files as
+// VideoSubtitleInfo.
+func resolveSidecar(videoName string, src sidecarSource) []driver.VideoSubtitleInfo {
 	listing := map[string]dirListing{}
 	objs := map[string]model.Obj{} // key: dir + "/" + name
 	listDir := func(key string) bool {
-		list, err := fs.List(c.Request.Context(), stdpath.Join(parentPath, key), &fs.ListArgs{})
+		list, err := src.list(key)
 		if err != nil {
 			return false
 		}
@@ -231,34 +241,90 @@ func resolveSidecarSubtitles(c *gin.Context, reqPath string, video model.Obj) []
 		return nil
 	}
 	for {
-		pending := pendingSubtitleDirs(video.GetName(), listing)
-		progressed := false
+		pending := pendingSubtitleDirs(videoName, listing)
 		for _, key := range pending {
 			if !listDir(key) {
 				listing[key] = dirListing{} // do not ask again
 			}
-			progressed = true
 		}
-		if !progressed {
+		if len(pending) == 0 {
 			break
 		}
 	}
 
-	apiURL := common.GetApiUrl(c)
 	var subs []driver.VideoSubtitleInfo
-	for _, m := range collectSidecarSubtitles(video.GetName(), listing) {
-		dirPath := stdpath.Join(parentPath, m.Dir)
-		dirMeta, _ := op.GetNearestMeta(dirPath)
-		query := ""
-		if s := common.Sign(objs[m.Dir+"/"+m.Name], dirPath, isEncrypt(dirMeta, dirPath)); s != "" {
-			query = "?sign=" + s
-		}
+	for _, m := range collectSidecarSubtitles(videoName, listing) {
 		subs = append(subs, driver.VideoSubtitleInfo{
 			Title:  strings.TrimSuffix(m.Name, stdpath.Ext(m.Name)),
 			Type:   m.Ext,
-			URL:    fmt.Sprintf("%s/p%s%s", apiURL, utils.EncodePath(stdpath.Join(dirPath, m.Name), true), query),
+			URL:    src.url(m.Dir, objs[m.Dir+"/"+m.Name]),
 			Source: subtitleSourceSidecar,
 		})
 	}
 	return subs
+}
+
+// resolveSidecarSubtitles resolves a video on a storage path, with signed
+// same-origin /p proxy URLs (mirroring the frontend proxyLink + FsGet rawURL
+// construction).
+func resolveSidecarSubtitles(c *gin.Context, reqPath string, video model.Obj) []driver.VideoSubtitleInfo {
+	parentPath := stdpath.Dir(reqPath)
+	apiURL := common.GetApiUrl(c)
+	return resolveSidecar(video.GetName(), sidecarSource{
+		list: func(rel string) ([]model.Obj, error) {
+			return fs.List(c.Request.Context(), stdpath.Join(parentPath, rel), &fs.ListArgs{})
+		},
+		url: func(rel string, o model.Obj) string {
+			dirPath := stdpath.Join(parentPath, rel)
+			dirMeta, _ := op.GetNearestMeta(dirPath)
+			query := ""
+			if s := common.Sign(o, dirPath, isEncrypt(dirMeta, dirPath)); s != "" {
+				query = "?sign=" + s
+			}
+			return fmt.Sprintf("%s/p%s%s", apiURL, utils.EncodePath(stdpath.Join(dirPath, o.GetName()), true), query)
+		},
+	})
+}
+
+// sharedSidecarSubtitles resolves a video inside share sid at path (relative to
+// the share root). Links are share direct links, authorised the way
+// SharingGet's raw URL is: /sd/<sid>/<path>?pwd=<share password>.
+func sharedSidecarSubtitles(c *gin.Context, sid, path, pwd string) ([]driver.VideoSubtitleInfo, error) {
+	parent := stdpath.Dir(path)
+	if parent == "." {
+		parent = ""
+	}
+	var share *model.Sharing
+	var listErr error
+	apiURL := common.GetApiUrl(c)
+	subs := resolveSidecar(stdpath.Base(path), sidecarSource{
+		list: func(rel string) ([]model.Obj, error) {
+			s, objs, err := sharing.List(c.Request.Context(), sid, stdpath.Join(parent, rel), model.SharingListArgs{Pwd: pwd})
+			if rel == "" && err != nil {
+				listErr = err
+			}
+			if err == nil {
+				share = s
+			}
+			return objs, err
+		},
+		url: func(rel string, o model.Obj) string {
+			pwd := ""
+			if share != nil {
+				pwd = share.Pwd
+			}
+			return shareSubtitleURL(apiURL, sid, stdpath.Join(parent, rel), o.GetName(), pwd)
+		},
+	})
+	return subs, listErr
+}
+
+// shareSubtitleURL is a share direct link, built like SharingGet's raw URL:
+// /sd/<sid>/<dir>/<name>, plus ?pwd= when the share has a password.
+func shareSubtitleURL(apiURL, sid, dir, name, pwd string) string {
+	u := fmt.Sprintf("%s/sd%s", apiURL, utils.EncodePath("/"+stdpath.Join(sid, dir, name), true))
+	if pwd != "" {
+		u += "?pwd=" + pwd
+	}
+	return u
 }

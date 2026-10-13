@@ -180,3 +180,70 @@ func TestSubtitleSourceValues(t *testing.T) {
 		t.Fatal("source values are part of the API")
 	}
 }
+
+// memObj is a minimal model.Obj for listing tests.
+type memObj struct {
+	model.Object
+}
+
+func memFile(name string) model.Obj { return &memObj{model.Object{Name: name}} }
+func memDir(name string) model.Obj  { return &memObj{model.Object{Name: name, IsFolder: true}} }
+
+func memSource(tree map[string][]model.Obj, calls *[]string) sidecarSource {
+	return sidecarSource{
+		list: func(rel string) ([]model.Obj, error) {
+			*calls = append(*calls, rel)
+			return tree[rel], nil
+		},
+		url: func(rel string, o model.Obj) string { return rel + "|" + o.GetName() },
+	}
+}
+
+func urls(subs []driver.VideoSubtitleInfo) []string {
+	out := []string{}
+	for _, s := range subs {
+		out = append(out, s.URL)
+	}
+	return out
+}
+
+func TestResolveSidecarSameNameAndSubtitleFolder(t *testing.T) {
+	useVideoTypes(t)
+	var calls []string
+	tree := map[string][]model.Obj{
+		"":     {memFile("A.mkv"), memFile("B.mkv"), memFile("A.zh.srt"), memDir("Subs")},
+		"Subs": {memFile("A.en.srt"), memFile("B.en.srt")},
+	}
+	subs := resolveSidecar("A.mkv", memSource(tree, &calls))
+	if got, want := urls(subs), []string{"|A.zh.srt", "Subs|A.en.srt"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for _, s := range subs {
+		if s.Source != subtitleSourceSidecar {
+			t.Errorf("source = %q", s.Source)
+		}
+	}
+	if want := []string{"", "Subs"}; !reflect.DeepEqual(calls, want) {
+		t.Errorf("listed %v, want %v", calls, want)
+	}
+}
+
+func TestResolveSidecarListsNothingExtraWithoutSubtitleFolder(t *testing.T) {
+	useVideoTypes(t)
+	var calls []string
+	resolveSidecar("A.mkv", memSource(map[string][]model.Obj{"": {memFile("A.mkv"), memDir("Extras")}}, &calls))
+	if want := []string{""}; !reflect.DeepEqual(calls, want) {
+		t.Errorf("listed %v, want %v", calls, want)
+	}
+}
+
+func TestShareSubtitleURL(t *testing.T) {
+	if got, want := shareSubtitleURL("http://h", "sid1", "Show/Subs", "A b.srt", ""),
+		"http://h/sd/sid1/Show/Subs/A%20b.srt"; got != want {
+		t.Errorf("no pwd: got %s, want %s", got, want)
+	}
+	if got, want := shareSubtitleURL("http://h", "sid1", "", "A.srt", "p1"),
+		"http://h/sd/sid1/A.srt?pwd=p1"; got != want {
+		t.Errorf("pwd: got %s, want %s", got, want)
+	}
+}
