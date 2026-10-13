@@ -176,6 +176,9 @@ func admin(g *gin.RouterGroup) {
 	clusterGrp.GET("/status", handles.ClusterStatus)
 	clusterGrp.POST("/groups", handles.ClusterSetGroups)
 
+	// Relayed-traffic and library statistics for the dashboard.
+	g.GET("/stats/overview", handles.StatsOverview)
+
 	syncGrp := g.Group("/sync")
 	syncGrp.POST("/run", handles.SyncRun)
 	syncGrp.GET("/get", handles.SyncGet)

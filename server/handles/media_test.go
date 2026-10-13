@@ -107,6 +107,7 @@ func newMediaEnv(t *testing.T) *mediaEnv {
 	api.GET("/media/asset/:id", MediaAsset)
 	api.Any("/public/settings", PublicSettings)
 	ad := api.Group("/admin", middlewares.AuthAdmin)
+	ad.GET("/stats/overview", StatsOverview)
 	ad.POST("/media/set", MediaSet)
 	ad.POST("/media/delete", MediaDelete)
 	ad.GET("/media/list", MediaAdminList)
