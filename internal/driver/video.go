@@ -30,6 +30,9 @@ type VideoSubtitleInfo struct {
 	Title    string `json:"title"`    // human label, e.g. "简体中文"
 	URL      string `json:"url"`
 	Type     string `json:"type"` // subtitle format: "srt" | "ass" | "vtt"
+	// Source tells where the track came from: "sidecar" (a subtitle file found
+	// next to the video) or "provider" (reported by the storage provider's API).
+	Source string `json:"source"`
 }
 
 // VideoSubtitleProvider is an optional driver capability exposing the provider's
