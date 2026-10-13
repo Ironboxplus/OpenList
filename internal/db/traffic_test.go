@@ -9,12 +9,13 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
 
 func testDB(t *testing.T) {
 	t.Helper()
 	conf.Conf = conf.DefaultConfig(t.TempDir())
-	d, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:db-traffic-%d?mode=memory&cache=shared", time.Now().UnixNano())), &gorm.Config{})
+	d, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:db-traffic-%d?mode=memory&cache=shared", time.Now().UnixNano())), &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: "x_"}}) // as in production
 	if err != nil {
 		t.Fatal(err)
 	}

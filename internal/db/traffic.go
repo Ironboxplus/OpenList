@@ -13,7 +13,8 @@ func AddTrafficDaily(day, kind string, delta int64) error {
 	err := db.Clauses(clause.OnConflict{
 		Columns: []clause.Column{{Name: "day"}, {Name: "kind"}},
 		DoUpdates: clause.Assignments(map[string]interface{}{
-			"bytes": gorm.Expr("traffic_dailies.bytes + ?", delta),
+			// CurrentTable, not a literal name: the table has the configured prefix.
+			"bytes": gorm.Expr("? + ?", clause.Column{Table: clause.CurrentTable, Name: "bytes"}, delta),
 		}),
 	}).Create(&row).Error
 	return errors.WithStack(err)
