@@ -288,7 +288,7 @@ func resolveSidecarSubtitles(c *gin.Context, reqPath string, video model.Obj) []
 
 // sharedSidecarSubtitles resolves a video inside share sid at path (relative to
 // the share root). Links are share direct links, authorised the way
-// SharingGet's raw URL is: /sd/<sid>/<path>?pwd=<share password>.
+// SharingGet's raw URL: shareLink.
 func sharedSidecarSubtitles(c *gin.Context, sid, path, pwd string) ([]driver.VideoSubtitleInfo, error) {
 	parent := stdpath.Dir(path)
 	if parent == "." {
@@ -313,18 +313,8 @@ func sharedSidecarSubtitles(c *gin.Context, sid, path, pwd string) ([]driver.Vid
 			if share != nil {
 				pwd = share.Pwd
 			}
-			return shareSubtitleURL(apiURL, sid, stdpath.Join(parent, rel), o.GetName(), pwd)
+			return shareLink(apiURL, "sd", sid, stdpath.Join(parent, rel, o.GetName()), pwd)
 		},
 	})
 	return subs, listErr
-}
-
-// shareSubtitleURL is a share direct link, built like SharingGet's raw URL:
-// /sd/<sid>/<dir>/<name>, plus ?pwd= when the share has a password.
-func shareSubtitleURL(apiURL, sid, dir, name, pwd string) string {
-	u := fmt.Sprintf("%s/sd%s", apiURL, utils.EncodePath("/"+stdpath.Join(sid, dir, name), true))
-	if pwd != "" {
-		u += "?pwd=" + pwd
-	}
-	return u
 }

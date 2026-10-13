@@ -2,6 +2,7 @@ package handles
 
 import (
 	"fmt"
+	"net/url"
 	stdpath "path"
 	"regexp"
 	"strings"
@@ -21,6 +22,18 @@ import (
 	"github.com/pkg/errors"
 )
 
+// shareLink is the one builder of share links: <apiURL>/<route>/<sid>/<path>,
+// plus ?pwd= when the share has a password. route is "sd" (download) or "sad"
+// (archive download). The password is query-escaped; the server reads it with
+// c.Query("pwd"), which unescapes it, so any password round-trips.
+func shareLink(apiURL, route, sid, path, pwd string) string {
+	u := fmt.Sprintf("%s/%s%s", apiURL, route, utils.EncodePath("/"+stdpath.Join(sid, path), true))
+	if pwd != "" {
+		u += "?pwd=" + url.QueryEscape(pwd)
+	}
+	return u
+}
+
 func SharingGet(c *gin.Context, req *FsGetReq) {
 	sid, path, _ := strings.Cut(strings.TrimPrefix(req.Path, "/"), "/")
 	if sid == "" {
@@ -37,11 +50,7 @@ func SharingGet(c *gin.Context, req *FsGetReq) {
 	_ = countAccess(c.ClientIP(), s)
 	url := ""
 	if !obj.IsDir() {
-		fakePath := fmt.Sprintf("/%s/%s", sid, path)
-		url = fmt.Sprintf("%s/sd%s", common.GetApiUrl(c), utils.EncodePath(fakePath, true))
-		if s.Pwd != "" {
-			url += "?pwd=" + s.Pwd
-		}
+		url = shareLink(common.GetApiUrl(c), "sd", sid, path, s.Pwd)
 	}
 	thumb, _ := model.GetThumb(obj)
 	common.SuccessResp(c, FsGetResp{
@@ -149,11 +158,7 @@ func SharingArchiveMeta(c *gin.Context, req *ArchiveMetaReq) {
 		return
 	}
 	_ = countAccess(c.ClientIP(), s)
-	fakePath := fmt.Sprintf("/%s/%s", sid, path)
-	url := fmt.Sprintf("%s/sad%s", common.GetApiUrl(c), utils.EncodePath(fakePath, true))
-	if s.Pwd != "" {
-		url += "?pwd=" + s.Pwd
-	}
+	url := shareLink(common.GetApiUrl(c), "sad", sid, path, s.Pwd)
 	common.SuccessResp(c, ArchiveMetaResp{
 		Comment:     ret.GetComment(),
 		IsEncrypted: ret.IsEncrypted(),
