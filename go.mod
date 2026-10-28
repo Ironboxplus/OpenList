@@ -3,8 +3,8 @@ module github.com/OpenListTeam/OpenList/v4
 go 1.27
 
 require (
-	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.22.0
-	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.8.0
+	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.1
+	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.8.1
 	github.com/Ironboxplus/cfs v0.0.0-00010101000000-000000000000
 	github.com/KarpelesLab/reflink v1.0.2
 	github.com/KirCute/zip v1.0.1
@@ -70,14 +70,14 @@ require (
 	github.com/pkg/sftp v1.13.11
 	github.com/pquerna/otp v1.5.0
 	github.com/quic-go/quic-go v0.54.1
-	github.com/rclone/rclone v1.75.1
+	github.com/rclone/rclone v1.75.2
 	github.com/shirou/gopsutil/v4 v4.26.6
 	github.com/sirupsen/logrus v1.9.4
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/spf13/afero v1.15.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
-	github.com/stretchr/testify v1.11.1
+	github.com/stretchr/testify v1.12.1
 	github.com/t3rm1n4l/go-mega v0.0.0-20260717075258-c6acd6a5bd04
 	github.com/tchap/go-patricia/v2 v2.3.3
 	github.com/traefik/yaegi v0.16.1
@@ -95,7 +95,7 @@ require (
 	golang.org/x/text v0.43.0
 	golang.org/x/time v0.15.0
 	google.golang.org/appengine v1.6.8
-	google.golang.org/grpc v1.84.0-dev.0.20260723093437-b6eac429d7b6
+	google.golang.org/grpc v1.85.0-dev.0.20260825072537-93e31b48545e
 	gopkg.in/ldap.v3 v3.1.0
 	gopkg.in/yaml.v3 v3.0.1
 	gorm.io/driver/mysql v1.5.7
@@ -123,6 +123,7 @@ require (
 	github.com/andreburgaud/crypt2go v1.8.0 // indirect
 	github.com/andybalholm/brotli v1.2.2 // indirect
 	github.com/andybalholm/cascadia v1.3.4 // indirect
+	github.com/apache/arrow-go/v18 v18.7.0 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/aymerick/douceur v0.2.0 // indirect
 	github.com/benbjohnson/clock v1.3.0 // indirect
@@ -165,7 +166,6 @@ require (
 	github.com/coreos/go-systemd/v22 v22.6.0 // indirect
 	github.com/crackcomm/go-gitignore v0.0.0-20170627025303-887ab5e44cc3 // indirect
 	github.com/cronokirby/saferith v0.33.1-0.20250226174546-1f11f94ce488 // indirect
-	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.1.0 // indirect
 	github.com/dsnet/compress v0.0.2-0.20230904184137-39efe44ab707 // indirect
 	github.com/dustin/go-humanize v1.1.0 // indirect
@@ -192,7 +192,8 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
-	github.com/golang/snappy v0.0.4 // indirect
+	github.com/golang/snappy v1.0.0 // indirect
+	github.com/google/flatbuffers v25.12.19+incompatible // indirect
 	github.com/google/go-tpm v0.9.5 // indirect
 	github.com/gorilla/css v1.0.1 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
@@ -219,7 +220,7 @@ require (
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/jzelinskie/whirlpool v0.0.0-20201016144138-0675e54bb004 // indirect
-	github.com/klauspost/compress v1.19.0 // indirect
+	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/klauspost/pgzip v1.2.6 // indirect
 	github.com/kr/fs v0.1.0 // indirect
@@ -264,9 +265,8 @@ require (
 	github.com/ncruces/go-strftime v1.1.0 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/peterh/liner v1.2.2 // indirect
-	github.com/pierrec/lz4/v4 v4.1.27 // indirect
+	github.com/pierrec/lz4/v4 v4.1.28 // indirect
 	github.com/pkg/xattr v0.4.12 // indirect
-	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
 	github.com/pquerna/cachecontrol v0.1.0 // indirect
 	github.com/prometheus/client_golang v1.23.2 // indirect
@@ -300,13 +300,14 @@ require (
 	github.com/zeebo/xxh3 v1.1.0 // indirect
 	go.etcd.io/bbolt v1.5.0 // indirect
 	go.uber.org/mock v0.5.0 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/arch v0.18.0 // indirect
-	golang.org/x/exp v0.0.0-20260709172345-9ea1abe57597 // indirect
+	golang.org/x/exp v0.0.0-20260813180055-c1d0aacb2297 // indirect
 	golang.org/x/mod v0.42.0 // indirect
 	golang.org/x/term v0.47.0 // indirect
 	golang.org/x/tools v0.52.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260715232425-e75dac1f907d // indirect
-	google.golang.org/protobuf v1.36.11 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260817212433-ac3dfec99bb1 // indirect
+	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/asn1-ber.v1 v1.0.0-20181015200546-f715ec2f112d // indirect
 	gopkg.in/go-jose/go-jose.v2 v2.6.3 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
@@ -328,3 +329,5 @@ replace github.com/OpenListTeam/115-sdk-go => ../115-sdk-go
 replace github.com/KarpelesLab/reflink => github.com/OpenListTeam/reflink v0.0.0-20260520031008-ed3c0dbe8009
 
 replace github.com/Ironboxplus/cfs => ../cfs
+
+replace github.com/rclone/rclone => ../rclone-fork
