@@ -86,6 +86,7 @@ type peerConn struct {
 
 	rttNanos    atomic.Int64 // last measured ping round trip
 	lastRecv    atomic.Int64 // unix nanos of the last frame received
+	lastRx      atomic.Int64 // unix nanos of the last inbound traffic of any kind (frame or pong)
 	lastAE      atomic.Int64 // unix nanos of the last hello/announce/reply received
 	peerProto   atomic.Int32
 	framesSent  atomic.Uint64
@@ -94,7 +95,7 @@ type peerConn struct {
 }
 
 func newPeerConn(mgr *Manager, ws *websocket.Conn, outbound bool, addr string) *peerConn {
-	return &peerConn{
+	c := &peerConn{
 		mgr:      mgr,
 		ws:       ws,
 		out:      newOutbox(),
@@ -103,6 +104,8 @@ func newPeerConn(mgr *Manager, ws *websocket.Conn, outbound bool, addr string) *
 		since:    now(),
 		closed:   make(chan struct{}),
 	}
+	c.lastRx.Store(time.Now().UnixNano())
+	return c
 }
 
 func (c *peerConn) node() string {
@@ -204,6 +207,7 @@ func (c *peerConn) readPump() {
 				c.rttNanos.Store(rtt)
 			}
 		}
+		c.lastRx.Store(time.Now().UnixNano())
 		return c.ws.SetReadDeadline(time.Now().Add(pongWait))
 	})
 	for {
@@ -216,6 +220,7 @@ func (c *peerConn) readPump() {
 			continue
 		}
 		c.lastRecv.Store(time.Now().UnixNano())
+		c.lastRx.Store(time.Now().UnixNano())
 		c.framesRecv.Add(1)
 		c.mgr.handleFrame(c, data)
 	}

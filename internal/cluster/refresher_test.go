@@ -422,6 +422,7 @@ func TestTakeoverPullsFirstThenClaimsAndOthersWait(t *testing.T) {
 	r := newRefresherRig(t, time.Hour, Config{LeaseTTLSec: 4}) // pull wait = 1s
 	// A live link that never answers: the taker must wait for its reply before claiming.
 	link := &peerConn{out: newOutbox(), closed: make(chan struct{})}
+	link.lastRx.Store(time.Now().UnixNano()) // the path itself works (pongs arrive)
 	r.m.conns.add(link)
 	r.m.conns.bind(link, r.peer.NodeID, r.local.NodeID)
 
@@ -474,6 +475,10 @@ func TestTakeoverPullsFirstThenClaimsAndOthersWait(t *testing.T) {
 
 func TestOnlyTheFirstInOrderTakesOverImmediatelyOthersStagger(t *testing.T) {
 	r := newRefresherRig(t, time.Hour, Config{LeaseTTLSec: 30})
+	live := &peerConn{out: newOutbox(), closed: make(chan struct{})}
+	live.lastRx.Store(time.Now().UnixNano())
+	r.m.conns.add(live)
+	r.m.conns.bind(live, r.peer.NodeID, r.local.NodeID)
 	// Make the peer rank first: the admin prefers it and it is online with a working mount.
 	r.m.state.setPolicy(r.local, "g1", r.peer.NodeID, now())
 	g, _ := r.m.state.groupByID("g1")
@@ -592,4 +597,43 @@ func TestMayRefreshKeepsLegacyBehaviourOutsideGroupsOrWithoutCluster(t *testing.
 	if !r.m.MayRefresh(r.mount) {
 		t.Fatal("with the cluster disabled every node refreshes for itself")
 	}
+}
+
+// A link that is up but silent is a stalled path, not a dead holder: claiming
+// would put a stale refresh_token in play against a holder that is alive.
+func TestStalledLinkBlocksTakeoverIsolatedNodeWaitsLonger(t *testing.T) {
+	r := newRefresherRig(t, time.Hour, Config{LeaseTTLSec: 30})
+	g, _ := r.m.state.groupByID("g1")
+	vacant := func(d time.Duration) {
+		r.m.refr.mu.Lock()
+		r.m.refr.noLeaseSince["g1"] = time.Now().Add(-d)
+		r.m.refr.mu.Unlock()
+	}
+
+	// Link present, but nothing heard for longer than the TTL.
+	stalled := &peerConn{out: newOutbox(), closed: make(chan struct{})}
+	stalled.lastRx.Store(time.Now().Add(-time.Minute).UnixNano())
+	r.m.conns.add(stalled)
+	r.m.conns.bind(stalled, r.peer.NodeID, r.local.NodeID)
+	vacant(time.Hour)
+	r.m.leaseStep(g)
+	time.Sleep(150 * time.Millisecond)
+	if r.m.isHolder("g1") {
+		t.Fatal("claimed the lease behind a silent link: the holder may be alive on the other side of a stall")
+	}
+
+	// The stalled link is declared dead; the node is now isolated. A short
+	// vacancy is not enough...
+	stalled.close("test")
+	r.m.conns.remove(stalled) // (a bare test link has no manager to do it)
+	vacant(40 * time.Second) // > TTL but < 3 x TTL
+	r.m.leaseStep(g)
+	time.Sleep(150 * time.Millisecond)
+	if r.m.isHolder("g1") {
+		t.Fatal("an isolated node claimed after only a TTL of silence")
+	}
+	// ...but a long one is: it may be the only survivor.
+	vacant(100 * time.Second)
+	r.m.leaseStep(g)
+	waitFor(t, "isolated survivor to claim", 5*time.Second, func() bool { return r.m.isHolder("g1") })
 }

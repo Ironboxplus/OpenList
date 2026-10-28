@@ -393,6 +393,19 @@ func (m *Manager) leaseStep(g group) {
 	if time.Since(started) < m.startupGrace(ttl) {
 		return
 	}
+	// "No renewal heard" must mean "the holder is gone", not "the path to it is
+	// stalled". A live link that has delivered nothing for a whole TTL is a
+	// stalled path (the holder may be refreshing happily behind it); wait for
+	// the link layer to declare it dead. With no link at all the node is
+	// isolated: it may still be the only survivor, so it claims, but only after
+	// a longer silence, since its refresh_token may already be stale.
+	if len(m.conns.all()) > 0 {
+		if !m.responsiveWithin(ttl) {
+			return
+		}
+	} else if noLeaseFor < 3*ttl {
+		return
+	}
 	rank := -1
 	for i, id := range order {
 		if id == self {
@@ -921,6 +934,11 @@ func (m *Manager) requestTick() {
 			continue
 		}
 		if holder == m.id.NodeID {
+			// We became the refresher after this token was rejected (the request
+			// hit the settle window): nobody else will refresh it, so do it now.
+			if m.settled(p.groupID) {
+				m.startRefresh(p.mount, "recover")
+			}
 			continue
 		}
 		var haveVer uint64
@@ -1126,4 +1144,17 @@ func (m *Manager) linkCount() int {
 		return 0
 	}
 	return len(m.conns.all())
+}
+
+// responsiveWithin reports whether any live link delivered traffic (a frame or a
+// pong) within d. A link that is up but silent is the signature of a stalled
+// path: the holder may be alive and refreshing behind it.
+func (m *Manager) responsiveWithin(d time.Duration) bool {
+	cut := time.Now().Add(-d).UnixNano()
+	for _, c := range m.conns.all() {
+		if c.lastRx.Load() >= cut {
+			return true
+		}
+	}
+	return false
 }
