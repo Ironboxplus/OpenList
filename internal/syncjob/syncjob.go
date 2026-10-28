@@ -215,21 +215,28 @@ func (m *Manager) Start(spec Spec) (Snapshot, error) {
 	// A job's storage calls are bulk work: they queue behind interactive
 	// requests for a drive's rate limit.
 	ctx, cancel := context.WithCancel(lane.WithBackground(context.Background()))
-	src, err := resolve(ctx, spec.Src)
-	if err != nil {
-		cancel()
-		return Snapshot{}, fmt.Errorf("src: %w", err)
-	}
-	dst, err := resolve(ctx, spec.Dst)
-	if err != nil {
-		cancel()
-		return Snapshot{}, fmt.Errorf("dst: %w", err)
-	}
 	id := random.String(12)
 	j := &job{
 		snap:   Snapshot{ID: id, Spec: spec, State: StateRunning, StartedAt: time.Now()},
 		cancel: cancel,
 		group:  "openlist-sync-" + id,
+	}
+	src, err := resolve(ctx, spec.Src)
+	if err != nil {
+		cancel()
+		return Snapshot{}, fmt.Errorf("src: %w", err)
+	}
+	// Only the destination reports uploads, and it does so from its own state: a
+	// Cfs storage over another storage builds an rclonefs Fs of its own, which must
+	// not report the same file a second time.
+	dst, err := resolve(ctx, spec.Dst, rclonefs.WithUploadObserver(func(u rclonefs.Upload) {
+		j.mu.Lock()
+		j.log.uploaded(u)
+		j.mu.Unlock()
+	}))
+	if err != nil {
+		cancel()
+		return Snapshot{}, fmt.Errorf("dst: %w", err)
 	}
 	if spec.Pack != nil || spec.Unpack {
 		j.snap.PackStats = &PackStats{}
@@ -250,11 +257,6 @@ func (m *Manager) Start(spec Spec) (Snapshot, error) {
 	ctx = operations.WithLogger(ctx, func(_ context.Context, sigil operations.Sigil, src, dst fs.DirEntry, err error) {
 		j.mu.Lock()
 		j.log.compared(sigil, src, dst, err)
-		j.mu.Unlock()
-	})
-	ctx = rclonefs.WithUploadObserver(ctx, func(u rclonefs.Upload) {
-		j.mu.Lock()
-		j.log.uploaded(u)
 		j.mu.Unlock()
 	})
 	m.mu.Lock()
@@ -409,7 +411,7 @@ func (m *Manager) pruneLocked() {
 
 // resolve turns an endpoint into an rclone Fs: "local:<absolute dir>" is a
 // directory on this machine, "/<mount path>" is an OpenList storage.
-func resolve(ctx context.Context, endpoint string) (fs.Fs, error) {
+func resolve(ctx context.Context, endpoint string, opts ...rclonefs.Option) (fs.Fs, error) {
 	if dir, ok := strings.CutPrefix(endpoint, LocalPrefix); ok {
 		if !filepath.IsAbs(dir) {
 			return nil, fmt.Errorf("local path %q must be absolute", dir)
@@ -420,7 +422,7 @@ func resolve(ctx context.Context, endpoint string) (fs.Fs, error) {
 		if _, _, err := op.GetStorageAndActualPath(endpoint); err != nil {
 			return nil, fmt.Errorf("no storage mounted at %q: %w", endpoint, err)
 		}
-		return rclonefs.NewFs(ctx, endpoint)
+		return rclonefs.NewFs(ctx, endpoint, opts...)
 	}
 	return nil, fmt.Errorf("endpoint %q must be an OpenList path starting with / or %s<absolute dir>", endpoint, LocalPrefix)
 }

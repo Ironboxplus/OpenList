@@ -255,8 +255,7 @@ func TestUploadsAreReportedWithBytesReadFromSource(t *testing.T) {
 	mountLocal(t, "/observed")
 	writeFile(t, src, "big.bin", strings.Repeat("x", 300*1024))
 	var got []rclonefs.Upload
-	ctx = rclonefs.WithUploadObserver(ctx, func(u rclonefs.Upload) { got = append(got, u) })
-	olFs, err := rclonefs.NewFs(ctx, "/observed")
+	olFs, err := rclonefs.NewFs(ctx, "/observed", rclonefs.WithUploadObserver(func(u rclonefs.Upload) { got = append(got, u) }))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,6 +272,39 @@ func TestUploadsAreReportedWithBytesReadFromSource(t *testing.T) {
 	}
 	if !(rclonefs.Upload{Size: 300 * 1024, SourceRead: 128 * 1024}).Rapid() {
 		t.Fatalf("an upload that only read the hash prefix is not reported as rapid")
+	}
+}
+
+// The observer belongs to one Fs. A driver under it that builds an rclonefs Fs of
+// its own (a Cfs storage stacked on another storage) gets the same ctx down but
+// must not report the file again.
+func TestUploadObserverBelongsToOneFs(t *testing.T) {
+	ctx := context.Background()
+	src := t.TempDir()
+	mountLocal(t, "/obs-outer")
+	mountLocal(t, "/obs-inner")
+	writeFile(t, src, "a.bin", strings.Repeat("a", 100*1024))
+	writeFile(t, src, "b.bin", strings.Repeat("b", 3))
+	var outer []rclonefs.Upload
+	outerFs, err := rclonefs.NewFs(ctx, "/obs-outer", rclonefs.WithUploadObserver(func(u rclonefs.Upload) { outer = append(outer, u) }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	innerFs, err := rclonefs.NewFs(ctx, "/obs-inner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sync.CopyDir(ctx, innerFs, localFs(t, src), false); err != nil {
+		t.Fatal(err)
+	}
+	if len(outer) != 0 {
+		t.Fatalf("uploads through another Fs reached this Fs's observer: %+v", outer)
+	}
+	if err := sync.CopyDir(ctx, outerFs, localFs(t, src), false); err != nil {
+		t.Fatal(err)
+	}
+	if len(outer) != 2 {
+		t.Fatalf("observer saw %d uploads, want 2", len(outer))
 	}
 }
 
