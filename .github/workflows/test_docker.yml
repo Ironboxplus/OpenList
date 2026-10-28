@@ -31,6 +31,9 @@ env:
   FRONTEND_REPO: ${{ github.event.inputs.frontend_repo || vars.FRONTEND_REPO || 'Ironboxplus/OpenList-Frontend' }}
   REGISTRY: ghcr.io
   RELEASE_PLATFORMS: 'linux/amd64'
+  # '|' falls through on any error (not only 404/410), so a stream reset on
+  # proxy.golang.org retries the module from goproxy.cn instead of failing.
+  GOPROXY: 'https://proxy.golang.org|https://goproxy.cn|direct'
 
 jobs:
   release_docker:
