@@ -62,6 +62,7 @@ func (d *Cfs) Init(ctx context.Context) error {
 	m := configmap.Simple{"state_dir": state}
 	for k, v := range map[string]string{
 		"threshold": d.Threshold, "seal_quiet": d.SealQuiet, "seal_max": d.SealMax,
+		"ack": d.Ack, "stage_max_bytes": d.StageMax, "pack_max_bytes": d.PackMax,
 		"dir_cache": d.DirCache, "gc_grace": d.GCGrace,
 	} {
 		if v != "" {

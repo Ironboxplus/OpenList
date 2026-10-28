@@ -131,6 +131,17 @@ func TestCfsStorageOnLocalStorage(t *testing.T) {
 		t.Fatal("small file differs")
 	}
 
+	// Staged small files are acknowledged before they are in a pack: wait until
+	// they have been committed (a real Flush of the volume the storage holds).
+	sh0 := cfsrclone.Lookup(cfsdrv.ShareKey("/cfs"))
+	if sh0 == nil {
+		t.Fatal("the storage's volume is not registered")
+	}
+	if err := sh0.Volume().Flush(ctx); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	sh0.Release(ctx)
+
 	// What reached the underlying storage: packs + log, and the big file at its real path.
 	if _, err := os.Stat(filepath.Join(under, "vol", "docs", "big.bin")); err != nil {
 		t.Errorf("the big file must be stored 1:1: %v", err)
