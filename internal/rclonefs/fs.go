@@ -37,6 +37,8 @@ type Fs struct {
 	// file costs two or three directory lookups on top of the upload.
 	dirs  sync.Map
 	dirMu sync.Mutex
+	// observer, when set, is told about every finished Put on this Fs.
+	observer func(Upload)
 }
 
 var (
@@ -46,8 +48,11 @@ var (
 
 // NewFs returns an rclone Fs rooted at the OpenList mount path root. The root
 // does not have to exist yet; rclone creates it on the first write.
-func NewFs(ctx context.Context, root string) (*Fs, error) {
+func NewFs(ctx context.Context, root string, opts ...Option) (*Fs, error) {
 	f := &Fs{root: utils.FixAndCleanPath(root)}
+	for _, o := range opts {
+		o(f)
+	}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
 	}).Fill(ctx, f)
@@ -165,7 +170,9 @@ func (f *Fs) Put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, exists bool) (fs.Object, error) {
 	remote := src.Remote()
 	obj, read, err := f.put(ctx, in, src, exists)
-	observeUpload(ctx, Upload{Remote: remote, Size: src.Size(), SourceRead: read, Err: err})
+	if f.observer != nil {
+		f.observer(Upload{Remote: remote, Size: src.Size(), SourceRead: read, Err: err})
+	}
 	if err != nil {
 		return nil, err
 	}

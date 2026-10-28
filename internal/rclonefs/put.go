@@ -117,17 +117,16 @@ type Upload struct {
 
 func (u Upload) Rapid() bool { return u.Err == nil && u.Size > 0 && u.SourceRead < u.Size }
 
-type uploadObserverKey struct{}
+// Option configures an Fs at NewFs.
+type Option func(*Fs)
 
-// WithUploadObserver has every Put on an rclonefs Fs under ctx report to fn.
-func WithUploadObserver(ctx context.Context, fn func(Upload)) context.Context {
-	return context.WithValue(ctx, uploadObserverKey{}, fn)
-}
-
-func observeUpload(ctx context.Context, u Upload) {
-	if fn, ok := ctx.Value(uploadObserverKey{}).(func(Upload)); ok {
-		fn(u)
-	}
+// WithUploadObserver has every Put on this Fs, and only on this Fs, report to fn.
+// It is state of the Fs, not of the context: a driver below the Fs that builds an
+// rclonefs Fs of its own (a Cfs storage over another storage) must not report the
+// same file again, just as rclone counts bytes in the operations layer and never
+// in a backend.
+func WithUploadObserver(fn func(Upload)) Option {
+	return func(f *Fs) { f.observer = fn }
 }
 
 // knownHashes collects the source hashes OpenList drivers use for rapid
