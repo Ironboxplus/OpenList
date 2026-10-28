@@ -346,6 +346,11 @@ type nodeInfo struct {
 	// seenAt is set locally on receipt for liveness; not part of the wire form's
 	// trust (it is overwritten each time we hear from/about the node).
 	seenAt int64 `json:"-"`
+	// advancedAt is the local time we last saw this node's Version move
+	// forward. Unlike seenAt it is not refreshed by a relay re-gossiping a stale
+	// entry of a dead node, so it is the evidence that the node itself is alive
+	// (every node bumps its own Version on each announce).
+	advancedAt int64 `json:"-"`
 }
 
 // ----------------------------------------------------------------------------
@@ -1087,7 +1092,9 @@ func (s *store) putInventory(info *nodeInfo, seenAt int64) {
 func (s *store) setLocalInventory(info *nodeInfo) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.putInventory(info, info.UpdatedAt)
+	cp := *info
+	cp.advancedAt = info.UpdatedAt
+	s.putInventory(&cp, info.UpdatedAt)
 }
 
 // mergeInventory integrates a peer's inventory entry (LWW by version). seenAt is
@@ -1100,7 +1107,12 @@ func (s *store) mergeInventory(info *nodeInfo, now int64) bool {
 		cur.seenAt = now // still heard about it; keep liveness fresh
 		return false
 	}
-	s.putInventory(info, now)
+	cp := *info
+	cp.advancedAt = now
+	if ok && info.Version == cur.Version {
+		cp.advancedAt = cur.advancedAt // an echo of what we already had
+	}
+	s.putInventory(&cp, now)
 	return true
 }
 
@@ -1111,6 +1123,7 @@ func (s *store) inventoryList() []nodeInfo {
 	for _, n := range s.inventory {
 		cp := *n
 		cp.seenAt = n.seenAt
+		cp.advancedAt = n.advancedAt
 		out = append(out, cp)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].NodeID < out[j].NodeID })

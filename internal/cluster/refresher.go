@@ -199,6 +199,19 @@ type refreshCandidate struct {
 
 // refreshCandidates lists the group's member nodes that are online and have a
 // usable mount. Self always counts as online.
+// leaseLive is the liveness test for refresher election. A direct link counts;
+// otherwise the node's own inventory Version must have advanced within three
+// announce intervals. Gossip about a node does not: a relay keeps re-announcing
+// a dead node's last entry, and electing (or handing the lease to) a dead
+// preferred refresher costs a full lease TTL each time.
+func (m *Manager) leaseLive(nodeID string, n nodeInfo) bool {
+	if m.conns.hasNode(nodeID) {
+		return true
+	}
+	window := int64(3 * m.cfgStore.get().announceInterval())
+	return n.advancedAt > 0 && now()-n.advancedAt < window
+}
+
 func (m *Manager) refreshCandidates(g group) []refreshCandidate {
 	byNode := map[string]nodeInfo{}
 	for _, n := range m.state.inventoryList() {
@@ -234,7 +247,7 @@ func (m *Manager) refreshCandidates(g group) []refreshCandidate {
 			}
 		} else {
 			n, ok := byNode[mem.NodeID]
-			if !ok || !m.isOnline(mem.NodeID, n.seenAt) {
+			if !ok || !m.leaseLive(mem.NodeID, n) {
 				continue
 			}
 			c.Public = n.Addr != ""

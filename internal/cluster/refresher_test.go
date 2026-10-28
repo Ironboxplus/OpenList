@@ -637,3 +637,43 @@ func TestStalledLinkBlocksTakeoverIsolatedNodeWaitsLonger(t *testing.T) {
 	r.m.leaseStep(g)
 	waitFor(t, "isolated survivor to claim", 5*time.Second, func() bool { return r.m.isHolder("g1") })
 }
+
+// A relay keeps re-gossiping the last inventory entry of a node that died. That
+// echo must not make the dead node look alive for the refresher election: the
+// holder would hand the lease to it and leave the group without a refresher for
+// a whole TTL, again and again.
+func TestDeadPreferredRefresherEchoedByRelayIsNotHandedTheLease(t *testing.T) {
+	r := newRefresherRig(t, time.Hour, Config{LeaseTTLSec: 30, AnnounceIntervalSec: 10})
+	r.becomeHolder()
+	r.m.refr.mu.Lock()
+	r.m.refr.acquiredAt["g1"] = time.Now().Add(-time.Hour)
+	r.m.refr.renewedAt["g1"] = time.Now()
+	r.m.refr.mu.Unlock()
+	r.m.state.setPolicy(r.local, "g1", r.peer.NodeID, now())
+	g, _ := r.m.state.groupByID("g1")
+
+	// The peer's own entry (Version 1) was last advanced 100 s ago; since then a
+	// relay has re-sent the same version every few seconds.
+	r.m.state.mu.Lock()
+	r.m.state.inventory[r.peer.NodeID].advancedAt = now() - 100
+	r.m.state.mu.Unlock()
+	for i := 0; i < 5; i++ {
+		r.m.state.mergeInventory(&nodeInfo{NodeID: r.peer.NodeID, Label: "peer", Version: 1,
+			Storages: []storageInfo{{MountPath: "/peer", Driver: "115 Open", Status: op.WORK}}}, now())
+	}
+	if n, _ := r.m.nodeInfoOf(r.peer.NodeID); n.seenAt < now()-1 {
+		t.Fatal("test premise: the echo does refresh seenAt")
+	}
+	r.m.leaseStep(g)
+	if !r.m.isHolder("g1") {
+		t.Fatal("the lease was handed to a preferred refresher that has been silent for 100 s")
+	}
+
+	// The peer really announces again (Version moves): now it is live.
+	r.m.state.mergeInventory(&nodeInfo{NodeID: r.peer.NodeID, Label: "peer", Version: 2,
+		Storages: []storageInfo{{MountPath: "/peer", Driver: "115 Open", Status: op.WORK}}}, now())
+	r.m.leaseStep(g)
+	if r.m.isHolder("g1") {
+		t.Fatal("a preferred refresher whose own announces arrive must get the lease")
+	}
+}
