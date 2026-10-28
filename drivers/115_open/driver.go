@@ -43,6 +43,7 @@ type Open115 struct {
 	// observable status (see WithOnAccessTokenInvalid below), not this flag, so
 	// a dropped first notification can never permanently silence every retry.
 	tokenInvalid atomic.Bool
+	refresh      refreshState
 }
 
 var (
@@ -65,13 +66,18 @@ func (d *Open115) Init(ctx context.Context) error {
 	// replaced the storage. The SDK reports the exact access token used by each
 	// success/failure so callbacks can bind to the current generation.
 	observedAccessToken := d.Addition.AccessToken
-	d.client = new115SDKClient(sdk.WithRefreshToken(d.Addition.RefreshToken),
+	mount := d.GetStorage().MountPath
+	opts := []sdk.Option{sdk.WithRefreshToken(d.Addition.RefreshToken),
 		sdk.WithAccessToken(d.Addition.AccessToken),
 		sdk.WithOnRefreshToken(func(s1, s2 string) {
 			d.Addition.AccessToken = s1
 			d.Addition.RefreshToken = s2
 			op.MustSaveDriverStorage(d)
 		}),
+		// Only the group's refresher may spend the single-use refresh_token; a
+		// member whose token was rejected asks the cluster for the new pair.
+		sdk.WithRefreshPolicy(func() bool { return op.RefreshAllowed(mount) }),
+		sdk.WithOnRefreshResult(func(ev sdk.RefreshEvent) { d.onRefreshResult(mount, ev) }),
 		// Cluster token-validity protocol: a node only shares a token it has
 		// proven valid, and pulls a fresh one from a healthy peer when its own
 		// dies. Edge-triggered so the cluster only reacts to real transitions.
@@ -93,26 +99,9 @@ func (d *Open115) Init(ctx context.Context) error {
 				op.NotifyStorageTokenValidWithSnapshot(d, currentAddition, currentModified)
 			}
 		}),
-		sdk.WithOnAccessTokenInvalid(func(accessToken string) {
-			st := d.GetStorage()
-			if st == nil || d.Addition.AccessToken != accessToken {
-				return
-			}
-			d.tokenInvalid.Store(true)
-			// Level-triggered on the observable status, not a one-shot latch: as
-			// long as this mount still reads WORK — the bad state cluster
-			// recovery needs to escape — every invalid callback must retry the
-			// notification. A CAS latch would go quiet forever if the one
-			// notification it allowed was itself dropped by
-			// NotifyStorageTokenInvalidWithSnapshot's own generation guard (a
-			// legitimate race against a concurrent storage replacement),
-			// permanently stranding the mount at WORK with cluster recovery
-			// never started. This naturally stops re-notifying once the status
-			// actually leaves WORK.
-			if st.Status == op.WORK {
-				op.NotifyStorageTokenInvalidWithSnapshot(d, st.Addition, st.Modified)
-			}
-		}))
+		sdk.WithOnAccessTokenInvalid(d.handleAccessTokenInvalid)}
+	opts = append(opts, testBaseURLOptions()...)
+	d.client = new115SDKClient(opts...)
 	applySDKProxyIfConfigured(d.client)
 	if flags.Debug || flags.Dev {
 		d.client.SetDebug(true)
@@ -157,6 +146,35 @@ func (d *Open115) Init(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// handleAccessTokenInvalid reacts to a rejected credential chain.
+func (d *Open115) handleAccessTokenInvalid(accessToken string) {
+	st := d.GetStorage()
+	if st == nil || d.Addition.AccessToken != accessToken {
+		return
+	}
+	if d.policySkipped(accessToken) {
+		// This member may not refresh, so the 401 only says the access token
+		// expired or was superseded; the refresh_token may be perfectly alive
+		// at the refresher. Revoking the pair here would kill it for everyone.
+		// The cluster is asked for the new pair via op.NotifyRefreshRejected.
+		return
+	}
+	d.tokenInvalid.Store(true)
+	// Level-triggered on the observable status, not a one-shot latch: as
+	// long as this mount still reads WORK — the bad state cluster
+	// recovery needs to escape — every invalid callback must retry the
+	// notification. A CAS latch would go quiet forever if the one
+	// notification it allowed was itself dropped by
+	// NotifyStorageTokenInvalidWithSnapshot's own generation guard (a
+	// legitimate race against a concurrent storage replacement),
+	// permanently stranding the mount at WORK with cluster recovery
+	// never started. This naturally stops re-notifying once the status
+	// actually leaves WORK.
+	if st.Status == op.WORK {
+		op.NotifyStorageTokenInvalidWithSnapshot(d, st.Addition, st.Modified)
+	}
 }
 
 func (d *Open115) shouldNotifyTokenValid() bool {
