@@ -27,7 +27,7 @@ func TestConnRegistry(t *testing.T) {
 	if len(r.all()) != 2 {
 		t.Fatalf("expected 2 conns, got %d", len(r.all()))
 	}
-	r.bind(c1, "NODE1")
+	r.bind(c1, "NODE1", "SELF")
 	if !r.hasNode("NODE1") {
 		t.Fatal("hasNode should find a bound node")
 	}

@@ -175,6 +175,7 @@ func admin(g *gin.RouterGroup) {
 	clusterGrp.POST("/config", handles.ClusterSetConfig)
 	clusterGrp.GET("/status", handles.ClusterStatus)
 	clusterGrp.POST("/groups", handles.ClusterSetGroups)
+	clusterGrp.POST("/refresher", handles.ClusterSetRefresher)
 
 	// Relayed-traffic and library statistics for the dashboard.
 	g.GET("/stats/overview", handles.StatsOverview)

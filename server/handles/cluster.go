@@ -108,3 +108,26 @@ func ClusterSetGroups(c *gin.Context) {
 	}
 	common.SuccessResp(c, m.Status())
 }
+
+// ClusterSetRefresher records the admin's preferred refresher for a sync group
+// (the node that should hold the refresher lease when it is online). An empty
+// node_id clears the preference. Admin only.
+func ClusterSetRefresher(c *gin.Context) {
+	m := clusterMgr(c)
+	if m == nil {
+		return
+	}
+	var req struct {
+		GroupID string `json:"group_id"`
+		NodeID  string `json:"node_id"`
+	}
+	if err := c.ShouldBind(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	if err := m.SetPreferredRefresher(req.GroupID, req.NodeID); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	common.SuccessResp(c, m.Status())
+}

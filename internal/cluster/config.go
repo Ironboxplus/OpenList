@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"time"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -45,11 +46,56 @@ type Config struct {
 	// AnnounceIntervalSec is how often this node re-broadcasts its inventory +
 	// credential digests so peers converge after any lost message. 0 => default.
 	AnnounceIntervalSec int `json:"announce_interval_sec"`
+
+	// Refresher timing (all optional, 0 => default). They exist so operators and
+	// tests can trade failover speed against traffic; the defaults suit
+	// production.
+	//
+	// LeaseTTLSec: how long a refresher lease stays valid without a renewal.
+	LeaseTTLSec int `json:"lease_ttl_sec,omitempty"`
+	// RefreshRequestWaitSec: a member whose token was rejected waits this long
+	// for a newer version before it sends the refresher a refresh-request.
+	RefreshRequestWaitSec int `json:"refresh_request_wait_sec,omitempty"`
+	// ProactiveMinGapSec: minimum spacing of refresh attempts per mount.
+	ProactiveMinGapSec int `json:"proactive_min_gap_sec,omitempty"`
+	// DeliveryResendSec: resend a new credential directly to a member that has
+	// not confirmed it after this long.
+	DeliveryResendSec int `json:"delivery_resend_sec,omitempty"`
+	// RevocationRetentionDays: prune superseded revocations older than this.
+	RevocationRetentionDays int `json:"revocation_retention_days,omitempty"`
 }
 
 const (
-	defaultAnnounceIntervalSec = 45
+	defaultAnnounceIntervalSec     = 45
+	defaultLeaseTTLSec             = 60
+	defaultRefreshRequestWaitSec   = 30
+	defaultProactiveMinGapSec      = 30
+	defaultDeliveryResendSec       = 20
+	defaultRevocationRetentionDays = 14
 )
+
+func pick(v, def int) int {
+	if v <= 0 {
+		return def
+	}
+	return v
+}
+
+func (c Config) leaseTTL() time.Duration {
+	return time.Duration(pick(c.LeaseTTLSec, defaultLeaseTTLSec)) * time.Second
+}
+func (c Config) refreshRequestWait() time.Duration {
+	return time.Duration(pick(c.RefreshRequestWaitSec, defaultRefreshRequestWaitSec)) * time.Second
+}
+func (c Config) proactiveMinGap() time.Duration {
+	return time.Duration(pick(c.ProactiveMinGapSec, defaultProactiveMinGapSec)) * time.Second
+}
+func (c Config) deliveryResend() time.Duration {
+	return time.Duration(pick(c.DeliveryResendSec, defaultDeliveryResendSec)) * time.Second
+}
+func (c Config) revocationRetentionSec() int64 {
+	return int64(pick(c.RevocationRetentionDays, defaultRevocationRetentionDays)) * 24 * 3600
+}
 
 func (c Config) announceInterval() int {
 	if c.AnnounceIntervalSec <= 0 {

@@ -24,7 +24,7 @@ import (
 //     holds, so the receiver can detect what it is missing.
 //   - Wants:       group ids the sender wants the receiver to send creds for.
 type syncMessage struct {
-	Type        string            `json:"type"` // "hello" | "push" | "announce" | "pull" | "reply"
+	Type        string            `json:"type"` // "hello" | "push" | "announce" | "pull" | "reply" | "refresh-request" | "ack"
 	Node        *nodeInfo         `json:"node,omitempty"`
 	Nodes       []*nodeInfo       `json:"nodes,omitempty"`
 	Groups      *groupDoc         `json:"groups,omitempty"`
@@ -33,6 +33,47 @@ type syncMessage struct {
 	Revocations []*credRevocation `json:"revocations,omitempty"`
 	CredDigests []credDigest      `json:"cred_digests,omitempty"`
 	Wants       []string          `json:"wants,omitempty"`
+
+	// Fields below are ignored by nodes that predate protocol 2 (JSON drops
+	// unknown fields; unknown message types fall through every switch).
+
+	// Proto is the sender's protocol level: 2 understands refresher leases,
+	// directed messages and the revocation digest.
+	Proto int `json:"proto,omitempty"`
+	// From/To/Hops address a directed message. A node that is not To forwards it
+	// over its direct link to To (or floods it, bounded by Hops) instead of
+	// processing it, so NAT'd members can talk through a public hub.
+	From string `json:"from,omitempty"`
+	To   string `json:"to,omitempty"`
+	Hops int    `json:"hops,omitempty"`
+	// RevDigest summarises the sender's revocation set. announce/hello carry it
+	// instead of the full set; a mismatch makes the receiver pull (WantRevs).
+	RevDigest string `json:"rev_digest,omitempty"`
+	WantRevs  bool   `json:"want_revs,omitempty"`
+	// Leases/Policies replicate the per-group refresher lease and the admin's
+	// preferred-refresher choice.
+	Leases   []*refresherLease `json:"leases,omitempty"`
+	Policies []*groupPolicy    `json:"policies,omitempty"`
+	// Req is a refresh-request; Acks confirm receipt of credential records.
+	Req  *refreshRequest `json:"req,omitempty"`
+	Acks []credDigest    `json:"acks,omitempty"`
+}
+
+// Message types introduced by protocol 2.
+const (
+	msgRefreshRequest = "refresh-request"
+	msgAck            = "ack"
+	// protoLevel is what this build advertises in Proto.
+	protoLevel = 2
+)
+
+// refreshRequest asks the group's refresher for a newer credential pair: the
+// requester's access token was rejected and no newer version arrived.
+type refreshRequest struct {
+	GroupID     string `json:"group_id"`
+	Mount       string `json:"mount"`
+	HaveHash    string `json:"have_hash"`
+	HaveVersion uint64 `json:"have_version"`
 }
 
 // envelope is the outer, on-the-wire structure. Its Cipher is the syncMessage

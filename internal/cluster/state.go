@@ -127,6 +127,13 @@ type credRecord struct {
 	UpdatedAt    int64                      `json:"updated_at"`
 	Sig          []byte                     `json:"sig"`                 // v1-compatible record signature
 	MountSig     []byte                     `json:"mount_sig,omitempty"` // binds OriginMount for upgraded peers
+	// ObtainedAt/ExpiresIn describe when the access token in the payload was
+	// issued and its lifetime in seconds (0 = unknown). They are unsigned
+	// scheduling metadata, only ever used to time a proactive refresh; a wrong
+	// value can at worst make the refresher act early or late. Older nodes
+	// ignore them.
+	ObtainedAt int64 `json:"obtained_at,omitempty"`
+	ExpiresIn  int64 `json:"expires_in,omitempty"`
 }
 
 // signingBytes deliberately preserves the original credential signature format.
@@ -301,6 +308,11 @@ type storageInfo struct {
 	MountPath string `json:"mount_path"`
 	Driver    string `json:"driver"`
 	Status    string `json:"status"`
+	// CredHash/CredVer identify the credential pair this mount is using (short
+	// hash and the catalogue version of that pair), so every node can show which
+	// version each member actually holds. Empty/0 = not in a group or unknown.
+	CredHash string `json:"cred_hash,omitempty"`
+	CredVer  uint64 `json:"cred_ver,omitempty"`
 }
 
 // storageStatusError is what any storage status other than work/disabled is
@@ -360,6 +372,19 @@ type store struct {
 	candidateHealth map[string]map[string]int64 // group id -> credential hash -> last proven unix second
 	inventory       map[string]*nodeInfo        // keyed by node id
 	lamport         uint64
+
+	// revFloor[group] is the newest UpdatedAt among revocations pruned for the
+	// group. A credential record authored at or before it is refused, so a pair
+	// whose tombstone was pruned can never come back (see pruneRevocations).
+	revFloor map[string]int64
+	// leases/policies: per-group refresher lease and the admin's preferred
+	// refresher (see lease.go).
+	leases   map[string]*leaseEntry
+	policies map[string]*groupPolicy
+	// clock is unix seconds; tests replace it.
+	clock func() int64
+	// revRetentionSec is the prune window for revocations (0 = default).
+	revRetentionSec int64
 }
 
 const candidateLeaseSec int64 = 15 * 60
@@ -371,6 +396,10 @@ func newStore() *store {
 		failedCandidates: make(map[string]map[string]map[string]int64),
 		candidateHealth:  make(map[string]map[string]int64),
 		inventory:        make(map[string]*nodeInfo),
+		revFloor:         make(map[string]int64),
+		leases:           make(map[string]*leaseEntry),
+		policies:         make(map[string]*groupPolicy),
+		clock:            now,
 	}
 }
 
@@ -627,6 +656,12 @@ func (s *store) credDigests() []credDigest {
 // Returns (nil,false) when the credential is unchanged (idempotent: "其他节点看到
 // 一样的 token 就不用变") or empty.
 func (s *store) localCredChange(id *identity, groupID, driver, mount string, payload map[string]json.RawMessage, now int64) (*credRecord, bool) {
+	return s.localCredChangeTimed(id, groupID, driver, mount, payload, now, 0, 0)
+}
+
+// localCredChangeTimed is localCredChange that also records when the access
+// token was obtained and its lifetime (see credRecord.ObtainedAt), when known.
+func (s *store) localCredChangeTimed(id *identity, groupID, driver, mount string, payload map[string]json.RawMessage, now, obtainedAt, expiresIn int64) (*credRecord, bool) {
 	h := credHash(payload)
 	if h == "" {
 		return nil, false
@@ -670,6 +705,8 @@ func (s *store) localCredChange(id *identity, groupID, driver, mount string, pay
 		OriginPub:    id.Pub,
 		OriginMount:  mount,
 		UpdatedAt:    now,
+		ObtainedAt:   obtainedAt,
+		ExpiresIn:    expiresIn,
 	}
 	r.Sig = id.sign(r.signingBytes())
 	r.MountSig = id.sign(r.mountSigningBytes())
@@ -685,6 +722,11 @@ func (s *store) mergeCred(r *credRecord) bool {
 	s.observe(r.Version)
 	if s.pairRevokedLocked(r.GroupID, r.CredHash) {
 		return false // a provider-auth tombstone is terminal for this complete pair
+	}
+	if floor := s.revFloor[r.GroupID]; floor > 0 && r.UpdatedAt <= floor {
+		// A tombstone at or after this record's authoring time was pruned. The
+		// record can only be a pair that was already dead then (or older).
+		return false
 	}
 	byOrigin := s.creds[r.GroupID]
 	for _, existing := range byOrigin {
@@ -869,6 +911,17 @@ func (s *store) mergeRevocation(rev *credRevocation) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.observe(rev.Version)
+	if s.revPrunableLocked(rev) {
+		// Past retention and already superseded by a newer credential: this is
+		// exactly what pruning would remove, so do not re-adopt it (that would
+		// make every peer's set differ forever). The floor keeps the dead pair
+		// itself out.
+		if rev.UpdatedAt > s.revFloor[rev.GroupID] {
+			s.revFloor[rev.GroupID] = rev.UpdatedAt
+		}
+		s.dropCredHashLocked(rev.GroupID, rev.CredHash)
+		return false
+	}
 	byRevocation := s.revocations[rev.GroupID]
 	if byRevocation == nil {
 		byRevocation = make(map[string]*credRevocation)
@@ -1088,6 +1141,10 @@ type persistedState struct {
 	Revocations      []*credRevocation  `json:"revocations,omitempty"`
 	FailedCandidates []candidateFailure `json:"failed_candidates,omitempty"`
 	Inventory        []*nodeInfo        `json:"inventory"`
+	// RevFloor, Leases and Policies are protocol-2 state; older builds ignore them.
+	RevFloor map[string]int64  `json:"rev_floor,omitempty"`
+	Leases   []*refresherLease `json:"leases,omitempty"`
+	Policies []*groupPolicy    `json:"policies,omitempty"`
 }
 
 // candidateFailure is local-only recovery metadata; it deliberately contains no
@@ -1127,6 +1184,20 @@ func (s *store) export() persistedState {
 	for _, n := range s.inventory {
 		ps.Inventory = append(ps.Inventory, n)
 	}
+	if len(s.revFloor) > 0 {
+		ps.RevFloor = make(map[string]int64, len(s.revFloor))
+		for g, v := range s.revFloor {
+			ps.RevFloor[g] = v
+		}
+	}
+	for _, e := range s.leases {
+		cp := *e.lease
+		ps.Leases = append(ps.Leases, &cp)
+	}
+	for _, p := range s.policies {
+		cp := *p
+		ps.Policies = append(ps.Policies, &cp)
+	}
 	return ps
 }
 
@@ -1143,22 +1214,49 @@ func (s *store) load(ps persistedState) {
 	s.revocations = make(map[string]map[string]*credRevocation)
 	s.candidateHealth = make(map[string]map[string]int64)
 	s.failedCandidates = make(map[string]map[string]map[string]int64)
+	s.revFloor = make(map[string]int64)
+	s.leases = make(map[string]*leaseEntry)
+	s.policies = make(map[string]*groupPolicy)
 	for _, rev := range ps.Revocations {
 		if !credentialRevocationAuthorizedByGroups(s.groups.Groups, rev) {
 			continue
 		}
-		bySource := s.revocations[rev.GroupID]
-		if bySource == nil {
-			bySource = make(map[string]*credRevocation)
-			s.revocations[rev.GroupID] = bySource
+		// Keyed by complete pair hash, exactly as mergeRevocation and
+		// pairRevokedLocked key them. (Keying by source mount here used to hide
+		// every revocation from pairRevokedLocked after a restart.)
+		byHash := s.revocations[rev.GroupID]
+		if byHash == nil {
+			byHash = make(map[string]*credRevocation)
+			s.revocations[rev.GroupID] = byHash
 		}
-		key := candidateKey(rev.Origin, rev.OriginMount)
-		if current := bySource[key]; current == nil || rev.dominates(current) {
+		if current := byHash[rev.CredHash]; current == nil || rev.dominates(current) {
 			cp := *rev
-			bySource[key] = &cp
+			byHash[rev.CredHash] = &cp
 		}
 		if rev.Version > s.lamport {
 			s.lamport = rev.Version
+		}
+	}
+	for g, v := range ps.RevFloor {
+		if v > 0 {
+			s.revFloor[g] = v
+		}
+	}
+	for _, l := range ps.Leases {
+		if leaseAuthorizedByGroups(s.groups.Groups, l) {
+			cp := *l
+			// Heard "now": a lease persisted across a restart stays valid for
+			// at most one more TTL, never longer.
+			s.leases[l.GroupID] = &leaseEntry{lease: &cp, seenAt: timeNow()}
+		}
+	}
+	for _, p := range ps.Policies {
+		if p.verify() {
+			cp := *p
+			s.policies[p.GroupID] = &cp
+			if p.Version > s.lamport {
+				s.lamport = p.Version
+			}
 		}
 	}
 	for _, r := range ps.Creds {
@@ -1166,7 +1264,7 @@ func (s *store) load(ps persistedState) {
 			continue
 		}
 		key := candidateKey(r.Origin, r.OriginMount)
-		if rev := s.revocations[r.GroupID][key]; rev != nil && rev.Version >= r.Version {
+		if s.revocations[r.GroupID][r.CredHash] != nil {
 			continue
 		}
 		byOrigin := s.creds[r.GroupID]

@@ -53,8 +53,12 @@ type Manager struct {
 	candidateRetryDelay time.Duration
 	probeCredentialFn   func(context.Context, model.Storage, string) error
 
-	dialMu  sync.Mutex
-	dialing map[string]bool // peer URLs with an in-flight/live outbound dial
+	dialMu sync.Mutex
+	dials  map[string]*dialState // peer URL -> redial bookkeeping
+
+	links      linkBook     // per-peer link health history
+	refr       refresherState
+	deliveries deliveryBook // credential versions awaiting member confirmation
 
 	invMu       sync.Mutex
 	lastSelfVer uint64 // monotonic version for our own inventory entry
@@ -97,7 +101,7 @@ func Init(dataDir string) (*Manager, error) {
 		state:           newStore(),
 		replay:          newReplayCache(replayWindowSec),
 		conns:           newConnRegistry(),
-		dialing:         make(map[string]bool),
+		dials:           make(map[string]*dialState),
 		recoveryLocks:   make(map[string]*sync.Mutex),
 		recoveryQueues:  make(map[string]*recoveryQueue),
 		recoveryRetries: make(map[string]struct{}),
@@ -107,10 +111,13 @@ func Init(dataDir string) (*Manager, error) {
 		return nil, err
 	}
 	m.loadState()
+	m.state.revRetentionSec = m.cfgStore.get().revocationRetentionSec()
 
 	op.RegisterStorageHook(m.onStorageHook)
 	op.RegisterStorageCredentialHook(m.onStorageCredential)
 	op.RegisterStorageCredentialHealthHook(m.onStorageCredentialHealthy)
+	// Only the group's lease holder may spend a single-use refresh_token.
+	op.SetRefreshCoordinator(m)
 	Default = m
 	return m, nil
 }
@@ -186,8 +193,9 @@ func (m *Manager) SetConfig(c Config) error {
 	if err := m.cfgStore.save(c); err != nil {
 		return err
 	}
+	m.state.revRetentionSec = c.revocationRetentionSec()
 	// Drop all live connections so they reconnect with the new settings.
-	m.conns.closeAll()
+	m.conns.closeAll(reasonConfig)
 	go m.refreshInventory()
 	go m.seedLocalCreds()
 	return nil
@@ -224,6 +232,7 @@ func (m *Manager) SetGroups(specs []GroupSpec) error {
 	}
 	d := m.state.setGroups(m.id, groups, now())
 	m.state.pruneCreds()
+	m.state.pruneLeases()
 	if err := m.persist(); err != nil {
 		return fmt.Errorf("persist groups: %w", err)
 	}
@@ -244,6 +253,7 @@ func (m *Manager) Start() {
 		go m.seedLocalCreds()
 		go m.announceLoop()
 		go m.dialSupervisor()
+		go m.refresherLoop()
 	})
 }
 
@@ -254,7 +264,7 @@ func (m *Manager) Stop() {
 	default:
 		close(m.stopCh)
 	}
-	m.conns.closeAll()
+	m.conns.closeAll(reasonShutdown)
 }
 
 // ---- self inventory ----
@@ -265,7 +275,9 @@ func (m *Manager) selfNodeInfo() *nodeInfo {
 	var sts []storageInfo
 	for _, d := range op.GetAllStorages() {
 		st := d.GetStorage()
-		sts = append(sts, storageInfoOf(*st))
+		info := storageInfoOf(*st)
+		info.CredHash, info.CredVer = m.heldCred(*st)
+		sts = append(sts, info)
 	}
 	sort.Slice(sts, func(i, j int) bool { return sts[i].MountPath < sts[j].MountPath })
 
@@ -312,27 +324,22 @@ func (m *Manager) knownNodesForPEX() []*nodeInfo {
 	return out
 }
 
-// helloMessage greets a freshly-connected peer with everything needed to
-// converge: our inventory, known dialable peers (PEX), the groups doc, and our
-// credential digests.
+/// helloMessage greets a freshly-connected peer with everything needed to
+// converge: our inventory, known dialable peers (PEX), the groups doc, our
+// credential digests, the refresher leases/policies and a revocation digest.
 func (m *Manager) helloMessage() *syncMessage {
-	self := m.selfNodeInfo()
-	m.state.setLocalInventory(self)
-	gd := m.state.groupDoc()
-	return &syncMessage{
-		Type:        "hello",
-		Node:        self,
-		Nodes:       m.knownNodesForPEX(),
-		Groups:      &gd,
-		GroupsVer:   gd.Version,
-		Revocations: m.state.revocationSnapshot(),
-		CredDigests: m.offerableDigests(),
-	}
+	msg := m.announceMessage()
+	msg.Type = "hello"
+	return msg
 }
 
-// announceMessage is the periodic anti-entropy + inventory advert.
+// announceMessage is the periodic anti-entropy + inventory advert. It carries
+// only a digest of the revocation set; a peer whose digest differs pulls the
+// set (see handleFrame), so the 10 KB tombstone list no longer rides on every
+// announce and every reply.
 func (m *Manager) announceMessage() *syncMessage {
 	self := m.selfNodeInfo()
+	m.state.setLocalInventory(self)
 	gd := m.state.groupDoc()
 	return &syncMessage{
 		Type:        "announce",
@@ -340,8 +347,11 @@ func (m *Manager) announceMessage() *syncMessage {
 		Nodes:       m.knownNodesForPEX(),
 		Groups:      &gd,
 		GroupsVer:   gd.Version,
-		Revocations: m.state.revocationSnapshot(),
 		CredDigests: m.offerableDigests(),
+		Proto:       protoLevel,
+		RevDigest:   m.state.revocationDigest(),
+		Leases:      m.state.leaseList(),
+		Policies:    m.state.policyList(),
 	}
 }
 
@@ -447,7 +457,8 @@ func (m *Manager) onStorageCredential(typ string, event op.StorageCredentialEven
 				m.state.markCandidateHealthy(g.ID, credID, now())
 				continue
 			}
-			if rec, ok := m.state.localCredChange(m.id, g.ID, st.Driver, st.MountPath, creds, now()); ok {
+			obtained, expiresIn := m.timingForPayload(st.MountPath, creds)
+			if rec, ok := m.state.localCredChangeTimed(m.id, g.ID, st.Driver, st.MountPath, creds, now(), obtained, expiresIn); ok {
 				m.state.markCandidateHealthy(g.ID, rec.CredHash, now())
 				dirty = true
 				m.recordEvent("share", g.ID, fmt.Sprintf("%s refreshed credentials", st.MountPath))
@@ -462,6 +473,11 @@ func (m *Manager) onStorageCredential(typ string, event op.StorageCredentialEven
 		}
 		if len(shares) > 0 {
 			m.broadcast(&syncMessage{Type: "push", Creds: shares})
+			for _, rec := range shares {
+				m.trackDelivery(rec)
+				utils.Log.Infof("[cluster] push group=%s v%d origin=%s mount=%s hash=%s expires_in=%ds to %d link(s)",
+					rec.GroupID, rec.Version, shortNode(rec.Origin), rec.OriginMount, shortHash(rec.CredHash), rec.ExpiresIn, m.linkCount())
+			}
 		}
 
 	case "token-invalid":
@@ -493,6 +509,10 @@ func (m *Manager) onStorageCredential(typ string, event op.StorageCredentialEven
 		}
 		if len(revocations) > 0 {
 			m.broadcast(&syncMessage{Type: "push", Revocations: revocations})
+			for _, rev := range revocations {
+				utils.Log.Warnf("[cluster] revoke group=%s hash=%s v%d origin=%s mount=%s (provider 401 on this node) -> %d link(s)",
+					rev.GroupID, shortHash(rev.CredHash), rev.Version, shortNode(rev.Origin), rev.OriginMount, m.linkCount())
+			}
 		}
 		for _, g := range groups {
 			m.enqueueKnownCandidates(g.ID, st.MountPath, credID)
@@ -691,7 +711,8 @@ func (m *Manager) pullGroup(groupID string) {
 	if !m.cfgStore.get().active() {
 		return
 	}
-	m.broadcast(&syncMessage{Type: "pull", Wants: []string{groupID}})
+	utils.Log.Infof("[cluster] pull group=%s requested from %d link(s)", groupID, m.linkCount())
+	m.broadcast(&syncMessage{Type: "pull", Wants: []string{groupID}, Proto: protoLevel})
 }
 
 // hasHealthyLocalCandidate reports whether this node is currently using this
@@ -937,13 +958,29 @@ func (m *Manager) absorbGroups(d *groupDoc) bool {
 }
 
 func (m *Manager) absorbCreds(recs []*credRecord) []*credRecord {
+	return m.absorbCredsFrom(recs, "")
+}
+
+// absorbCredsFrom merges received credential records and logs the outcome of
+// each (version, origin, source mount, hash) so a missing or ignored record is
+// diagnosable from the log alone.
+func (m *Manager) absorbCredsFrom(recs []*credRecord, from string) []*credRecord {
 	var merged []*credRecord
 	for _, r := range recs {
 		if r == nil || !r.verify() || !m.credentialAuthorized(r) {
+			if r != nil {
+				utils.Log.Debugf("[cluster] recv cred group=%s v%d origin=%s mount=%s from=%s: REJECTED (bad signature or unauthorized source)",
+					r.GroupID, r.Version, shortNode(r.Origin), r.OriginMount, shortNode(from))
+			}
 			continue
 		}
 		if m.state.mergeCred(r) {
 			merged = append(merged, r)
+			utils.Log.Infof("[cluster] recv cred group=%s v%d origin=%s mount=%s hash=%s from=%s: merged",
+				r.GroupID, r.Version, shortNode(r.Origin), r.OriginMount, shortHash(r.CredHash), shortNode(from))
+		} else {
+			utils.Log.Debugf("[cluster] recv cred group=%s v%d origin=%s mount=%s hash=%s from=%s: already known/superseded/revoked",
+				r.GroupID, r.Version, shortNode(r.Origin), r.OriginMount, shortHash(r.CredHash), shortNode(from))
 		}
 	}
 	if len(merged) > 0 {
@@ -977,6 +1014,8 @@ func (m *Manager) absorbRevocations(revs []*credRevocation) []*credRevocation {
 			merged = append(merged, rev)
 			m.recordEvent("revoke", rev.GroupID,
 				fmt.Sprintf("%s revoked candidate from %s", rev.OriginMount, shortNode(rev.Origin)))
+			utils.Log.Infof("[cluster] recv revocation group=%s hash=%s v%d origin=%s mount=%s: applied",
+				rev.GroupID, shortHash(rev.CredHash), rev.Version, shortNode(rev.Origin), rev.OriginMount)
 		}
 	}
 	if len(merged) > 0 {
@@ -1000,7 +1039,7 @@ func (m *Manager) credentialAuthorized(r *credRecord) bool {
 // buildReply answers a peer's digests / wants, telling it what we hold that it
 // lacks and requesting what it holds that we lack.
 func (m *Manager) buildReply(in *syncMessage) *syncMessage {
-	reply := &syncMessage{Type: "reply"}
+	reply := &syncMessage{Type: "reply", Proto: protoLevel}
 
 	// Groups: if ours is newer, offer it.
 	local := m.state.groupDoc()
@@ -1071,7 +1110,19 @@ func (m *Manager) buildReply(in *syncMessage) *syncMessage {
 			appendCred(cur)
 		}
 	}
-	reply.Revocations = m.state.revocationSnapshot()
+	// Revocations ride only when the peer asked for them (digest mismatch) or it
+	// is a protocol-1 node, whose announces carry its full set and which expects
+	// ours back whenever the two differ.
+	switch {
+	case in.WantRevs:
+		reply.Revocations = m.state.revocationSnapshot()
+	case in.Proto < protoLevel && in.Type == "pull":
+		reply.Revocations = m.state.revocationSnapshot()
+	case in.Proto < protoLevel && (in.Type == "hello" || in.Type == "announce"):
+		if revocationDigest(in.Revocations) != m.state.revocationDigest() {
+			reply.Revocations = m.state.revocationSnapshot()
+		}
+	}
 
 	if reply.Groups == nil && len(reply.Creds) == 0 && len(reply.Revocations) == 0 && len(reply.Wants) == 0 {
 		return nil
@@ -1081,36 +1132,39 @@ func (m *Manager) buildReply(in *syncMessage) *syncMessage {
 
 // ---- networking ----
 
-// seal wraps a message in an encrypted envelope addressed from this node.
+/// seal wraps a message in an encrypted envelope addressed from this node. The
+// protocol level is stamped on a copy, so shared messages are never mutated.
 func (m *Manager) seal(msg *syncMessage) ([]byte, error) {
 	key, err := deriveAEADKey([]byte(m.cfgStore.get().Key))
 	if err != nil {
 		return nil, err
 	}
-	return sealEnvelope(key, m.id, msg, now())
+	cp := *msg
+	if cp.Proto == 0 {
+		cp.Proto = protoLevel
+	}
+	return sealEnvelope(key, m.id, &cp, now())
 }
 
-// sendTo enqueues a sealed message on a single connection.
+// sendTo queues a message on a single connection. A link that was just closed as
+// a duplicate hands the message to the surviving link to the same node.
 func (m *Manager) sendTo(c *peerConn, msg *syncMessage) {
-	frame, err := m.seal(msg)
-	if err != nil {
+	if c.isClosed() {
+		if id := c.node(); id != "" {
+			if alt := m.conns.get(id); alt != nil && alt != c {
+				alt.enqueue(msg)
+			}
+		}
 		return
 	}
-	c.enqueue(frame)
+	c.enqueue(msg)
 }
 
-// broadcast enqueues a sealed message on every live connection.
+// broadcast queues a message on every live connection. Each link coalesces it
+// into its own pending state; nothing here can block or drop a connection.
 func (m *Manager) broadcast(msg *syncMessage) {
-	conns := m.conns.all()
-	if len(conns) == 0 {
-		return
-	}
-	frame, err := m.seal(msg)
-	if err != nil {
-		return
-	}
-	for _, c := range conns {
-		c.enqueue(frame)
+	for _, c := range m.conns.all() {
+		c.enqueue(msg)
 	}
 }
 
@@ -1122,15 +1176,33 @@ func (m *Manager) relayMsg(msg *syncMessage, except *peerConn) {
 	if len(conns) <= 1 {
 		return
 	}
-	frame, err := m.seal(msg)
-	if err != nil {
-		return
-	}
 	for _, c := range conns {
 		if c == except {
 			continue
 		}
-		c.enqueue(frame)
+		c.enqueue(msg)
+	}
+}
+
+// bindConn records the authenticated node id of a link and, when a second link
+// to the same node exists, keeps exactly one of the two (see keepNewLink). What
+// the closed link still had queued moves to the survivor.
+func (m *Manager) bindConn(c *peerConn, nodeID string) {
+	loser := m.conns.bind(c, nodeID, m.id.NodeID)
+	if c.outbound {
+		m.noteDialNode(c.addr, nodeID)
+	}
+	if loser == nil {
+		m.links.connected(c, nodeID)
+		return
+	}
+	if winner := m.conns.get(nodeID); winner != nil && winner != loser {
+		winner.out.absorb(loser.out)
+	}
+	utils.Log.Infof("[cluster] duplicate link to %s: closing the %s link, keeping the other", shortNode(nodeID), dirOf(loser))
+	loser.close(reasonSuperseded)
+	if loser != c {
+		m.links.connected(c, nodeID)
 	}
 }
 
@@ -1139,26 +1211,43 @@ func (m *Manager) relayMsg(msg *syncMessage, except *peerConn) {
 func (m *Manager) handleFrame(c *peerConn, data []byte) {
 	cfg := m.cfgStore.get()
 	if !cfg.active() {
-		c.close()
+		c.close(reasonInactive)
 		return
 	}
 	key, err := deriveAEADKey([]byte(cfg.Key))
 	if err != nil {
-		c.close()
+		c.close(reasonRejected)
 		return
 	}
 	env, msg, err := openEnvelope(key, data, now(), m.replay, replayWindowSec)
 	if err != nil {
-		utils.Log.Debugf("[cluster] frame rejected from %s: %v", c.nodeID, err)
-		c.close()
+		utils.Log.Debugf("[cluster] frame rejected from %s: %v", shortNode(c.node()), err)
+		c.close(reasonRejected + ": " + shortErr(err))
 		return
 	}
 	if env.Sender == m.id.NodeID {
-		c.close() // connected to ourselves
+		c.close(reasonSelf) // connected to ourselves
 		return
 	}
-	if c.nodeID == "" {
-		m.conns.bind(c, env.Sender)
+	if c.node() == "" {
+		m.bindConn(c, env.Sender)
+	}
+	proto := int32(msg.Proto)
+	if proto == 0 {
+		proto = 1 // a node that predates protocol 2 sends no level
+	}
+	c.peerProto.Store(proto)
+	m.links.noteProto(env.Sender, int(proto))
+	from := env.Sender
+
+	// A directed message for someone else is forwarded, never processed.
+	if msg.To != "" && msg.To != m.id.NodeID {
+		m.forwardDirected(msg, c)
+		return
+	}
+	switch msg.Type {
+	case "hello", "announce", "reply":
+		c.lastAE.Store(time.Now().UnixNano())
 	}
 
 	relay := &syncMessage{Type: "push"}
@@ -1180,14 +1269,36 @@ func (m *Manager) handleFrame(c *peerConn, data []byte) {
 		relay.Groups = &gd
 		relayHas = true
 	}
+	// Refresher leases and the admin's preferred-refresher policy (protocol 2).
+	if leases := m.absorbLeases(msg.Leases); len(leases) > 0 {
+		relay.Leases = leases
+		relayHas = true
+	}
+	if pols := m.absorbPolicies(msg.Policies); len(pols) > 0 {
+		relay.Policies = pols
+		relayHas = true
+	}
 	// Candidate tombstones must converge before credentials: otherwise a relay
 	// can briefly resurrect an old signed token while a revocation is in flight.
 	if revoked := m.absorbRevocations(msg.Revocations); len(revoked) > 0 {
 		relay.Revocations = revoked
 		relayHas = true
 	}
+	// Announces carry a revocation digest instead of the set: when it differs
+	// from ours, fetch the peer's set once per distinct (theirs, ours) pair.
+	if msg.Proto >= 2 && (msg.Type == "hello" || msg.Type == "announce") {
+		mine := m.state.revocationDigest()
+		if msg.RevDigest != mine {
+			if k := msg.RevDigest + "|" + mine; c.lastRevPull.Load() != k {
+				c.lastRevPull.Store(k)
+				utils.Log.Infof("[cluster] revocation digest differs from %s (theirs %q ours %q): pulling their set", shortNode(from), msg.RevDigest, mine)
+				m.sendTo(c, &syncMessage{Type: "pull", WantRevs: true, Proto: protoLevel})
+			}
+		}
+	}
 	// Credentials.
-	if merged := m.absorbCreds(msg.Creds); len(merged) > 0 {
+	if merged := m.absorbCredsFrom(msg.Creds, from); len(merged) > 0 {
+		m.ackMerged(c, merged)
 		// A relay must not amplify a peer credential merely because its signature
 		// was valid. Only candidates that this node has actually proven locally
 		// may leave this node again.
@@ -1199,6 +1310,26 @@ func (m *Manager) handleFrame(c *peerConn, data []byte) {
 		if len(relay.Creds) > 0 {
 			relayHas = true
 		}
+	}
+	// Delivery confirmations: explicit acks, and the digests of every announce.
+	for _, dg := range msg.Acks {
+		ackFrom := msg.From
+		if ackFrom == "" {
+			ackFrom = from
+		}
+		m.confirmDelivery(ackFrom, dg)
+	}
+	if msg.Type == "hello" || msg.Type == "announce" {
+		for _, dg := range msg.CredDigests {
+			m.confirmDelivery(from, dg)
+		}
+	}
+	if msg.Type == msgRefreshRequest {
+		reqFrom := msg.From
+		if reqFrom == "" {
+			reqFrom = from
+		}
+		m.handleRefreshRequest(reqFrom, msg.Req)
 	}
 	if relayHas {
 		m.relayMsg(relay, c)
