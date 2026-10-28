@@ -19,6 +19,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
+	"github.com/OpenListTeam/OpenList/v4/internal/syncjob"
 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
 	cfsrclone "github.com/Ironboxplus/cfs/frontend/rclone"
 	"github.com/glebarez/sqlite"
@@ -217,5 +218,51 @@ func TestCfsRejectsRemotePathInsideItself(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("a cfs storage inside itself must be refused")
+	}
+}
+
+// A sync into a Cfs storage that sits on another OpenList storage: the Cfs
+// driver builds an rclonefs Fs of its own over the storage below, and the
+// job context goes down with every big file (stored 1:1). Each file must still
+// count once, and the uploaded bytes must be the source bytes.
+func TestSyncIntoStackedCfsCountsEachFileOnce(t *testing.T) {
+	under, state, src := t.TempDir(), t.TempDir(), t.TempDir()
+	addStorage(t, "Local", "/stack-under", `{"root_folder_path":`+q(under)+`}`)
+	addStorage(t, "Cfs", "/stack-cfs", `{"remote_path":"/stack-under/vol","root_folder_path":"/","state_dir":`+q(state)+`,"seal_quiet":"50ms","seal_max":"500ms","threshold":"64KiB"}`)
+
+	sizes := map[string]int{"small1.txt": 100, "d/small2.txt": 5000, "d/edge.bin": 64<<10 - 1, "big1.bin": 64 << 10, "d/big2.bin": 300 << 10, "big3.bin": 1 << 20}
+	var total int64
+	for rel, n := range sizes {
+		p := filepath.Join(src, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, randBytes(n), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		total += int64(n)
+	}
+
+	m := syncjob.NewManager()
+	m.SetHistoryPath(filepath.Join(t.TempDir(), "sync-jobs.jsonl"))
+	s, err := m.Start(syncjob.Spec{Mode: syncjob.ModeCopy, Src: "local:" + src, Dst: "/stack-cfs"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(60 * time.Second); s.State == syncjob.StateRunning; {
+		if time.Now().After(deadline) {
+			t.Fatal("job did not finish")
+		}
+		time.Sleep(50 * time.Millisecond)
+		s, _ = m.Get(s.ID, false)
+	}
+	if s.State != syncjob.StateSucceeded {
+		t.Fatalf("state %s: %s", s.State, s.Error)
+	}
+	if c := s.Counters; c.Uploaded != int64(len(sizes)) || c.UploadedBytes != total || c.Errors != 0 {
+		t.Fatalf("counted %d uploads / %d bytes (errors %d), want %d / %d", c.Uploaded, c.UploadedBytes, c.Errors, len(sizes), total)
+	}
+	if got := readAll(t, "/stack-cfs", "/big3.bin"); len(got) != 1<<20 {
+		t.Fatalf("big3.bin has %d bytes", len(got))
 	}
 }
