@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 )
@@ -21,8 +22,12 @@ func newTestNode(t *testing.T, label, key string) *testNode {
 	if err != nil {
 		t.Fatal(err)
 	}
+	dir, err := os.MkdirTemp("", "cluster-link-test")
+	if err != nil {
+		t.Fatal(err)
+	}
 	m := &Manager{
-		dir:      t.TempDir(),
+		dir:      dir,
 		id:       id,
 		cfgStore: &configStore{cfg: Config{Enabled: true, Key: key, Label: label, ApplyRemote: false, AnnounceIntervalSec: 1}},
 		state:    newStore(),
@@ -36,6 +41,10 @@ func newTestNode(t *testing.T, label, key string) *testNode {
 	t.Cleanup(func() {
 		m.Stop()
 		srv.Close()
+		// Pumps may still be persisting state for a moment after Stop; removal is
+		// best effort (t.TempDir would fail the test on that race).
+		time.Sleep(200 * time.Millisecond)
+		_ = os.RemoveAll(dir)
 	})
 	return &testNode{m: m, srv: srv}
 }
