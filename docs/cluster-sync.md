@@ -200,16 +200,20 @@ optional; 0 means default.
 
 ### Tests
 
-- Unit and in-process tests: `go test ./internal/cluster/ ./drivers/115_open/ ./internal/op/`
-  (add `-race` with `CGO_ENABLED=1 CC=gcc`). They drive the real 115 driver and
+- Unit and in-process tests: `go test -tags emu115 ./internal/cluster/ ./drivers/115_open/ ./internal/op/`
+  (without the tag the emulator-backed cluster tests skip; add `-race` with `CGO_ENABLED=1 CC=gcc`). They drive the real 115 driver and
   SDK against the local emulator `115-sdk-go/emu115` (a real HTTP server).
 - Black-box: `go test -tags blackbox ./internal/cluster/blackbox/ -v` runs three
   real server processes on free ports under `E:\Go\Openlist\tmp\cluster-bb\`
   (override with `CLUSTER_BB_DIR`), with a fault TCP proxy between followers and
-  the hub. It needs `bin-new.exe` (current tree, `go build -o ...`) and, for BB5,
+  the hub. It needs `bin-new.exe` (current tree, built with
+  `go build -tags emu115 -buildvcs=false -o ...`) and, for BB5,
   `bin-old.exe` built from `c02580c4` (`CLUSTER_BB_BIN`, `CLUSTER_BB_OLD_BIN`).
-  Test builds read `OPENLIST_TEST_115_API_BASE` / `OPENLIST_TEST_115_PASSPORT_BASE`
-  to point the 115 driver at the emulator; they are unset in production.
+  Only binaries built with `-tags emu115` read `OPENLIST_TEST_115_API_BASE` /
+  `OPENLIST_TEST_115_PASSPORT_BASE` to point the 115 driver at the emulator.
+  Release builds do not contain that code at all (a test asserts it), so an
+  environment variable can never redirect real tokens to another host. Never
+  ship a binary built with `-tags emu115`.
 
 ## State on disk
 

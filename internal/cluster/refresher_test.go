@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/OpenListTeam/115-sdk-go/emu115"
-	_ "github.com/OpenListTeam/OpenList/v4/drivers/115_open"
+	drv115 "github.com/OpenListTeam/OpenList/v4/drivers/115_open"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -37,6 +37,9 @@ type refresherRig struct {
 }
 
 func newRefresherRig(t *testing.T, ttl time.Duration, cfg Config) *refresherRig {
+	if !drv115.EmuHook {
+		t.Skip("needs the 115 emulator hook: run with -tags emu115")
+	}
 	t.Helper()
 	emu := emu115.New(emu115.Config{AccessTTL: ttl})
 	srv := httptest.NewServer(emu.Handler())

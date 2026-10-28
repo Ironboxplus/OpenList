@@ -3,8 +3,6 @@ package _115_open
 import (
 	"context"
 	"errors"
-	"os"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -16,24 +14,6 @@ import (
 // skipLogEvery bounds the log volume of gated refresh skips: a player retrying
 // at 1 req/s on a non-refresher member must not flood the log.
 const skipLogEvery = 30 * time.Second
-
-// Test-only endpoint overrides. They point the SDK at a local emulator of 115
-// (see 115-sdk-go/emu115) for cluster black-box tests; production never sets them.
-const (
-	envTestAPIBase      = "OPENLIST_TEST_115_API_BASE"
-	envTestPassportBase = "OPENLIST_TEST_115_PASSPORT_BASE"
-)
-
-func testBaseURLOptions() []sdk.Option {
-	var opts []sdk.Option
-	if v := strings.TrimSpace(os.Getenv(envTestAPIBase)); v != "" {
-		opts = append(opts, sdk.WithAPIBaseURL(v))
-	}
-	if v := strings.TrimSpace(os.Getenv(envTestPassportBase)); v != "" {
-		opts = append(opts, sdk.WithPassportBaseURL(v))
-	}
-	return opts
-}
 
 // refreshState is the per-driver bookkeeping of refresh observation.
 type refreshState struct {
