@@ -1,0 +1,120 @@
+name: test-ours
+
+# Tests of the packages this fork owns (sync jobs, rclonefs, cluster, 115 Open).
+# Only branches whose go.mod uses public replaces can build here; feat/cfs needs
+# ../cfs, ../rclone-fork and ../115-sdk-go (see the guard step).
+
+on:
+  push:
+    branches: ["dev/**", "feat/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-ours-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: sync
+            pkgs: ./internal/syncjob ./internal/rclonefs ./cmd
+          - name: cluster-emu115
+            tags: emu115
+            pkgs: ./internal/cluster ./drivers/115_open ./internal/op
+          - name: handles
+            pkgs: ./server/handles
+    steps:
+      - uses: actions/checkout@v4
+      - name: Guard, local replaces cannot build here
+        run: |
+          if grep -nE '^replace .*=> *\.\.?/' go.mod; then
+            echo "::error::go.mod replaces a module with a local path; this branch cannot build in CI yet"
+            exit 1
+          fi
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Embedded frontend placeholder
+        run: |
+          mkdir -p public/dist
+          [ -e public/dist/index.html ] || echo '<!doctype html>' > public/dist/index.html
+      - name: go build, go vet
+        env:
+          TAGS: ${{ matrix.tags }}
+          PKGS: ${{ matrix.pkgs }}
+        run: |
+          go build -tags "$TAGS" $PKGS
+          go vet -tags "$TAGS" $PKGS
+      - name: go test
+        env:
+          TAGS: ${{ matrix.tags }}
+          PKGS: ${{ matrix.pkgs }}
+        run: |
+          set -o pipefail
+          go test -count=1 -timeout 20m -tags "$TAGS" $PKGS 2>&1 | tee "$RUNNER_TEMP/test.log"
+      - name: Tail of the log
+        if: failure()
+        run: tail -c 200000 "$RUNNER_TEMP/test.log" > "$RUNNER_TEMP/test-tail.log" || true
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: log-${{ matrix.name }}
+          path: ${{ runner.temp }}/test-tail.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Real server processes against the 115 emulator. The binary is built with
+  # -tags emu115 and only ever used here.
+  cluster-blackbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Guard, local replaces cannot build here
+        run: |
+          if grep -nE '^replace .*=> *\.\.?/' go.mod; then
+            echo "::error::go.mod replaces a module with a local path; this branch cannot build in CI yet"
+            exit 1
+          fi
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Embedded frontend placeholder
+        run: |
+          mkdir -p public/dist
+          [ -e public/dist/index.html ] || echo '<!doctype html>' > public/dist/index.html
+      - name: Build the emu115 binary
+        run: go build -tags emu115 -buildvcs=false -o "$RUNNER_TEMP/bin-new" .
+      - name: go test -tags blackbox
+        env:
+          CLUSTER_BB_BIN: ${{ runner.temp }}/bin-new
+          CLUSTER_BB_DIR: ${{ runner.temp }}/cluster-bb
+        run: |
+          set -o pipefail
+          go test -count=1 -timeout 25m -tags "blackbox emu115" -v ./internal/cluster/blackbox/ 2>&1 | tee "$RUNNER_TEMP/bb.log"
+      - name: Tail of the log
+        if: failure()
+        run: tail -c 200000 "$RUNNER_TEMP/bb.log" > "$RUNNER_TEMP/bb-tail.log" || true
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: log-cluster-blackbox
+          path: ${{ runner.temp }}/bb-tail.log
+          retention-days: 7
+          if-no-files-found: ignore
