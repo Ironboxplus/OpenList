@@ -316,7 +316,10 @@ type cluster struct {
 }
 
 func newEmu(t *testing.T, ttl time.Duration) (*emu115.Server, *httptest.Server) {
-	emu := emu115.New(emu115.Config{AccessTTL: ttl})
+	// The first access token lives long: starting three processes can take longer
+	// than a short test ttl, and the storages must be created with a valid pair.
+	// buildCluster switches to the scenario's ttl once they exist.
+	emu := emu115.New(emu115.Config{AccessTTL: 30 * time.Minute})
 	srv := httptest.NewServer(emu.Handler())
 	t.Cleanup(srv.Close)
 	return emu, srv
@@ -377,6 +380,7 @@ func buildCluster(t *testing.T, name string, ttl time.Duration, tm timing, hubBi
 		members = append(members, map[string]string{"node_id": n.nodeID, "mount_path": "/115"})
 	}
 	c.nodes[0].mustDo("POST", "/api/admin/cluster/groups", map[string]any{"groups": []any{map[string]any{"id": c.groupID, "name": "115", "members": members}}})
+	emu.SetAccessTTL(ttl) // pairs issued from now on live for the scenario ttl
 	waitUntil(t, "group document on every node", 30*time.Second, func() bool {
 		for _, n := range c.nodes {
 			if _, ok := n.group(c.groupID); !ok {
