@@ -104,6 +104,7 @@ admits the sender as a peer.
 | POST | `/api/admin/cluster/config` | Save config (blank/`********` key keeps current) |
 | GET | `/api/admin/cluster/status` | Live status only |
 | POST | `/api/admin/cluster/groups` | Replace the sync-group document |
+| POST | `/api/admin/cluster/refresher` | Set (empty node id: clear) a group's preferred refresher: `{group_id, node_id}` |
 
 ## Config
 
@@ -112,6 +113,103 @@ admits the sender as a peer.
 NAT), `seeds` (optional bootstrap URLs), `apply_remote` (adopt peer creds;
 default on), `announce_interval_sec`. `active() == enabled && key != ""` — a
 reachable node can run accept-only with no seed.
+
+## Single refresher (115 Open)
+
+115's `refresh_token` is single-use: whoever refreshes invalidates every other
+copy. So in a group of `115 Open` storages exactly one member spends it.
+
+- **Lease.** Each group has a signed refresher lease `(epoch, seq, holder)`,
+  gossiped like any other record. The newest `(epoch, seq, holder)` dominates;
+  expiry is judged on the *receiver's* clock (`lease_ttl_sec`, default 60 s), so
+  clock skew between nodes cannot extend a lease. The holder renews at TTL/6.
+- **Who holds it.** The admin's preferred refresher if online, else the
+  working member that is first by public address, then node id. Set it with
+  `POST /api/admin/cluster/refresher` or the cluster page; an empty node id
+  returns to automatic. A node that is preferred takes the lease back from a
+  temporary holder (release to preferred).
+- **Proactive refresh.** The holder refreshes at 80 % of `expires_in`, never
+  blind: until the lifetime of the current access token is known (first
+  refresh, or `expires_in` carried by the group record) it waits for a 401.
+  Attempts per mount are at least `proactive_min_gap_sec` (30 s) apart.
+- **Followers never refresh.** A follower whose access token is rejected pulls
+  the group first; if nothing newer arrives within `refresh_request_wait_sec`
+  (30 s) it sends the holder a *refresh-request* (directed message, relayed by
+  a hub if needed, at most 5 per rejected token, 60 s apart). A follower never
+  revokes a still-good refresh token because its *access* token lapsed.
+- **Takeover.** When the lease has expired, members take over in rank order
+  (preferred, working, address, node id; staggered by rank, with a startup
+  grace). A taker pulls the latest credential **before** claiming and waits 2 s
+  for a dominating simultaneous claim before it refreshes.
+- **Stalled paths.** A node whose links are up but silent (no frame or pong
+  recently) must not claim: a stale token spent on 115 kills the group. An
+  isolated node waits 3x the TTL.
+- **Delivery.** After a new version the holder watches the members' `announce`
+  digests; a member that has not confirmed it within `delivery_resend_sec`
+  (20 s) gets the credential resent directly (through a hub when needed).
+- **Revocations.** A signed revocation digest rides on `announce`; a mismatch
+  triggers a pull. Superseded revocations older than
+  `revocation_retention_days` (14) are pruned, only behind a per-group
+  UpdatedAt floor so a pruned revocation cannot be resurrected by a stale record.
+
+### Transport
+
+- Each peer has a **coalescing send state** (priority class for leases, acks and
+  refresh-requests; bulk class for records), not a FIFO: a newer item for the
+  same key replaces the pending one. A link is never closed because of backlog;
+  it closes only on read/write errors, a write timeout or pong loss.
+- One link per node pair: if both ends dial, the dial of the smaller node id
+  wins (`keepNewLink` tie-break).
+- Redial backoff 2 s .. 60 s with +-25 % jitter.
+- `GET /api/admin/cluster/status` reports per link: connected, direction, RTT,
+  queue depth, last anti-entropy, connects/disconnects, flaps in 10 min and the
+  last disconnect reason; per group: refresher, lease epoch/expiry, preferred,
+  last refresh (node, time, outcome, trigger, `expires_in`), recent
+  refresh-requests, each member's held version (laggards flagged) and protocol
+  level; `mixed` is set when a member predates leases.
+
+### Logs
+
+Every refresh is logged by the 115 driver (`[115_open] refresh ok|failed
+mount=... trigger=proactive|refresh-request|recover|<code>`), and the cluster
+logs each push, pull, apply, probe failure, revocation, lease claim/release/
+takeover and refresh-request (`[cluster] ...`).
+
+### Rollout and compatibility
+
+Protocol level 2 adds `lease`, directed messages, `ack` and the revocation
+digest as optional JSON fields / new message types. Old builds ignore unknown
+fields and types, so a mixed cluster keeps working, with these limits:
+
+- An **old node** (no leases) still refreshes on its own and can kill the
+  group's token. The status marks it `legacy` and sets the group `mixed`.
+- An **old hub** does not relay leases, directed messages or acks, so new nodes
+  behind it cannot see each other's lease. Credentials still flow through it.
+  Tested (BB5): two new nodes behind an old hub make one refresh and the other
+  adopts it, but this is not safe in general.
+- Therefore: **upgrade all nodes of a 115 group together, hubs (public nodes)
+  first**, then restart. Do not run a long-lived mixed cluster.
+- The cluster key rotation planned with this release needs all online nodes to
+  restart with the new key together.
+
+### Config (added)
+
+`lease_ttl_sec` (60), `refresh_request_wait_sec` (30), `proactive_min_gap_sec`
+(30), `delivery_resend_sec` (20), `revocation_retention_days` (14). All
+optional; 0 means default.
+
+### Tests
+
+- Unit and in-process tests: `go test ./internal/cluster/ ./drivers/115_open/ ./internal/op/`
+  (add `-race` with `CGO_ENABLED=1 CC=gcc`). They drive the real 115 driver and
+  SDK against the local emulator `115-sdk-go/emu115` (a real HTTP server).
+- Black-box: `go test -tags blackbox ./internal/cluster/blackbox/ -v` runs three
+  real server processes on free ports under `E:\Go\Openlist\tmp\cluster-bb\`
+  (override with `CLUSTER_BB_DIR`), with a fault TCP proxy between followers and
+  the hub. It needs `bin-new.exe` (current tree, `go build -o ...`) and, for BB5,
+  `bin-old.exe` built from `c02580c4` (`CLUSTER_BB_BIN`, `CLUSTER_BB_OLD_BIN`).
+  Test builds read `OPENLIST_TEST_115_API_BASE` / `OPENLIST_TEST_115_PASSPORT_BASE`
+  to point the 115 driver at the emulator; they are unset in production.
 
 ## State on disk
 
