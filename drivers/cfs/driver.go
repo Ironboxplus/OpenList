@@ -20,6 +20,7 @@ import (
 	cfsrclone "github.com/Ironboxplus/cfs/frontend/rclone"
 	"github.com/Ironboxplus/cfs/store"
 	"github.com/OpenListTeam/OpenList/v4/cmd/flags"
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -29,6 +30,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/shirou/gopsutil/v4/disk"
 )
 
 type Cfs struct {
@@ -63,7 +65,7 @@ func (d *Cfs) Init(ctx context.Context) error {
 	for k, v := range map[string]string{
 		"threshold": d.Threshold, "seal_quiet": d.SealQuiet, "seal_max": d.SealMax,
 		"ack": d.Ack, "stage_max_bytes": d.StageMax, "pack_max_bytes": d.PackMax,
-		"dir_cache": d.DirCache, "gc_grace": d.GCGrace,
+		"dir_cache": d.DirCache, "gc_grace": d.GCGrace, "lease_ttl": d.LeaseTTL,
 	} {
 		if v != "" {
 			m[k] = v
@@ -213,11 +215,12 @@ func (d *Cfs) Remove(ctx context.Context, obj model.Obj) error {
 
 func (d *Cfs) Put(ctx context.Context, dstDir model.Obj, s model.FileStreamer, up driver.UpdateProgress) error {
 	p := stdpath.Join(rel(dstDir.GetPath()), s.GetName())
+	opts := core.PutOpts{Size: s.GetSize(), MTime: s.ModTime(), SHA1: s.GetHash().GetHash(utils.SHA1)}
 	var r io.Reader
-	if size := s.GetSize(); size >= d.vol.Config().Threshold {
-		// A big file goes to the underlying storage 1:1. Cache it first, so that a
-		// failed upload can be repeated without asking the client to send it again.
-		f, err := s.CacheFullAndWriter(&up, nil)
+	if opts.Size >= d.vol.Config().Threshold {
+		// A big file goes to the underlying storage 1:1, and a failed upload is
+		// repeated from the start of a seekable source.
+		f, err := seekableSource(s, &up)
 		if err != nil {
 			return err
 		}
@@ -228,11 +231,92 @@ func (d *Cfs) Put(ctx context.Context, dstDir model.Obj, s model.FileStreamer, u
 	} else {
 		r = driver.NewLimitedUploadStream(ctx, &driver.ReaderUpdatingProgress{Reader: s, UpdateProgress: up})
 	}
-	if _, err := d.vol.Put(ctx, p, r, s.GetSize(), s.ModTime()); err != nil {
+	if _, err := d.vol.PutWith(ctx, p, r, opts); err != nil {
 		return mapErr(err)
 	}
 	up(100)
 	return nil
+}
+
+// spareTemp is what must stay free on the disk of the temp dir after a file
+// was cached there.
+const spareTemp = 1 << 30
+
+// seekableSource returns the content of s as something that can be read again
+// from the start. A stream that is already seekable (backed by a file, or one
+// that can be read by range from its source) is used as it is; only the others
+// are cached, after checking that the temp dir can take the copy.
+func seekableSource(s model.FileStreamer, up *driver.UpdateProgress) (io.ReadSeeker, error) {
+	if f := s.GetFile(); f != nil {
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return nil, err
+		}
+		return f, nil
+	}
+	if ss, ok := s.(*stream.SeekableStream); ok {
+		return &rangeFile{s: ss, size: ss.GetSize()}, nil
+	}
+	if err := checkTempSpace(s.GetSize()); err != nil {
+		return nil, err
+	}
+	return s.CacheFullAndWriter(up, nil)
+}
+
+// checkTempSpace refuses to cache size bytes when the disk of the temp dir
+// would be left with less than spareTemp.
+func checkTempSpace(size int64) error {
+	u, err := disk.Usage(conf.Conf.TempDir)
+	if err != nil {
+		return fmt.Errorf("check free space of temp dir %s: %w", conf.Conf.TempDir, err)
+	}
+	if need := uint64(size) + spareTemp; u.Free < need {
+		return fmt.Errorf("temp dir has %s free, need %s (file %s + %s to spare)",
+			sizeStr(u.Free), sizeStr(need), sizeStr(uint64(size)), sizeStr(spareTemp))
+	}
+	return nil
+}
+
+func sizeStr(n uint64) string { return fmt.Sprintf("%.2f GiB", float64(n)/(1<<30)) }
+
+// rangeFile reads a stream by range from its source, as a ReadSeeker: nothing
+// is cached, a Seek (a repeated upload starts with one) just starts a new range.
+type rangeFile struct {
+	s    *stream.SeekableStream
+	size int64
+	off  int64
+	cur  io.Reader
+}
+
+func (f *rangeFile) Read(p []byte) (int, error) {
+	if f.off >= f.size {
+		return 0, io.EOF
+	}
+	if f.cur == nil {
+		r, err := f.s.RangeRead(http_range.Range{Start: f.off, Length: -1})
+		if err != nil {
+			return 0, err
+		}
+		f.cur = r
+	}
+	n, err := f.cur.Read(p)
+	f.off += int64(n)
+	return n, err
+}
+
+func (f *rangeFile) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekCurrent:
+		offset += f.off
+	case io.SeekEnd:
+		offset += f.size
+	}
+	if offset < 0 {
+		return 0, errors.New("cfs: seek before the start of the file")
+	}
+	if offset != f.off {
+		f.off, f.cur = offset, nil
+	}
+	return offset, nil
 }
 
 var _ driver.Driver = (*Cfs)(nil)
