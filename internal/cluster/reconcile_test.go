@@ -385,7 +385,7 @@ func TestReconcileNewestFirstAndRevocationPersistedBeforeNext(t *testing.T) {
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if s, ok := rowStatus(mount); ok && s.Status == op.WORK {
+		if m.state.candidateHealthy("g1", tokenHash(loTok), now()) {
 			mu.Lock()
 			defer mu.Unlock()
 			if strings.Join(order, ",") != "hi,lo" {
@@ -421,7 +421,7 @@ func TestReconcileTransientProbeErrorIsRetried(t *testing.T) {
 	}
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		if s, ok := rowStatus(mount); ok && s.Status == op.WORK {
+		if m.state.candidateHealthy("g1", tokenHash("tok"), now()) {
 			if n := len(m.state.revocationSnapshot()); n != 0 {
 				t.Fatalf("a transient error produced %d revocation(s)", n)
 			}

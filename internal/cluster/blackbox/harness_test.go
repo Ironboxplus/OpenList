@@ -14,12 +14,15 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -631,10 +634,13 @@ func contains(s, sub string) bool { return strings.Contains(s, sub) }
 
 // restart starts the node again on its existing data directory (new port, same
 // identity, config and storages) and puts it in the old node's place.
-func (c *cluster) restart(n *node) *node {
+func (c *cluster) restart(n *node) *node { return c.restartWith(n, c.emuSrv.URL) }
+
+// restartWith is restart with a different provider base URL for the new process.
+func (c *cluster) restartWith(n *node, emuURL string) *node {
 	c.t.Helper()
 	n.stop()
-	nn := startNode(c.t, c.root, n.name, startOpts{bin: n.bin, emuURL: c.emuSrv.URL, keep: true})
+	nn := startNode(c.t, c.root, n.name, startOpts{bin: n.bin, emuURL: emuURL, keep: true})
 	nn.nodeID = n.nodeID
 	for i := range c.nodes {
 		if c.nodes[i] == n {
@@ -642,4 +648,29 @@ func (c *cluster) restart(n *node) *node {
 		}
 	}
 	return nn
+}
+
+// slowEmu forwards to the emulator and holds every request for the current
+// delay first. A restarted node pointed at it spends that long inside its 115
+// storage's Init, which is where the cluster's credential push can land while the
+// storage is still unregistered.
+type slowEmu struct {
+	srv   *httptest.Server
+	delay atomic.Int64 // nanoseconds
+}
+
+func newSlowEmu(t *testing.T, target string, delay time.Duration) *slowEmu {
+	u, err := url.Parse(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &slowEmu{}
+	s.delay.Store(int64(delay))
+	proxy := httputil.NewSingleHostReverseProxy(u)
+	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(time.Duration(s.delay.Load()))
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(s.srv.Close)
+	return s
 }

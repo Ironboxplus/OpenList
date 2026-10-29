@@ -60,8 +60,12 @@ func TestBB6_StoppedMemberRestartsAfterRotationConvergesWithoutRefresh(t *testin
 func TestBB7_StartWithExpiredPairAdoptsHeldRecordWithinResync(t *testing.T) {
 	c, n3 := rotateWhileDown(t, "s7-expired-start")
 	c.emu.ResetStats()
-	n3 = c.restart(n3)
+	// Init of the restarted node's storage is slowed to 8 s: the cluster hands
+	// over the held record while the storage is still not registered.
+	slow := newSlowEmu(t, c.emuSrv.URL, 8*time.Second)
+	n3 = c.restartWith(n3, slow.srv.URL)
 	t0 := time.Now()
+	slow.delay.Store(0)
 	bound := 4*time.Duration(fastTiming.Resync)*time.Second + 10*time.Second
 	waitUntil(t, "the restarted member to recover on its own", bound, func() bool { return n3.list() == nil })
 	record(t, "recovered %s after start (resync %ds)", time.Since(t0).Round(100*time.Millisecond), fastTiming.Resync)
