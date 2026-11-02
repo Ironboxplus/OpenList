@@ -148,6 +148,13 @@ type Config struct {
 	// choose its own IP with a header. Default: loopback and private ranges
 	// (a reverse proxy on the same host or LAN). Put a public load balancer here.
 	TrustedProxies []string `json:"trusted_proxies" env:"TRUSTED_PROXIES" envSeparator:","`
+	// TrustedPlatform names a header that a CDN in front of the server sets to
+	// the real visitor address: "cloudflare" (CF-Connecting-IP), "flyio", "google",
+	// or any header name. Empty (default) = off. Enable it ONLY when the origin
+	// accepts traffic from the CDN alone: the header is believed from whoever
+	// sends it, so with the origin reachable directly any client could pick its
+	// IP. Applies to the main listener only, never to the frp gateways.
+	TrustedPlatform string `json:"trusted_platform" env:"TRUSTED_PLATFORM"`
 }
 
 func DefaultConfig(dataDir string) *Config {

@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"path"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/pires/go-proxyproto"
@@ -35,9 +36,19 @@ type gateway struct {
 // forwardingHeaders are what a visitor could use to claim another address.
 var forwardingHeaders = []string{"X-Forwarded-For", "X-Real-Ip", "Forwarded", "X-Client-Ip", "True-Client-Ip", "Cf-Connecting-Ip"}
 
+// platformHeader is the CDN header the main listener believes (trusted_platform);
+// through a tunnel it is just a client-sent header and must not be believed.
+var platformHeader atomic.Pointer[string]
+
+// SetPlatformHeader tells the gateways which header to drop in addition.
+func SetPlatformHeader(h string) { platformHeader.Store(&h) }
+
 func stripForwarding(h http.Header) {
 	for _, k := range forwardingHeaders {
 		h.Del(k)
+	}
+	if p := platformHeader.Load(); p != nil && *p != "" {
+		h.Del(*p)
 	}
 }
 

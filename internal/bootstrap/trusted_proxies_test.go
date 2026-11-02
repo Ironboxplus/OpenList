@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/frp"
 	"github.com/gin-gonic/gin"
 )
 
@@ -71,5 +72,51 @@ func TestTrustedProxiesAreConfigurableAndBadValuesTrustNobody(t *testing.T) {
 	r2.GET("/ip", func(c *gin.Context) { c.String(200, c.ClientIP()) })
 	if got := clientIPOf(t, r2, "127.0.0.1:1", map[string]string{"X-Forwarded-For": "198.51.100.77"}); got != "127.0.0.1" {
 		t.Errorf("bad list should trust nobody: %s", got)
+	}
+}
+
+func platformEngine(t *testing.T, platform string) *gin.Engine {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	conf.Conf.TrustedPlatform = platform
+	r := gin.New()
+	applyTrustedProxies(r)
+	t.Cleanup(func() { frp.SetPlatformHeader("") })
+	r.GET("/ip", func(c *gin.Context) { c.String(200, c.ClientIP()) })
+	return r
+}
+
+// A CDN in front of the server puts the visitor in its own header; off unless
+// asked for.
+func TestTrustedPlatform(t *testing.T) {
+	cf := map[string]string{"CF-Connecting-IP": "198.51.100.77"}
+
+	// empty: no effect, the header is just a header
+	r := platformEngine(t, "")
+	if got := clientIPOf(t, r, "104.21.0.9:443", cf); got != "104.21.0.9" {
+		t.Errorf("empty setting believed the header: %s", got)
+	}
+	// cloudflare: the visitor, whoever the peer is
+	r = platformEngine(t, "cloudflare")
+	if got := clientIPOf(t, r, "104.21.0.9:443", cf); got != "198.51.100.77" {
+		t.Errorf("cloudflare: %s", got)
+	}
+	if got := clientIPOf(t, r, "104.21.0.9:443", nil); got != "104.21.0.9" {
+		t.Errorf("cloudflare without the header: %s", got)
+	}
+	// case-insensitive name, custom header
+	r = platformEngine(t, " Cloudflare ")
+	if got := clientIPOf(t, r, "104.21.0.9:443", cf); got != "198.51.100.77" {
+		t.Errorf("Cloudflare spelled differently: %s", got)
+	}
+	r = platformEngine(t, "X-Visitor-Ip")
+	if got := clientIPOf(t, r, "104.21.0.9:443", map[string]string{"X-Visitor-Ip": "198.51.100.88"}); got != "198.51.100.88" {
+		t.Errorf("custom header: %s", got)
+	}
+	for in, want := range map[string]string{"": "", "cloudflare": "CF-Connecting-IP", "flyio": "Fly-Client-IP", "google": "X-Appengine-Remote-Addr", "X-Foo": "X-Foo"} {
+		if got := platformHeader(in); got != want {
+			t.Errorf("platformHeader(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

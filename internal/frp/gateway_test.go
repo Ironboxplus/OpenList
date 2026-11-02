@@ -176,3 +176,53 @@ func TestGatewaysKeepTheClusterEndpointClosed(t *testing.T) {
 		t.Errorf("exposed: %d %s", code, body)
 	}
 }
+
+// The CDN header trusted on the main listener (trusted_platform) means nothing
+// through a tunnel: a visitor can send it himself.
+func TestGatewaysIgnoreTheTrustedPlatformHeader(t *testing.T) {
+	SetPlatformHeader("CF-Connecting-IP")
+	t.Cleanup(func() { SetPlatformHeader("") })
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.TrustedPlatform = gin.PlatformCloudflare // as the main engine would have it
+	r.GET("/ip", func(c *gin.Context) { c.String(200, c.ClientIP()) })
+
+	web, err := openWeb(r, func() bool { return false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer web.close()
+	raw, err := openRaw(r, func() bool { return false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.close()
+
+	code, body := get(t, "http://"+web.addr+"/ip", map[string]string{"CF-Connecting-IP": "6.6.6.6", "X-Forwarded-For": "203.0.113.9"})
+	if code != 200 || body != "203.0.113.9" {
+		t.Fatalf("web gateway believed the platform header: %d %s", code, body)
+	}
+	c := rawConn(t, raw.addr, "203.0.113.77", true)
+	defer c.Close()
+	code, body = rawGet(t, c, "/ip", "CF-Connecting-IP: 6.6.6.6\r\n")
+	if code != 200 || body != "203.0.113.77" {
+		t.Fatalf("raw gateway believed the platform header: %d %s", code, body)
+	}
+}
+
+func TestGatewaysIgnoreACustomPlatformHeaderToo(t *testing.T) {
+	SetPlatformHeader("X-Visitor-Ip")
+	t.Cleanup(func() { SetPlatformHeader("") })
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.TrustedPlatform = "X-Visitor-Ip"
+	r.GET("/ip", func(c *gin.Context) { c.String(200, c.ClientIP()) })
+	web, err := openWeb(r, func() bool { return false })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer web.close()
+	if _, body := get(t, "http://"+web.addr+"/ip", map[string]string{"X-Visitor-Ip": "6.6.6.6", "X-Forwarded-For": "203.0.113.9"}); body != "203.0.113.9" {
+		t.Fatalf("custom platform header believed through the gateway: %s", body)
+	}
+}

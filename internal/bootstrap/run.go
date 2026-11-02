@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,8 +15,9 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/bootstrap/data"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
-	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/frontend"
+	"github.com/OpenListTeam/OpenList/v4/internal/frp"
+	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/plugin"
 	"github.com/OpenListTeam/OpenList/v4/internal/session"
 	"github.com/OpenListTeam/OpenList/v4/internal/stats"
@@ -103,10 +105,31 @@ func IsRunning(t string) bool {
 // configured proxies. gin's default is "everyone", which lets any client pick
 // its own IP (and with it dodge every per-IP limit).
 func applyTrustedProxies(r *gin.Engine) {
+	header := platformHeader(conf.Conf.TrustedPlatform)
+	r.TrustedPlatform = header
+	frp.SetPlatformHeader(header) // the frp gateways must not believe it
+	if header != "" {
+		utils.Log.Warnf("trusted_platform=%q: the %s header is believed as the client IP. Enable this only when the origin accepts traffic from the CDN alone, or any client can choose its IP.", conf.Conf.TrustedPlatform, header)
+	}
 	if err := r.SetTrustedProxies(conf.Conf.TrustedProxies); err != nil {
 		utils.Log.Errorf("invalid trusted_proxies %v, trusting no proxy: %v", conf.Conf.TrustedProxies, err)
 		_ = r.SetTrustedProxies(nil)
 	}
+}
+
+// platformHeader maps the trusted_platform setting to the header name.
+func platformHeader(v string) string {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "":
+		return ""
+	case "cloudflare":
+		return gin.PlatformCloudflare
+	case "flyio":
+		return gin.PlatformFlyIO
+	case "google":
+		return gin.PlatformGoogleAppEngine
+	}
+	return strings.TrimSpace(v)
 }
 
 func Start() {
