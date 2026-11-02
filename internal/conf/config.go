@@ -112,18 +112,21 @@ type MCP struct {
 }
 
 type Config struct {
-	Force                 bool        `json:"force" env:"FORCE"`
-	SiteURL               string      `json:"site_url" env:"SITE_URL"`
-	Cdn                   string      `json:"cdn" env:"CDN"`
-	JwtSecret             string      `json:"jwt_secret" env:"JWT_SECRET"`
-	TokenExpiresIn        int         `json:"token_expires_in" env:"TOKEN_EXPIRES_IN"`
-	Database              Database    `json:"database" envPrefix:"DB_"`
-	Meilisearch           Meilisearch `json:"meilisearch" envPrefix:"MEILISEARCH_"`
-	Scheme                Scheme      `json:"scheme"`
-	TempDir               string      `json:"temp_dir" env:"TEMP_DIR"`
-	BleveDir              string      `json:"bleve_dir" env:"BLEVE_DIR"`
-	DistDir               string      `json:"dist_dir"`
-	FrontendRepo          string      `json:"frontend_repo" env:"FRONTEND_REPO"`
+	Force          bool        `json:"force" env:"FORCE"`
+	SiteURL        string      `json:"site_url" env:"SITE_URL"`
+	Cdn            string      `json:"cdn" env:"CDN"`
+	JwtSecret      string      `json:"jwt_secret" env:"JWT_SECRET"`
+	TokenExpiresIn int         `json:"token_expires_in" env:"TOKEN_EXPIRES_IN"`
+	Database       Database    `json:"database" envPrefix:"DB_"`
+	Meilisearch    Meilisearch `json:"meilisearch" envPrefix:"MEILISEARCH_"`
+	Scheme         Scheme      `json:"scheme"`
+	TempDir        string      `json:"temp_dir" env:"TEMP_DIR"`
+	BleveDir       string      `json:"bleve_dir" env:"BLEVE_DIR"`
+	DistDir        string      `json:"dist_dir"`
+	FrontendRepo   string      `json:"frontend_repo" env:"FRONTEND_REPO"`
+	// FrontendChannel is the release tag of the frontend repo that FetchFromRolling
+	// follows ("rolling" by default; "canary" lets one node run a frontend the others do not).
+	FrontendChannel       string      `json:"frontend_channel" env:"FRONTEND_CHANNEL"`
 	Log                   LogConfig   `json:"log" envPrefix:"LOG_"`
 	DelayedStart          int         `json:"delayed_start" env:"DELAYED_START"`
 	AutoMemoryLimit       int         `json:"auto_memory_limit" env:"AUTO_MEMORY_LIMIT"`
@@ -170,8 +173,9 @@ func DefaultConfig(dataDir string) *Config {
 			Host:  "http://localhost:7700",
 			Index: "openlist",
 		},
-		BleveDir:     indexDir,
-		FrontendRepo: FrontendRepoDefault,
+		BleveDir:        indexDir,
+		FrontendRepo:    FrontendRepoDefault,
+		FrontendChannel: FrontendChannelDefault,
 		Log: LogConfig{
 			Enable:     true,
 			Name:       logPath,

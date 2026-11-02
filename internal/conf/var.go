@@ -7,11 +7,11 @@ import (
 )
 
 var (
-	BuiltAt    string = "unknown"
-	GitAuthor  string = "unknown"
-	GitCommit  string = "unknown"
-	Version    string = "dev"
-	WebVersion string = "rolling"
+	BuiltAt             string = "unknown"
+	GitAuthor           string = "unknown"
+	GitCommit           string = "unknown"
+	Version             string = "dev"
+	WebVersion          string = "rolling"
 	FrontendRepoDefault string = "Ironboxplus/OpenList-Frontend"
 )
 
@@ -79,3 +79,7 @@ func ResetStoragesLoadSignal() {
 	}
 	storagesLoadMu.Unlock()
 }
+
+// FrontendChannelDefault is the frontend release tag followed when
+// frontend_channel is not set.
+const FrontendChannelDefault = "rolling"

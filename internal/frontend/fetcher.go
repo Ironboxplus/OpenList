@@ -65,9 +65,21 @@ func writeVersion(version string) error {
 	return os.WriteFile(GetVersionFilePath(), []byte(version), 0644)
 }
 
-// FetchFromRolling downloads the frontend dist from the GitHub rolling release
+// frontendChannel is the release tag FetchFromRolling follows: the configured
+// frontend_channel, "rolling" when it is empty.
+func frontendChannel() string {
+	if conf.Conf != nil {
+		if c := strings.TrimSpace(conf.Conf.FrontendChannel); c != "" {
+			return c
+		}
+	}
+	return conf.FrontendChannelDefault
+}
+
+// FetchFromRolling downloads the frontend dist from the GitHub release of the
+// configured channel (frontend_channel, default "rolling").
 func FetchFromRolling(ctx context.Context) (*FetchResult, error) {
-	return fetchFromTag(ctx, "rolling", "")
+	return fetchFromTag(ctx, frontendChannel(), "")
 }
 
 // FetchFromLatest downloads the frontend dist from the GitHub latest release

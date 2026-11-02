@@ -4,9 +4,9 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -623,5 +623,84 @@ func TestEnsureDistOnceFailureDoesNotLock(t *testing.T) {
 	result2 := EnsureDistOnce(ctx)
 	if result2 != "" {
 		t.Errorf("expected empty result on retry, got %q", result2)
+	}
+}
+
+func TestFrontendChannelDefaultsToRolling(t *testing.T) {
+	orig := conf.Conf
+	defer func() { conf.Conf = orig }()
+
+	conf.Conf = nil
+	if got := frontendChannel(); got != "rolling" {
+		t.Fatalf("no config: got %q, want rolling", got)
+	}
+	conf.Conf = &conf.Config{}
+	if got := frontendChannel(); got != "rolling" {
+		t.Fatalf("empty channel: got %q, want rolling", got)
+	}
+	conf.Conf.FrontendChannel = "  canary "
+	if got := frontendChannel(); got != "canary" {
+		t.Fatalf("canary: got %q", got)
+	}
+
+	cfg := conf.DefaultConfig("data")
+	if cfg.FrontendChannel != "rolling" {
+		t.Fatalf("DefaultConfig channel = %q", cfg.FrontendChannel)
+	}
+	// a config.json written before the field existed keeps the default
+	if err := json.Unmarshal([]byte(`{"site_url":"https://example.com"}`), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FrontendChannel != "rolling" {
+		t.Fatalf("legacy config channel = %q", cfg.FrontendChannel)
+	}
+	if err := json.Unmarshal([]byte(`{"frontend_channel":"canary"}`), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FrontendChannel != "canary" {
+		t.Fatalf("configured channel = %q", cfg.FrontendChannel)
+	}
+}
+
+// The channel is the release tag that is asked for.
+func TestFetchFollowsConfiguredChannelTag(t *testing.T) {
+	origConf := conf.Conf
+	defer func() { conf.Conf = origConf }()
+	conf.Conf = &conf.Config{FrontendRepo: "Ironboxplus/OpenList-Frontend", FrontendChannel: "canary"}
+
+	tarData := createTestTarGz(t, map[string]string{"./dist/index.html": "<html>canary</html>"})
+	var asked []string
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = append(asked, r.URL.Path)
+		switch r.URL.Path {
+		case "/repos/Ironboxplus/OpenList-Frontend/releases/tags/canary":
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"tag_name":"canary","assets":[{"name":"openlist-frontend-dist.tar.gz","browser_download_url":"%s/download/c.tar.gz"}]}`, ts.URL)))
+		case "/repos/Ironboxplus/OpenList-Frontend/git/ref/tags/canary":
+			_, _ = w.Write([]byte(`{"object":{"type":"commit","sha":"0123456789abcdef0123456789abcdef01234567"}}`))
+		case "/download/c.tar.gz":
+			_, _ = w.Write(tarData)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ts.Close()
+
+	ResetFetchState()
+	_ = os.MkdirAll(GetDistPath(), 0o755)
+	_ = os.RemoveAll(filepath.Join(GetDistPath(), distDirName))
+	_ = os.Remove(GetVersionFilePath())
+
+	res, err := fetchFromTag(context.Background(), frontendChannel(), ts.URL)
+	if err != nil {
+		t.Fatalf("fetch: %v (asked %v)", err, asked)
+	}
+	if res.Version != "canary@0123456789ab" {
+		t.Fatalf("version = %q", res.Version)
+	}
+	for _, p := range asked {
+		if strings.Contains(p, "/rolling") {
+			t.Fatalf("asked for the rolling tag: %v", asked)
+		}
 	}
 }
