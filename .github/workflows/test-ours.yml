@@ -39,6 +39,11 @@ jobs:
             pkgs: ./internal/cluster ./drivers/115_open ./internal/op
           - name: handles
             pkgs: ./server/handles
+          # Everything else, so a merge of upstream is checked against the
+          # tests of every package it touched (blackbox needs its own tag and
+          # runs in the job below).
+          - name: all
+            pkgs: ./...
     steps:
       - uses: actions/checkout@v4
       - name: Guard, local replaces cannot build here
