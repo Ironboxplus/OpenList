@@ -198,10 +198,19 @@ func InitialSettings() []model.SettingItem {
 
 		// single settings
 		{Key: conf.Token, Value: token, Type: conf.TypeString, Group: model.SINGLE, Flag: model.PRIVATE},
-		{Key: conf.SearchIndex, Value: "none", Type: conf.TypeSelect, Options: "database,database_non_full_text,bleve,meilisearch,none", Group: model.INDEX},
+		{Key: conf.SearchIndex, Value: "none", Type: conf.TypeSelect, Options: "database,database_non_full_text,bleve,meilisearch,no_index,none", Group: model.INDEX,
+			Help: `no_index: no index is built, every search walks the storages live (slow on big trees, bounded by the limits below). Default stays none.`},
 		{Key: conf.AutoUpdateIndex, Value: "false", Type: conf.TypeBool, Group: model.INDEX},
 		{Key: conf.IgnorePaths, Value: "", Type: conf.TypeText, Group: model.INDEX, Flag: model.PRIVATE, Help: `one path per line`},
 		{Key: conf.MaxIndexDepth, Value: "20", Type: conf.TypeNumber, Group: model.INDEX, Flag: model.PRIVATE, Help: `max depth of index`},
+		{Key: conf.NoIndexMaxVisited, Value: "5000", Type: conf.TypeNumber, Group: model.INDEX, Flag: model.PRIVATE,
+			Help: `no_index only: the live search stops after looking at this many entries. Our own conservative default; AList has no such limit (it only caps results at 1000).`},
+		{Key: conf.NoIndexTimeout, Value: "20", Type: conf.TypeNumber, Group: model.INDEX, Flag: model.PRIVATE,
+			Help: `no_index only: a live search stops after this many seconds and returns what it has found. Our own conservative default; AList has no such limit.`},
+		{Key: conf.NoIndexMaxConcurrent, Value: "2", Type: conf.TypeNumber, Group: model.INDEX, Flag: model.PRIVATE,
+			Help: `no_index only: how many live searches may run at the same time; further ones are refused until one finishes. Our own conservative default; AList has no such limit.`},
+		{Key: conf.NoIndexSkipDrivers, Value: "115 Cloud,115 Open,115 Share", Type: conf.TypeText, Group: model.INDEX, Flag: model.PRIVATE,
+			Help: `no_index only: storages of these drivers (comma separated driver names) are never walked by a live search. 115 is listed because all of a 115 account's API calls share one rate limit, and walking a big tree through it can use up that limit or get the account banned. Storages with "disable index" set are skipped as well. Remove a name only if you accept that risk.`},
 		{Key: conf.IndexProgress, Value: "{}", Type: conf.TypeText, Group: model.SINGLE, Flag: model.PRIVATE},
 
 		// SSO settings

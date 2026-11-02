@@ -76,6 +76,12 @@ const (
 	IgnorePaths     = "ignore_paths"
 	MaxIndexDepth   = "max_index_depth"
 
+	// no_index (live search) limits
+	NoIndexMaxVisited    = "no_index_max_visited"
+	NoIndexTimeout       = "no_index_timeout_seconds"
+	NoIndexMaxConcurrent = "no_index_max_concurrent"
+	NoIndexSkipDrivers   = "no_index_skip_drivers"
+
 	// aria2
 	Aria2Uri    = "aria2_uri"
 	Aria2Secret = "aria2_secret"
