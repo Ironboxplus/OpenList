@@ -320,6 +320,9 @@ func (m *Manager) loadSaved() {
 
 // persistSavedLocked writes the snapshots atomically: temp file, fsync, rename.
 func (m *Manager) persistSavedLocked() {
+	if m.diskClosed {
+		return
+	}
 	out := make(map[string]savedPairFile, len(m.saved))
 	for mount, sp := range m.saved {
 		f := savedPairFile{Hash: sp.hash, Known: make([]string, 0, len(sp.known))}

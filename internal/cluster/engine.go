@@ -54,12 +54,17 @@ type Manager struct {
 
 	// The reconcile queue is created on first use (see reconcileQueue), so a
 	// Manager that never saw an event costs nothing.
-	savedMu  sync.Mutex
-	saved    map[string]savedPair // mount -> pair the storage was last updated to
-	queueMu  sync.Mutex
-	queue    workqueue.TypedRateLimitingInterface[string]
-	pullMu   sync.Mutex
-	lastPull map[string]time.Time // group -> last pull request, for the cooldown
+	savedMu sync.Mutex
+	saved   map[string]savedPair // mount -> pair the storage was last updated to
+	// diskClosed is set by Stop: from then on nothing is written under m.dir.
+	// Storage hooks run on their own goroutines and can still fire after Stop;
+	// both writers check it under the lock they hold while writing, so Stop
+	// returns only after an in-flight write has finished.
+	diskClosed bool // guarded by persistMu and savedMu (set holding both)
+	queueMu    sync.Mutex
+	queue      workqueue.TypedRateLimitingInterface[string]
+	pullMu     sync.Mutex
+	lastPull   map[string]time.Time // group -> last pull request, for the cooldown
 
 	dialMu sync.Mutex
 	dials  map[string]*dialState // peer URL -> redial bookkeeping
@@ -150,6 +155,9 @@ func (m *Manager) loadState() {
 func (m *Manager) persist() error {
 	m.persistMu.Lock()
 	defer m.persistMu.Unlock()
+	if m.diskClosed {
+		return nil
+	}
 	ps := m.state.export()
 	b, err := json.MarshalIndent(ps, "", "  ")
 	if err != nil {
@@ -266,6 +274,12 @@ func (m *Manager) Stop() {
 	}
 	m.conns.closeAll(reasonShutdown)
 	m.reconcileQueue().ShutDown()
+	// No write to the cluster directory after this point (see diskClosed).
+	m.persistMu.Lock()
+	m.savedMu.Lock()
+	m.diskClosed = true
+	m.savedMu.Unlock()
+	m.persistMu.Unlock()
 }
 
 // ---- self inventory ----
