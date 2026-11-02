@@ -6,6 +6,8 @@ import (
 	stdpath "path"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -43,6 +45,45 @@ func recentWriteIdentityKey(storage *model.Storage, parentID, name string) (stri
 	return strconv.FormatUint(uint64(storage.ID), 10) + "\x00" + storage.MountPath + "\x00" + parentID + "\x00" + name, true
 }
 
+// recentWriteLiveUntil records, per storage, until when the bridge may hold an
+// entry (unix nanoseconds). Entries expire on their own, so this is only ever
+// moved forward and never has to be cleaned up with them: a stale "live" costs
+// one lookup, an empty bridge costs nothing. Without it every missed Get would
+// first resolve the parent directory, which on a storage whose listing cache
+// has expired is an extra driver List (on 115 through its single rate gate).
+var recentWriteLiveUntil sync.Map // storage identity -> *atomic.Int64
+
+func recentWriteStorageKey(s *model.Storage) string {
+	return strconv.FormatUint(uint64(s.ID), 10) + "\x00" + s.MountPath
+}
+
+func markRecentWriteLive(storage driver.Driver) {
+	k := recentWriteStorageKey(storage.GetStorage())
+	v, ok := recentWriteLiveUntil.Load(k)
+	if !ok {
+		v, _ = recentWriteLiveUntil.LoadOrStore(k, new(atomic.Int64))
+	}
+	until := time.Now().Add(recentWriteConsistencyWindow).UnixNano()
+	if c := v.(*atomic.Int64); c.Load() < until {
+		c.Store(until)
+	}
+}
+
+func recentWriteLive(storage driver.Driver) bool {
+	v, ok := recentWriteLiveUntil.Load(recentWriteStorageKey(storage.GetStorage()))
+	return ok && v.(*atomic.Int64).Load() > time.Now().UnixNano()
+}
+
+// recentWriteParent resolves dirPath only when the storage has live entries;
+// otherwise there is nothing to delete or rebind and the lookup is skipped.
+func recentWriteParent(ctx context.Context, storage driver.Driver, dirPath string) model.Obj {
+	if !recentWriteLive(storage) {
+		return nil
+	}
+	parent, _ := GetUnwrap(ctx, storage, dirPath)
+	return parent
+}
+
 func recentWriteKey(storage driver.Driver, parent model.Obj, name string) (string, bool) {
 	if parent == nil {
 		return "", false
@@ -58,6 +99,7 @@ func setRecentWrite(storage driver.Driver, parent model.Obj, obj model.Obj) {
 	if !ok {
 		return
 	}
+	markRecentWriteLive(storage)
 	recentWriteCache.Set(key, obj, cache.WithEx[model.Obj](recentWriteConsistencyWindow))
 }
 
@@ -69,6 +111,9 @@ func delRecentWrite(storage driver.Driver, parent model.Obj, name string) {
 }
 
 func getRecentWrite(ctx context.Context, storage driver.Driver, dirPath, name string) (model.Obj, bool) {
+	if !recentWriteLive(storage) {
+		return nil, false
+	}
 	parent, err := GetUnwrap(ctx, storage, dirPath)
 	if err != nil {
 		return nil, false
@@ -499,7 +544,6 @@ func Move(ctx context.Context, storage driver.Driver, srcPath, dstDirPath string
 		return errors.WithStack(errs.PermissionDenied)
 	}
 	srcObj := model.UnwrapObjName(srcRawObj)
-	srcDir, _ := GetUnwrap(ctx, storage, srcDirPath)
 	dstDir, err := GetUnwrap(ctx, storage, dstDirPath)
 	if err != nil {
 		return errors.WithMessage(err, "failed to get dst dir")
@@ -521,7 +565,7 @@ func Move(ctx context.Context, storage driver.Driver, srcPath, dstDirPath string
 		return errors.WithStack(err)
 	}
 
-	delRecentWrite(storage, srcDir, srcRawObj.GetName())
+	delRecentWrite(storage, recentWriteParent(ctx, storage, srcDirPath), srcRawObj.GetName())
 	if newObj != nil {
 		setRecentWrite(storage, dstDir, wrapObjName(storage, newObj))
 	}
@@ -576,7 +620,6 @@ func Rename(ctx context.Context, storage driver.Driver, srcPath, dstName string)
 	}
 	oldName := srcRawObj.GetName()
 	srcObj := model.UnwrapObjName(srcRawObj)
-	srcDir, _ := GetUnwrap(ctx, storage, stdpath.Dir(srcPath))
 
 	var newObj model.Obj
 	switch s := storage.(type) {
@@ -591,9 +634,15 @@ func Rename(ctx context.Context, storage driver.Driver, srcPath, dstName string)
 		return errors.WithStack(err)
 	}
 
-	delRecentWrite(storage, srcDir, oldName)
-	if newObj != nil {
-		setRecentWrite(storage, srcDir, wrapObjName(storage, newObj))
+	// Rename has to resolve the parent to record the new name; Get(srcPath) above
+	// just listed it, so this is a dir-cache hit unless the storage has NoCache.
+	if srcDir := recentWriteParent(ctx, storage, stdpath.Dir(srcPath)); srcDir != nil {
+		delRecentWrite(storage, srcDir, oldName)
+	}
+	if newObj != nil && newObj.GetID() != "" {
+		if srcDir, _ := GetUnwrap(ctx, storage, stdpath.Dir(srcPath)); srcDir != nil {
+			setRecentWrite(storage, srcDir, wrapObjName(storage, newObj))
+		}
 	}
 	dirKey := Key(storage, stdpath.Dir(srcPath))
 	if !srcRawObj.IsDir() {
@@ -711,13 +760,12 @@ func Remove(ctx context.Context, storage driver.Driver, path string) error {
 		return errors.WithStack(errs.PermissionDenied)
 	}
 	dirPath := stdpath.Dir(path)
-	parentDir, _ := GetUnwrap(ctx, storage, dirPath)
 
 	switch s := storage.(type) {
 	case driver.Remove:
 		err = s.Remove(ctx, model.UnwrapObjName(rawObj))
 		if err == nil {
-			delRecentWrite(storage, parentDir, rawObj.GetName())
+			delRecentWrite(storage, recentWriteParent(ctx, storage, dirPath), rawObj.GetName())
 			Cache.removeDirectoryObject(storage, dirPath, rawObj)
 		}
 	default:
