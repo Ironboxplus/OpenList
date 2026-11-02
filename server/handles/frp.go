@@ -1,16 +1,13 @@
 package handles
 
 import (
-	"encoding/json"
 	"strconv"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/frp"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
-	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
-	"github.com/pkg/errors"
 )
 
 // secretSettingKeys are settings whose values the generic settings API never
@@ -51,6 +48,7 @@ func frpManager(c *gin.Context) *frp.Manager {
 // FRPProxyView is a proxy as the admin UI sees it: no secret key, only whether
 // one is set.
 type FRPProxyView struct {
+	ID            string   `json:"id"`
 	Name          string   `json:"name"`
 	Type          string   `json:"type"`
 	CustomDomains []string `json:"custom_domains"`
@@ -83,7 +81,7 @@ func frpView(cfg *frp.Config, st frp.Status) FRPView {
 			doms = []string{}
 		}
 		v.Proxies = append(v.Proxies, FRPProxyView{
-			Name: p.Name, Type: p.Type, CustomDomains: doms, Subdomain: p.Subdomain,
+			ID: p.ID, Name: p.Name, Type: p.Type, CustomDomains: doms, Subdomain: p.Subdomain,
 			RemotePort: p.RemotePort, SecretSet: p.SecretKey != "",
 		})
 	}
@@ -104,12 +102,15 @@ func GetFRP(c *gin.Context) {
 }
 
 type frpProxyReq struct {
+	// ID: the proxy's stable id as GET returned it; absent = a new proxy (or an
+	// older client: matched to a stored one by name).
+	ID            string   `json:"id"`
 	Name          string   `json:"name"`
 	Type          string   `json:"type"`
 	CustomDomains []string `json:"custom_domains"`
 	Subdomain     string   `json:"subdomain"`
 	RemotePort    int      `json:"remote_port"`
-	// SecretKey: absent = keep the stored one (same name), "" = clear, value = replace.
+	// SecretKey: absent = keep the stored one (same id), "" = clear, value = replace.
 	SecretKey *string `json:"secret_key"`
 }
 
@@ -139,9 +140,12 @@ func SaveFRP(c *gin.Context) {
 	if err != nil {
 		old = &frp.Config{} // unreadable stored config: the request replaces it
 	}
-	oldSecret := map[string]string{}
+	oldByID, oldByName := map[string]frp.Proxy{}, map[string]frp.Proxy{}
 	for _, p := range old.Proxies {
-		oldSecret[p.Name] = p.SecretKey
+		if p.ID != "" {
+			oldByID[p.ID] = p
+		}
+		oldByName[p.Name] = p
 	}
 	cfg := &frp.Config{
 		Enabled: req.Enabled, ServerAddr: req.ServerAddr, ServerPort: req.ServerPort,
@@ -153,9 +157,23 @@ func SaveFRP(c *gin.Context) {
 	if req.Token != nil {
 		cfg.Token = *req.Token
 	}
+	usedIDs := map[string]bool{}
 	for _, p := range req.Proxies {
-		np := frp.Proxy{Name: p.Name, Type: p.Type, CustomDomains: p.CustomDomains, Subdomain: p.Subdomain,
-			RemotePort: p.RemotePort, SecretKey: oldSecret[p.Name]}
+		prev, known := oldByID[p.ID]
+		if p.ID == "" {
+			prev, known = oldByName[p.Name] // a client that does not send ids
+		}
+		id := ""
+		if known {
+			id = prev.ID
+		}
+		if id == "" || usedIDs[id] {
+			id = frp.NewProxyID()
+			prev = frp.Proxy{} // a new proxy inherits nothing
+		}
+		usedIDs[id] = true
+		np := frp.Proxy{ID: id, Name: p.Name, Type: p.Type, CustomDomains: p.CustomDomains, Subdomain: p.Subdomain,
+			RemotePort: p.RemotePort, SecretKey: prev.SecretKey}
 		if p.SecretKey != nil {
 			np.SecretKey = *p.SecretKey
 		}
@@ -168,7 +186,7 @@ func SaveFRP(c *gin.Context) {
 			return
 		}
 	}
-	if err := saveFRPConfig(cfg); err != nil {
+	if err := frp.Save(cfg); err != nil {
 		common.ErrorResp(c, err, 500)
 		return
 	}
@@ -179,39 +197,6 @@ func SaveFRP(c *gin.Context) {
 	}
 	st := m.Status()
 	common.SuccessResp(c, gin.H{"state": st.State, "state_message": st.StateMessage})
-}
-
-func saveFRPConfig(cfg *frp.Config) error {
-	proxies := make([]frp.Proxy, len(cfg.Proxies))
-	copy(proxies, cfg.Proxies)
-	secrets := map[string]string{}
-	for _, p := range cfg.Proxies {
-		if p.SecretKey != "" {
-			secrets[p.Name] = p.SecretKey
-		}
-	}
-	pj, err := json.Marshal(proxies)
-	if err != nil {
-		return err
-	}
-	sj, err := json.Marshal(secrets)
-	if err != nil {
-		return err
-	}
-	str := func(key, val string, typ string, flag int) model.SettingItem {
-		return model.SettingItem{Key: key, Value: val, Type: typ, Group: model.FRP, Flag: flag}
-	}
-	items := []model.SettingItem{
-		str(conf.FRPEnabled, strconv.FormatBool(cfg.Enabled), conf.TypeBool, model.PRIVATE),
-		str(conf.FRPServerAddr, cfg.ServerAddr, conf.TypeString, model.PRIVATE),
-		str(conf.FRPServerPort, strconv.Itoa(cfg.ServerPort), conf.TypeNumber, model.PRIVATE),
-		str(conf.FRPTLSEnable, strconv.FormatBool(cfg.TLS), conf.TypeBool, model.PRIVATE),
-		str(conf.FRPAuthToken, cfg.Token, conf.TypeString, model.PRIVATE),
-		str(conf.FRPProxies, string(pj), conf.TypeText, model.PRIVATE),
-		str(conf.FRPProxySecrets, string(sj), conf.TypeText, model.PRIVATE),
-		str(conf.FRPExposeCluster, strconv.FormatBool(cfg.ExposeCluster), conf.TypeBool, model.PRIVATE),
-	}
-	return errors.WithStack(op.SaveSettingItems(items))
 }
 
 // StartFRP starts the client with the stored configuration, without touching

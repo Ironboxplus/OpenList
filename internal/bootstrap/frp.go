@@ -13,6 +13,9 @@ import (
 // gateways, and starts the client only if the admin turned it on.
 func InitFRP(handler http.Handler) {
 	frp.Default = frp.New(handler)
+	if err := frp.MigrateIDs(); err != nil {
+		utils.Log.Warnf("frp: could not give the stored proxies their ids: %v", err)
+	}
 	if !setting.GetBool(conf.FRPEnabled) {
 		return
 	}

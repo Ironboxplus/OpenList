@@ -6,6 +6,8 @@
 package frp
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -14,6 +16,8 @@ import (
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/pkg/errors"
@@ -32,6 +36,9 @@ var proxyNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 // Proxy is one tunnel. SecretKey (stcp) is kept apart from the rest in storage
 // and never leaves the process (see View).
 type Proxy struct {
+	// ID never changes after it is first given, so a proxy can be renamed
+	// without losing its secret key (secrets are stored by ID).
+	ID            string   `json:"id"`
 	Name          string   `json:"name"`
 	Type          string   `json:"type"`
 	CustomDomains []string `json:"custom_domains,omitempty"`
@@ -73,9 +80,84 @@ func Load() (*Config, error) {
 		}
 	}
 	for i := range c.Proxies {
-		c.Proxies[i].SecretKey = secrets[c.Proxies[i].Name]
+		key := c.Proxies[i].ID
+		if key == "" {
+			key = c.Proxies[i].Name // stored before proxies had an ID: keyed by name
+		}
+		c.Proxies[i].SecretKey = secrets[key]
 	}
 	return c, nil
+}
+
+// NewProxyID returns a fresh random proxy ID.
+func NewProxyID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		panic(err) // crypto/rand does not fail on supported platforms
+	}
+	return hex.EncodeToString(b)
+}
+
+// AssignIDs gives every proxy that has no ID one and reports whether it changed
+// anything. The secret of such a proxy was loaded by its name; Save moves it to
+// the ID key.
+func (c *Config) AssignIDs() bool {
+	changed := false
+	for i := range c.Proxies {
+		if c.Proxies[i].ID == "" {
+			c.Proxies[i].ID = NewProxyID()
+			changed = true
+		}
+	}
+	return changed
+}
+
+// MigrateIDs gives the stored proxies their IDs and re-keys their secrets, once:
+// it writes nothing when every proxy already has an ID.
+func MigrateIDs() error {
+	c, err := Load()
+	if err != nil {
+		return err
+	}
+	if !c.AssignIDs() {
+		return nil
+	}
+	return Save(c)
+}
+
+// Save writes the configuration to the settings. Secrets go to their own
+// private setting, keyed by proxy ID; names that no longer exist drop out.
+func Save(cfg *Config) error {
+	proxies := make([]Proxy, len(cfg.Proxies))
+	copy(proxies, cfg.Proxies)
+	secrets := map[string]string{}
+	for _, p := range cfg.Proxies {
+		if p.SecretKey != "" {
+			secrets[p.ID] = p.SecretKey
+		}
+	}
+	pj, err := json.Marshal(proxies)
+	if err != nil {
+		return err
+	}
+	sj, err := json.Marshal(secrets)
+	if err != nil {
+		return err
+	}
+	str := func(key, val string, typ string) model.SettingItem {
+		return model.SettingItem{Key: key, Value: val, Type: typ, Group: model.FRP, Flag: model.PRIVATE}
+	}
+	items := []model.SettingItem{
+		str(conf.FRPEnabled, strconv.FormatBool(cfg.Enabled), conf.TypeBool),
+		str(conf.FRPServerAddr, cfg.ServerAddr, conf.TypeString),
+		str(conf.FRPServerPort, strconv.Itoa(cfg.ServerPort), conf.TypeNumber),
+		str(conf.FRPTLSEnable, strconv.FormatBool(cfg.TLS), conf.TypeBool),
+		str(conf.FRPAuthToken, cfg.Token, conf.TypeString),
+		str(conf.FRPProxies, string(pj), conf.TypeText),
+		str(conf.FRPProxySecrets, string(sj), conf.TypeText),
+		str(conf.FRPExposeCluster, strconv.FormatBool(cfg.ExposeCluster), conf.TypeBool),
+	}
+	return errors.WithStack(op.SaveSettingItems(items))
 }
 
 // Validate checks everything that can be checked without a server. Messages

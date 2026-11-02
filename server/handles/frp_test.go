@@ -13,6 +13,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/frp"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/gin-gonic/gin"
 )
 
@@ -259,5 +260,88 @@ func TestFRPRuntimeLimit(t *testing.T) {
 	}
 	if err := json.Unmarshal([]byte(body), &r); err != nil || len(r.Data.Lines) != 5 {
 		t.Fatalf("runtime: %v %s", err, body)
+	}
+}
+
+func proxiesOf(t *testing.T, e *frpEnv) []FRPProxyView {
+	t.Helper()
+	_, body := e.do("GET", "/api/admin/frp", nil)
+	var r struct {
+		Data FRPView `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(body), &r); err != nil {
+		t.Fatal(err)
+	}
+	return r.Data.Proxies
+}
+
+// A proxy keeps its stcp secret when it is renamed: secrets are keyed by the
+// proxy's id, which GET returns and the admin UI sends back.
+func TestFRPRenameKeepsTheSecret(t *testing.T) {
+	e := newFRPEnv(t)
+	save := func(proxies ...map[string]any) {
+		t.Helper()
+		e.save(map[string]any{"enabled": false, "server_addr": "frps.example.test", "server_port": 7000, "proxies": proxies})
+	}
+	save(map[string]any{"name": "peer", "type": "stcp", "secret_key": fakeFRPSecret}, map[string]any{"name": "other", "type": "stcp", "secret_key": "k-other"})
+	ps := proxiesOf(t, e)
+	if len(ps) != 2 || ps[0].ID == "" || ps[1].ID == "" || ps[0].ID == ps[1].ID {
+		t.Fatalf("ids: %+v", ps)
+	}
+	id := ps[0].ID
+
+	// rename, no secret_key in the request
+	save(map[string]any{"id": id, "name": "renamed", "type": "stcp"}, map[string]any{"id": ps[1].ID, "name": "other", "type": "stcp"})
+	c, err := frp.Load()
+	if err != nil || len(c.Proxies) != 2 || c.Proxies[0].Name != "renamed" || c.Proxies[0].ID != id || c.Proxies[0].SecretKey != fakeFRPSecret || c.Proxies[1].SecretKey != "k-other" {
+		t.Fatalf("after rename: %+v %v", c, err)
+	}
+	// a client that sends no ids still matches by name and keeps id and secret
+	save(map[string]any{"name": "renamed", "type": "stcp"}, map[string]any{"name": "other", "type": "stcp"})
+	if c, _ = frp.Load(); c.Proxies[0].ID != id || c.Proxies[0].SecretKey != fakeFRPSecret {
+		t.Fatalf("id-less save: %+v", c.Proxies[0])
+	}
+	// delete one and add another under the old name: the new one gets nothing
+	save(map[string]any{"id": id, "name": "renamed", "type": "stcp"}, map[string]any{"name": "other", "type": "stcp"})
+	save(map[string]any{"id": id, "name": "renamed", "type": "stcp"})
+	save(map[string]any{"id": id, "name": "renamed", "type": "stcp"}, map[string]any{"name": "other", "type": "stcp"})
+	if c, _ = frp.Load(); c.Proxies[1].SecretKey != "" || c.Proxies[1].ID == id {
+		t.Fatalf("a new proxy inherited something: %+v", c.Proxies[1])
+	}
+	// the secrets setting is keyed by id, not by name
+	raw := setting.GetStr(conf.FRPProxySecrets)
+	if strings.Contains(raw, "renamed") || !strings.Contains(raw, id) {
+		t.Fatalf("secrets are not keyed by id: %d bytes", len(raw))
+	}
+}
+
+// Proxies stored before ids existed (secrets keyed by name) get an id on the
+// first start and keep their secret; a second run changes nothing.
+func TestFRPMigrateNameKeyedSecrets(t *testing.T) {
+	newFRPEnv(t)
+	items := []model.SettingItem{
+		{Key: conf.FRPServerAddr, Value: "frps.example.test", Type: conf.TypeString, Group: model.FRP, Flag: model.PRIVATE},
+		{Key: conf.FRPProxies, Value: `[{"name":"peer","type":"stcp"},{"name":"web","type":"http","custom_domains":["a.example.test"]}]`, Type: conf.TypeText, Group: model.FRP, Flag: model.PRIVATE},
+		{Key: conf.FRPProxySecrets, Value: `{"peer":"` + fakeFRPSecret + `"}`, Type: conf.TypeText, Group: model.FRP, Flag: model.PRIVATE},
+	}
+	if err := op.SaveSettingItems(items); err != nil {
+		t.Fatal(err)
+	}
+	if err := frp.MigrateIDs(); err != nil {
+		t.Fatal(err)
+	}
+	c, err := frp.Load()
+	if err != nil || len(c.Proxies) != 2 || c.Proxies[0].ID == "" || c.Proxies[1].ID == "" || c.Proxies[0].SecretKey != fakeFRPSecret {
+		t.Fatalf("after migration: %+v %v", c, err)
+	}
+	if raw := setting.GetStr(conf.FRPProxySecrets); strings.Contains(raw, `"peer"`) || !strings.Contains(raw, c.Proxies[0].ID) {
+		t.Fatal("secrets still keyed by name")
+	}
+	first := c.Proxies[0].ID
+	if err := frp.MigrateIDs(); err != nil {
+		t.Fatal(err)
+	}
+	if c, _ = frp.Load(); c.Proxies[0].ID != first || c.Proxies[0].SecretKey != fakeFRPSecret {
+		t.Fatalf("second run changed something: %+v", c.Proxies[0])
 	}
 }
