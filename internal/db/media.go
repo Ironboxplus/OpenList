@@ -215,28 +215,39 @@ func CreateOrUpdateMediaItem(item *model.MediaItem) error {
 	item.CreatedAt = existing.CreatedAt
 	// 复用已有记录时清除软删除标记，确保该条目“恢复”为正常记录
 	item.DeletedAt = gorm.DeletedAt{}
-	// 如果已有刮削数据，保留刮削字段，防止重新扫描时覆盖刮削结果
-	if existing.ScrapedAt != nil {
-		item.ScrapedAt = existing.ScrapedAt
-		item.ScrapedName = existing.ScrapedName
-		item.Cover = existing.Cover
-		item.AlbumName = existing.AlbumName
-		item.AlbumArtist = existing.AlbumArtist
-		item.TrackNumber = existing.TrackNumber
-		item.Duration = existing.Duration
-		item.Genre = existing.Genre
-		item.ReleaseDate = existing.ReleaseDate
-		item.Rating = existing.Rating
-		item.Plot = existing.Plot
-		item.Authors = existing.Authors
-		item.Description = existing.Description
-		item.Publisher = existing.Publisher
-		item.ISBN = existing.ISBN
-		item.ExternalID = existing.ExternalID
+	// 已锁定、已刮削或人工整理过的条目：保留刮削字段和整理信息，防止重新扫描时覆盖
+	if existing.Locked || existing.ScrapedAt != nil || existing.Source == model.MediaSourceManual {
+		keepScraped(item, &existing)
 	}
 	// 扫描不覆盖用户手动隐藏的状态
 	item.Hidden = existing.Hidden
 	return db.Unscoped().Save(item).Error
+}
+
+// keepScraped copies everything a scrape or a human wrote from existing to
+// item, so a rescan only refreshes what the scan itself knows (size, mime,
+// folder flag, episode list).
+func keepScraped(item, existing *model.MediaItem) {
+	item.ScrapedAt = existing.ScrapedAt
+	item.ScrapedName = existing.ScrapedName
+	item.Cover = existing.Cover
+	item.AlbumName = existing.AlbumName
+	item.AlbumArtist = existing.AlbumArtist
+	item.TrackNumber = existing.TrackNumber
+	item.Duration = existing.Duration
+	item.Genre = existing.Genre
+	item.ReleaseDate = existing.ReleaseDate
+	item.Rating = existing.Rating
+	item.Plot = existing.Plot
+	item.Authors = existing.Authors
+	item.Description = existing.Description
+	item.Publisher = existing.Publisher
+	item.ISBN = existing.ISBN
+	item.ExternalID = existing.ExternalID
+	item.VideoType = existing.VideoType
+	item.Season = existing.Season
+	item.Episode = existing.Episode
+	item.MediaCuration = existing.MediaCuration
 }
 
 // UpdateMediaItem 更新媒体条目
@@ -297,26 +308,33 @@ func ClearMediaItemsByScanPath(scanPathID uint) error {
 // 仅清空刮削结果相关字段，不删除条目，便于重新刮削。
 // mediaType 为空时表示对所有类型生效。
 func ClearMediaScrapedData(mediaType model.MediaType) (int64, error) {
-	tx := db.Unscoped().Model(&model.MediaItem{})
+	// 已锁定的条目不清除
+	tx := db.Unscoped().Model(&model.MediaItem{}).Where("locked = ?", false)
 	if mediaType != "" {
 		tx = tx.Where("media_type = ?", mediaType)
 	}
 	updates := map[string]interface{}{
-		"scraped_name": "",
-		"description":  "",
-		"cover":        "",
-		"release_date": "",
-		"rating":       0,
-		"genre":        "",
-		"authors":      "",
-		"plot":         "",
-		"reviews":      "",
-		"external_id":  "",
-		"album_artist": "",
-		"publisher":    "",
-		"isbn":         "",
-		"lyrics":       "",
-		"scraped_at":   nil,
+		"original_title": "",
+		"external_ids":   "",
+		"backdrop":       "",
+		"source":         "",
+		"confidence":     0,
+		"candidates":     "",
+		"scraped_name":   "",
+		"description":    "",
+		"cover":          "",
+		"release_date":   "",
+		"rating":         0,
+		"genre":          "",
+		"authors":        "",
+		"plot":           "",
+		"reviews":        "",
+		"external_id":    "",
+		"album_artist":   "",
+		"publisher":      "",
+		"isbn":           "",
+		"lyrics":         "",
+		"scraped_at":     nil,
 	}
 	result := tx.Updates(updates)
 	return result.RowsAffected, result.Error
@@ -495,8 +513,8 @@ func ListFolderPaths(mediaType model.MediaType) ([]string, error) {
 func GetUnscrappedItems(mediaType model.MediaType, limit int) ([]model.MediaItem, error) {
 	var items []model.MediaItem
 	tx := db.Where(
-		"media_type = ? AND (scraped_at IS NULL OR cover = '' OR cover IS NULL OR scraped_name = '' OR scraped_name IS NULL OR plot = '' OR plot IS NULL)",
-		mediaType,
+		"media_type = ? AND locked = ? AND (scraped_at IS NULL OR cover = '' OR cover IS NULL OR scraped_name = '' OR scraped_name IS NULL OR plot = '' OR plot IS NULL)",
+		mediaType, false,
 	)
 	if limit > 0 {
 		tx = tx.Limit(limit)

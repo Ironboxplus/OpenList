@@ -91,6 +91,9 @@ type MediaItem struct {
 	Episodes   string `gorm:"type:text"                                         json:"episodes"`         // 选集信息，JSON数组，格式：[{file_name,index,title},...]
 
 	ScrapedAt *time.Time `json:"scraped_at"`
+
+	// 识别、置信度、锁定、候选等整理信息（见 media_curation.go）
+	MediaCuration
 }
 
 // MediaConfig 媒体库配置（每种类型一条记录）

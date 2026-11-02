@@ -7,35 +7,8 @@ package model
 
 import "time"
 
-// Media kinds. A MediaWork is one directory (or, for a loose video at the top
-// level, one file) and its path is its identity.
-const (
-	MediaKindMovie      = "movie"
-	MediaKindTV         = "tv"
-	MediaKindAnime      = "anime"
-	MediaKindCollection = "collection"
-	MediaKindIgnore     = "ignore"
-	MediaKindLibrary    = "library" // a root whose entries are the works: opens as a poster wall
-)
-
-// Where an item's data came from.
-const (
-	MediaSourceManual  = "manual"
-	MediaSourceRule    = "rule"
-	MediaSourceScraper = "scraper"
-)
-
-// MediaPendingConfidence is the confidence below which an unlocked item still
-// needs a human look.
-const MediaPendingConfidence = 0.6
-
-func ValidMediaKind(k string) bool {
-	switch k {
-	case MediaKindMovie, MediaKindTV, MediaKindAnime, MediaKindCollection, MediaKindIgnore, MediaKindLibrary:
-		return true
-	}
-	return false
-}
+// Kinds that exist only for the staged works: a library root.
+const MediaKindLibrary = "library"
 
 // MediaWork is a scraped work. P1 models "directory = one work"; the group
 // tables of REFACTOR_PLAN 6.6 can be derived from it later.
