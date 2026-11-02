@@ -3,9 +3,11 @@ package handles
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	stdpath "path"
@@ -15,7 +17,9 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/media"
+	"github.com/OpenListTeam/OpenList/v4/internal/media/apply"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/scraper"
+	"github.com/OpenListTeam/OpenList/v4/internal/media/store"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
@@ -464,20 +468,54 @@ func GetMediaScanProgress(c *gin.Context) {
 // MediaScrapeStatsResp 刮削统计响应
 // 包含 TMDB 视频刮削的累计指标，用于运维观测与命中率评估
 type MediaScrapeStatsResp struct {
-	TMDB scraper.TMDBStats `json:"tmdb"`
+	TMDB VideoScrapeStats `json:"tmdb"`
 }
 
-// GetMediaScrapeStats 获取刮削统计（进程级累计值，重启清零）
-// 返回字段：
-//   - total_scraped         : 累计触发刮削次数
-//   - hit_count             : 命中（含强命中）次数
-//   - low_confidence_count  : 仅低置信度兜底命中次数
-//   - no_match_count        : 完全未命中次数
-//   - total_attempts        : 累计 TMDB 搜索请求次数
-//   - total_search_millis   : 累计搜索耗时（毫秒）
+// VideoScrapeStats 视频刮削统计（原子计数，进程级累计值，重启清零）
+//   - TotalScraped       : 累计刮削次数
+//   - HitCount           : 强命中（已取回详情）次数
+//   - LowConfidenceCount : 只有低置信度候选、留待人工挑选的次数
+//   - NoMatchCount       : 完全未命中次数
+//   - TotalAttempts      : 保留字段，恒为 0（搜索请求数由各 provider 内部限流，不再单独计数）
+//   - TotalSearchMillis  : 累计刮削耗时（毫秒）
+type VideoScrapeStats struct {
+	TotalScraped       int64
+	HitCount           int64
+	NoMatchCount       int64
+	LowConfidenceCount int64
+	TotalAttempts      int64
+	TotalSearchMillis  int64
+}
+
+var videoScrapeStats VideoScrapeStats
+
+func (s *VideoScrapeStats) snapshot() VideoScrapeStats {
+	return VideoScrapeStats{
+		TotalScraped:       atomic.LoadInt64(&s.TotalScraped),
+		HitCount:           atomic.LoadInt64(&s.HitCount),
+		NoMatchCount:       atomic.LoadInt64(&s.NoMatchCount),
+		LowConfidenceCount: atomic.LoadInt64(&s.LowConfidenceCount),
+		TotalSearchMillis:  atomic.LoadInt64(&s.TotalSearchMillis),
+	}
+}
+
+func (s *VideoScrapeStats) record(res *apply.ScrapeResult, took time.Duration) {
+	atomic.AddInt64(&s.TotalScraped, 1)
+	atomic.AddInt64(&s.TotalSearchMillis, took.Milliseconds())
+	switch {
+	case res != nil && res.Matched && res.Provider != "":
+		atomic.AddInt64(&s.HitCount, 1)
+	case res != nil && len(res.Candidates) > 0:
+		atomic.AddInt64(&s.LowConfidenceCount, 1)
+	default:
+		atomic.AddInt64(&s.NoMatchCount, 1)
+	}
+}
+
+// GetMediaScrapeStats 获取视频刮削统计
 func GetMediaScrapeStats(c *gin.Context) {
 	common.SuccessResp(c, MediaScrapeStatsResp{
-		TMDB: scraper.GetTMDBStats(),
+		TMDB: videoScrapeStats.snapshot(),
 	})
 }
 
@@ -502,8 +540,6 @@ func StartMediaScrape(c *gin.Context) {
 	}
 
 	// 从系统设置中读取刮削配置
-	tmdbKey := setting.GetStr(conf.MediaTMDBKey)
-	tmdbAPIURL := setting.GetStr(conf.MediaTMDBAPIURL, "https://api.themoviedb.org")
 	discogsToken := setting.GetStr(conf.MediaDiscogsToken)
 	discogsAPIURL := setting.GetStr(conf.MediaDiscogsAPIURL, "https://api.discogs.com")
 	thumbnailMode := setting.GetStr(conf.MediaThumbnailMode, "runtime")
@@ -570,6 +606,26 @@ func StartMediaScrape(c *gin.Context) {
 			concurrency = len(items)
 		}
 
+		var videoOrch *apply.Orchestrator
+		if req.MediaType == model.MediaTypeVideo && len(items) > 0 {
+			set, e := mediaScraperSet()
+			if e != nil {
+				log.Errorf("刮削失败：%v", e)
+				return
+			}
+			var dl apply.Downloader
+			if downloadCover {
+				if dl, e = mediaDownloader(); e != nil {
+					log.Errorf("刮削失败：%v", e)
+					return
+				}
+			}
+			videoOrch = &apply.Orchestrator{
+				Lister: apply.LocalLister{}, Writer: apply.LocalWriter{Store: store.New(thumbnailMode, thumbnailPath)},
+				Providers: set, Download: dl,
+			}
+		}
+
 		var wg sync.WaitGroup
 		jobs := make(chan int, len(items))
 		// 落库串行化：所有 worker 把刮削成功的 item 推到 saveCh，由单协程负责落库，
@@ -596,8 +652,18 @@ func StartMediaScrape(c *gin.Context) {
 
 				switch req.MediaType {
 				case model.MediaTypeVideo:
-					s := scraper.NewTMDBScraper(tmdbKey, tmdbAPIURL)
-					scrapeErr = s.ScrapeVideo(item)
+					// 视频走 scraper.Set + apply.ScrapeOne：识别、搜索、取详情、落库都在里面，
+					// 手动选定（source=manual）和锁定的条目不碰。
+					if item.Source == model.MediaSourceManual || item.Locked {
+						continue
+					}
+					began := time.Now()
+					res, e := videoOrch.ScrapeOne(context.Background(), db.MediaItemPath(item), apply.ScrapeOpts{})
+					videoScrapeStats.record(res, time.Since(began))
+					if e != nil && !errors.Is(e, apply.ErrLocked) {
+						log.Warnf("刮削失败 [%s] %s: %v", req.MediaType, item.FolderPath, e)
+					}
+					continue
 				case model.MediaTypeMusic:
 					// 音乐：刮削前先用文件本身的 ID3/Vorbis tag + .lrc 做本地兜底，
 					// 仅填空字段；这样用户清空刮削后重新刮削也能恢复封面/歌词等。

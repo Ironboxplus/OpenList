@@ -50,10 +50,34 @@ func mediaScraperSet() (*scraper.Set, error) {
 		Proxy:        strings.TrimSpace(setting.GetStr(conf.MediaHTTPProxy)),
 		Timeout:      time.Duration(setting.GetInt(conf.MediaScraperTimeout, 15)) * time.Second,
 	}
+	if u := tmdbBaseURL(setting.GetStr(conf.MediaTMDBAPIURL)); u != "" {
+		cfg.BaseURLs = map[string]string{"tmdb": u}
+	}
 	if mediaConfigHook != nil {
 		mediaConfigHook(&cfg)
 	}
 	return scraper.NewSet(cfg)
+}
+
+// tmdbBaseURL turns the media_tmdb_api_url setting into the TMDB base URL with
+// its /3 prefix. It takes a bare host (api.themoviedb.org), a reverse proxy
+// prefix (https://example.com/api/tmdb) or the full form already ending in /3.
+// Empty and the official host give "" (the provider default).
+func tmdbBaseURL(v string) string {
+	base := strings.TrimRight(strings.TrimSpace(v), "/")
+	if base == "" {
+		return ""
+	}
+	if !strings.HasPrefix(base, "http://") && !strings.HasPrefix(base, "https://") {
+		base = "https://" + base
+	}
+	if !strings.HasSuffix(base, "/3") {
+		base += "/3"
+	}
+	if base == "https://api.themoviedb.org/3" {
+		return ""
+	}
+	return base
 }
 
 func mediaDownloader() (apply.Downloader, error) {

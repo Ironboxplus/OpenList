@@ -20,6 +20,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/bootstrap/data"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/OpenListTeam/OpenList/v4/internal/media/apply"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/scraper"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
@@ -423,5 +424,34 @@ func TestSearchReturnsCandidates(t *testing.T) {
 	_ = json.Unmarshal(raw, &cs)
 	if len(cs) != 1 || cs[0].ID != "tv/890" || cs[0].Provider != "tmdb" {
 		t.Fatalf("candidates: %s", raw)
+	}
+}
+
+func TestTMDBBaseURLSetting(t *testing.T) {
+	for in, want := range map[string]string{
+		"":                                      "",
+		"api.themoviedb.org":                    "", // the official host is the provider default
+		"https://api.themoviedb.org/":           "",
+		"example.edgeone.run/api/tmdb":          "https://example.edgeone.run/api/tmdb/3",
+		"https://example.edgeone.run/api/tmdb/": "https://example.edgeone.run/api/tmdb/3",
+		"https://proxy.example/api/tmdb/3":      "https://proxy.example/api/tmdb/3",
+		"http://10.0.0.2:8080":                  "http://10.0.0.2:8080/3",
+	} {
+		if got := tmdbBaseURL(in); got != want {
+			t.Errorf("tmdbBaseURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestVideoScrapeStatsCountOutcomes(t *testing.T) {
+	var s VideoScrapeStats
+	s.record(&apply.ScrapeResult{Matched: true, Provider: "tmdb"}, 20*time.Millisecond)
+	s.record(&apply.ScrapeResult{Candidates: []scraper.Candidate{{ID: "1"}}}, 10*time.Millisecond)
+	s.record(&apply.ScrapeResult{}, 0)
+	s.record(nil, 0) // a failed call is a miss
+	got := s.snapshot()
+	want := VideoScrapeStats{TotalScraped: 4, HitCount: 1, LowConfidenceCount: 1, NoMatchCount: 2, TotalSearchMillis: 30}
+	if got != want {
+		t.Fatalf("stats = %+v, want %+v", got, want)
 	}
 }
