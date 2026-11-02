@@ -1,10 +1,10 @@
 package _115_open
 
 import (
-	"github.com/OpenListTeam/OpenList/v4/internal/lane"
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/OpenListTeam/OpenList/v4/internal/lane"
 	"net/http"
 	"net/url"
 	stdpath "path"
@@ -341,6 +341,11 @@ func (d *Open115) Get(ctx context.Context, path string) (model.Obj, error) {
 // parent directory. Every API call goes through d.waitAPI, the single rate-limit gate.
 func (d *Open115) getFromParent(ctx context.Context, path, id string) (model.Obj, error) {
 	path = stdpath.Clean(path)
+	if path == "/" || path == "." {
+		// the root has no parent to list; without this a lookup that stays
+		// "not found" up to the root would recurse forever
+		return nil, errs.ObjectNotFound
+	}
 	parent, name := stdpath.Split(path)
 	parent = stdpath.Clean(parent)
 	parentID := d.GetRootId()
