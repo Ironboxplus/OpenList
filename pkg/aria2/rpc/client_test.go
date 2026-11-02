@@ -7,6 +7,7 @@ import (
 )
 
 func TestHTTPAll(t *testing.T) {
+	requireAria2(t)
 	const targetURL = "https://nodejs.org/dist/index.json"
 	rpc, err := New(context.Background(), "http://localhost:6800/jsonrpc", "", time.Second, &DummyNotifier{})
 	if err != nil {
@@ -66,6 +67,7 @@ func TestHTTPAll(t *testing.T) {
 }
 
 func TestWebsocketAll(t *testing.T) {
+	requireAria2(t)
 	const targetURL = "https://nodejs.org/dist/index.json"
 	rpc, err := New(context.Background(), "ws://localhost:6800/jsonrpc", "", time.Second, &DummyNotifier{})
 	if err != nil {
