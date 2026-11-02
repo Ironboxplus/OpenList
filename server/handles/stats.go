@@ -18,7 +18,7 @@ func StatsOverview(c *gin.Context) {
 		common.ErrorResp(c, err, 500, true)
 		return
 	}
-	// Same rule as /api/media/library: with media off there is nothing to count.
+	// Same rule as /api/fs/media/list: with media off there is nothing to count.
 	var media db.MediaStats
 	if MediaEnabled() {
 		if media, err = db.GetMediaStats(); err != nil {

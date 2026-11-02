@@ -47,5 +47,5 @@ forwarded, so the speed-limit settings keep working.
 (`now_bps`, `series`, `today`, `month`, `total`, `daily` = last 30 days,
 zero-filled), `media` (counts of movie/tv/anime/collection, episodes, unscraped).
 `today`/`month`/`total` are the saved values plus the bytes not yet flushed.
-`media` is all zeros while media is switched off, like `/api/media/library`.
+`media` is all zeros while media is switched off, like `/api/fs/media/list`.
 Transfer and sync figures are not served here; use the transfer and sync APIs.

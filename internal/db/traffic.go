@@ -48,7 +48,7 @@ func TrafficSums(fromDay, toDay string) (map[string]int64, error) {
 	return out, nil
 }
 
-// MediaStats counts the scraped library the way /api/media/library lists it:
+// MediaStats counts the scraped library the way /api/fs/media/list lists it:
 // the work kinds only ("ignore" and "library" roots are not works).
 type MediaStats struct {
 	Movie      int64 `json:"movie"`
