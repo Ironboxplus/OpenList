@@ -9,6 +9,7 @@ import (
 	"path"
 	"strings"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
@@ -138,6 +139,9 @@ func (d *S3) listV1(dirPath string, args model.ListArgs) ([]model.Obj, error) {
 			files = append(files, &file)
 		}
 		for _, object := range listObjectsResult.Contents {
+			if strings.HasSuffix(*object.Key, "/") {
+				continue
+			}
 			name := path.Base(*object.Key)
 			if !args.S3ShowPlaceholder && (name == getPlaceholderName(d.Placeholder) || name == d.Placeholder) {
 				continue
@@ -344,9 +348,12 @@ func getCopyPartSize(size int64) (int64, error) {
 }
 
 func (d *S3) copyDir(ctx context.Context, src string, dst string) error {
-	objs, err := op.List(ctx, d, src, model.ListArgs{S3ShowPlaceholder: true})
+	objs, err := op.List(ctx, d, src, model.ListArgs{S3ShowPlaceholder: true, Refresh: true})
 	if err != nil {
 		return err
+	}
+	if len(objs) == 0 && !d.UsePlaceholder {
+		return d.createDirMarker(ctx, dst)
 	}
 	for _, obj := range objs {
 		cSrc := path.Join(src, obj.GetName())
@@ -364,8 +371,13 @@ func (d *S3) copyDir(ctx context.Context, src string, dst string) error {
 }
 
 func (d *S3) removeDir(ctx context.Context, src string) error {
-	objs, err := op.List(ctx, d, src, model.ListArgs{})
+	d.cleanupDirArtifacts(ctx, src)
+
+	objs, err := op.List(ctx, d, src, model.ListArgs{Refresh: true})
 	if err != nil {
+		if errs.IsObjectNotFound(err) {
+			return nil
+		}
 		return err
 	}
 	for _, obj := range objs {
@@ -379,9 +391,14 @@ func (d *S3) removeDir(ctx context.Context, src string) error {
 			return err
 		}
 	}
+	d.cleanupDirArtifacts(ctx, src)
+	return nil
+}
+
+func (d *S3) cleanupDirArtifacts(ctx context.Context, src string) {
 	_ = d.removeFile(ctx, path.Join(src, getPlaceholderName(d.Placeholder)))
 	_ = d.removeFile(ctx, path.Join(src, d.Placeholder))
-	return nil
+	_ = d.removeFile(ctx, getKey(src, true))
 }
 
 func (d *S3) removeFile(ctx context.Context, src string) error {

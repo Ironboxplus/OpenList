@@ -38,6 +38,33 @@ type S3 struct {
 	cron   *cron.Cron
 }
 
+var storageClassLookup = map[string]string{
+	"standard":            s3.ObjectStorageClassStandard,
+	"reduced_redundancy":  s3.ObjectStorageClassReducedRedundancy,
+	"glacier":             s3.ObjectStorageClassGlacier,
+	"standard_ia":         s3.ObjectStorageClassStandardIa,
+	"onezone_ia":          s3.ObjectStorageClassOnezoneIa,
+	"intelligent_tiering": s3.ObjectStorageClassIntelligentTiering,
+	"deep_archive":        s3.ObjectStorageClassDeepArchive,
+	"outposts":            s3.ObjectStorageClassOutposts,
+	"glacier_ir":          s3.ObjectStorageClassGlacierIr,
+	"snow":                s3.ObjectStorageClassSnow,
+	"express_onezone":     s3.ObjectStorageClassExpressOnezone,
+}
+
+func (d *S3) resolveStorageClass() *string {
+	value := strings.TrimSpace(d.StorageClass)
+	if value == "" {
+		return nil
+	}
+	normalized := strings.ToLower(strings.ReplaceAll(value, "-", "_"))
+	if v, ok := storageClassLookup[normalized]; ok {
+		return aws.String(v)
+	}
+	log.Warnf("s3: unknown storage class %q, using raw value", d.StorageClass)
+	return aws.String(value)
+}
+
 func (d *S3) Config() driver.Config {
 	return d.config
 }
@@ -47,6 +74,9 @@ func (d *S3) GetAddition() driver.Additional {
 }
 
 func (d *S3) Init(ctx context.Context) error {
+	if !strings.Contains(d.Storage.Addition, `"use_placeholder"`) {
+		d.UsePlaceholder = true
+	}
 	if d.Region == "" {
 		d.Region = "openlist"
 	}
@@ -158,16 +188,20 @@ func (d *S3) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*mo
 }
 
 func (d *S3) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
-	return d.Put(ctx, &model.Object{
-		Path: stdpath.Join(parentDir.GetPath(), dirName),
-	}, &stream.FileStream{
-		Obj: &model.Object{
-			Name:     getPlaceholderName(d.Placeholder),
-			Modified: time.Now(),
-		},
-		Reader:   bytes.NewReader([]byte{}),
-		Mimetype: "application/octet-stream",
-	}, func(float64) {})
+	dirPath := stdpath.Join(parentDir.GetPath(), dirName)
+	if d.UsePlaceholder {
+		return d.Put(ctx, &model.Object{
+			Path: dirPath,
+		}, &stream.FileStream{
+			Obj: &model.Object{
+				Name:     getPlaceholderName(d.Placeholder),
+				Modified: time.Now(),
+			},
+			Reader:   bytes.NewReader([]byte{}),
+			Mimetype: "application/octet-stream",
+		}, func(float64) {})
+	}
+	return d.createDirMarker(ctx, dirPath)
 }
 
 func (d *S3) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
@@ -214,8 +248,33 @@ func (d *S3) Put(ctx context.Context, dstDir model.Obj, s model.FileStreamer, up
 		}),
 		ContentType: &contentType,
 	}
+	if storageClass := d.resolveStorageClass(); storageClass != nil {
+		input.StorageClass = storageClass
+	}
 	_, err := uploader.UploadWithContext(ctx, input)
 	return err
+}
+
+func (d *S3) putEmptyObject(ctx context.Context, key string) error {
+	uploader := s3manager.NewUploader(d.Session)
+	contentType := "application/octet-stream"
+	input := &s3manager.UploadInput{
+		Bucket:      &d.Bucket,
+		Key:         &key,
+		Body:        driver.NewLimitedUploadStream(ctx, bytes.NewReader([]byte{})),
+		ContentType: &contentType,
+	}
+	if storageClass := d.resolveStorageClass(); storageClass != nil {
+		input.StorageClass = storageClass
+	}
+	_, err := uploader.UploadWithContext(ctx, input)
+	return err
+}
+
+// createDirMarker makes an empty folder exist without a placeholder file, as a
+// zero-byte "dir/" object.
+func (d *S3) createDirMarker(ctx context.Context, dirPath string) error {
+	return d.putEmptyObject(ctx, getKey(dirPath, true))
 }
 
 func (d *S3) GetDirectUploadTools() []string {
