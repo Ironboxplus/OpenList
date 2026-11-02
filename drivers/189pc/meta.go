@@ -10,6 +10,7 @@ type Addition struct {
 	Username     string `json:"username" help:"Not needed when an access token or refresh token is provided"`
 	Password     string `json:"password" help:"Not needed when an access token or refresh token is provided"`
 	VCode        string `json:"validate_code"`
+	StripEmoji   bool   `json:"strip_emoji" help:"Remove four-byte characters (e.g., emoji) before upload"`
 	SmsCode      string `json:"sms_code" help:"SMS code for the second device verification, fill it in and save again when login asks for it"`
 	AccessToken  string `json:"access_token" required:"false"`
 	RefreshToken string `json:"refresh_token" help:"To switch accounts, please clear this field"`

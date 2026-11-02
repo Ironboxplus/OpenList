@@ -225,10 +225,11 @@ func (y *Cloud189PC) MakeDir(ctx context.Context, parentDir model.Obj, dirName s
 	fullUrl += "/createFolder.action"
 
 	var newFolder Cloud189Folder
+	safeName := y.sanitizeName(dirName)
 	_, err := y.post(fullUrl, func(req *resty.Request) {
 		req.SetContext(ctx)
 		req.SetQueryParams(map[string]string{
-			"folderName":   dirName,
+			"folderName":   safeName,
 			"relativePath": "",
 		})
 		if isFamily {
@@ -287,15 +288,16 @@ func (y *Cloud189PC) Rename(ctx context.Context, srcObj model.Obj, newName strin
 		queryParam["familyId"] = y.FamilyID
 	}
 
+	safeName := y.sanitizeName(newName)
 	switch srcObj.(type) {
 	case *Cloud189File:
 		fullUrl += "/renameFile.action"
 		queryParam["fileId"] = srcObj.GetID()
-		queryParam["destFileName"] = newName
+		queryParam["destFileName"] = safeName
 	case *Cloud189Folder:
 		fullUrl += "/renameFolder.action"
 		queryParam["folderId"] = srcObj.GetID()
-		queryParam["destFolderName"] = newName
+		queryParam["destFolderName"] = safeName
 	default:
 		return nil, errs.NotSupport
 	}

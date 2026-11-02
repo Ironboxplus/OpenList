@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -211,7 +212,7 @@ func (y *Cloud189PC) put(ctx context.Context, url string, headers map[string]str
 }
 
 func (y *Cloud189PC) getFiles(ctx context.Context, fileId string, isFamily bool) ([]model.Obj, error) {
-    pageSize := 1000  // 每一页返回的文件数量
+	pageSize := 1000 // 每一页返回的文件数量
 	res := make([]model.Obj, 0, 100)
 	for pageNum := 1; ; pageNum++ {
 		resp, err := y.getFilesWithPage(ctx, fileId, isFamily, pageNum, pageSize, y.OrderBy, y.OrderDirection)
@@ -222,10 +223,10 @@ func (y *Cloud189PC) getFiles(ctx context.Context, fileId string, isFamily bool)
 		if resp.FileListAO.Count == 0 {
 			break
 		}
-		
+
 		FolderCount := len(resp.FileListAO.FolderList) // 当前文件夹总数
-        FileCount := len(resp.FileListAO.FileList) // 当前文件总数
-        PageCount := FolderCount + FileCount // 当前页数总数
+		FileCount := len(resp.FileListAO.FileList)     // 当前文件总数
+		PageCount := FolderCount + FileCount           // 当前页数总数
 
 		for i := 0; i < FolderCount; i++ {
 			res = append(res, &resp.FileListAO.FolderList[i])
@@ -234,11 +235,11 @@ func (y *Cloud189PC) getFiles(ctx context.Context, fileId string, isFamily bool)
 			resp.FileListAO.FileList[i].ParentID = fileId
 			res = append(res, &resp.FileListAO.FileList[i])
 		}
-		
+
 		// 当前文件数量小于设定数量则跳出
 		if PageCount < pageSize {
-            break
-        }
+			break
+		}
 	}
 	return res, nil
 }
@@ -978,6 +979,31 @@ func (y *Cloud189PC) keepAlive() {
 
 // 普通上传
 // 无法上传大小为0的文件
+// sanitizeName drops four-byte characters (e.g. emoji) from a name when the
+// strip_emoji option is on.
+func (y *Cloud189PC) sanitizeName(name string) string {
+	if !y.StripEmoji {
+		return name
+	}
+	b := strings.Builder{}
+	for _, r := range name {
+		if utf8.RuneLen(r) == 4 {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	sanitized := b.String()
+	if sanitized == "" {
+		ext := path.Ext(name)
+		if ext != "" {
+			sanitized = "file" + ext
+		} else {
+			sanitized = "file"
+		}
+	}
+	return sanitized
+}
+
 func (y *Cloud189PC) StreamUpload(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress, isFamily bool, overwrite bool) (model.Obj, error) {
 	// 文件大小
 	fileSize := file.GetSize()
@@ -986,7 +1012,7 @@ func (y *Cloud189PC) StreamUpload(ctx context.Context, dstDir model.Obj, file mo
 
 	params := Params{
 		"parentFolderId": dstDir.GetID(),
-		"fileName":       url.QueryEscape(file.GetName()),
+		"fileName":       url.QueryEscape(y.sanitizeName(file.GetName())),
 		"fileSize":       fmt.Sprint(fileSize),
 		"sliceSize":      fmt.Sprint(sliceSize), // 必须为特定分片大小
 		"lazyCheck":      "1",
@@ -1186,7 +1212,7 @@ func (y *Cloud189PC) RapidUpload(ctx context.Context, dstDir model.Obj, stream m
 		return nil, errors.New("invalid hash")
 	}
 
-	uploadInfo, err := y.OldUploadCreate(ctx, dstDir.GetID(), fileMd5, stream.GetName(), fmt.Sprint(stream.GetSize()), isFamily)
+	uploadInfo, err := y.OldUploadCreate(ctx, dstDir.GetID(), fileMd5, y.sanitizeName(stream.GetName()), fmt.Sprint(stream.GetSize()), isFamily)
 	if err != nil {
 		return nil, err
 	}
@@ -1316,7 +1342,7 @@ func (y *Cloud189PC) fastUpload(ctx context.Context, dstDir model.Obj, file mode
 		// step.2 预上传
 		params := Params{
 			"parentFolderId": dstDir.GetID(),
-			"fileName":       url.QueryEscape(file.GetName()),
+			"fileName":       url.QueryEscape(y.sanitizeName(file.GetName())),
 			"fileSize":       fmt.Sprint(file.GetSize()),
 			"fileMd5":        fileMd5Hex,
 			"sliceSize":      fmt.Sprint(sliceSize),
@@ -1494,7 +1520,7 @@ func (y *Cloud189PC) OldUpload(ctx context.Context, dstDir model.Obj, file model
 	rateLimited := driver.NewLimitedUploadStream(ctx, io.NopCloser(tempFile))
 
 	// 创建上传会话
-	uploadInfo, err := y.OldUploadCreate(ctx, dstDir.GetID(), fileMd5, file.GetName(), fmt.Sprint(file.GetSize()), isFamily)
+	uploadInfo, err := y.OldUploadCreate(ctx, dstDir.GetID(), fileMd5, y.sanitizeName(file.GetName()), fmt.Sprint(file.GetSize()), isFamily)
 	if err != nil {
 		return nil, err
 	}
