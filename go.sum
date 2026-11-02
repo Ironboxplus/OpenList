@@ -35,6 +35,12 @@ github.com/Files-com/files-sdk-go/v3 v3.3.194 h1:dtOFxSTWWRpkmvXa6ycNiw8dVDu1wkg
 github.com/Files-com/files-sdk-go/v3 v3.3.194/go.mod h1:rl0WumSN9gSo775DgvQv+wMQ8rlb0ES/1hU5jkMtLXg=
 github.com/IBM/go-sdk-core/v5 v5.23.1 h1:fxLusCG+GlGY1SM7BYAAiiSFhzKUs5zqs0P8knDqeFU=
 github.com/IBM/go-sdk-core/v5 v5.23.1/go.mod h1:yO+OQpByKDLTvpEcsFFexgzpeR8eRfCFWAYzxkAu4bk=
+github.com/Ironboxplus/115-sdk-go v0.2.19 h1:lvI37mWHTNPJSnC0OzbP7ZJeR3pufFWR+qaL3bFgwIk=
+github.com/Ironboxplus/115-sdk-go v0.2.19/go.mod h1:cfvitk2lwe6036iNi2h+iNxwxWDifKZsSvNtrur5BqU=
+github.com/Ironboxplus/cfs v0.0.0-20261102171618-b0d18a02cfe2 h1:b0uuCsEFvEGSZYFbgC8W4nogTaES8ugdrctS6EH/PE4=
+github.com/Ironboxplus/cfs v0.0.0-20261102171618-b0d18a02cfe2/go.mod h1:9EL2NoOSRpnuSqm1paY7yBaG1MxX5Nn1fXsuSKisQwk=
+github.com/Ironboxplus/rclone v0.0.0-20261028045822-c6c227a3f4d3 h1:n21re0HxLUYNPTyEU9lxEK6cBNDRhqgv5pX5NcniTpw=
+github.com/Ironboxplus/rclone v0.0.0-20261028045822-c6c227a3f4d3/go.mod h1:YmKNkhnFIoIwLsEZl7FSN756Iq5ZXy3LPDuypnuFocA=
 github.com/KirCute/zip v1.0.1 h1:L/tVZglOiDVKDi9Ud+fN49htgKdQ3Z0H80iX8OZk13c=
 github.com/KirCute/zip v1.0.1/go.mod h1:xhF7dCB+Bjvy+5a56lenYCKBsH+gxDNPZSy5Cp+nlXk=
 github.com/Masterminds/semver/v3 v3.2.0 h1:3MEsd0SM6jqZojhjLWWeBY+Kcjy9i6MQAeY7YgDP83g=

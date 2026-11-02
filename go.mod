@@ -5,7 +5,7 @@ go 1.27
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.1
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.8.1
-	github.com/Ironboxplus/cfs v0.0.0-00010101000000-000000000000
+	github.com/Ironboxplus/cfs v0.0.0-20261102171618-b0d18a02cfe2
 	github.com/KarpelesLab/reflink v1.0.2
 	github.com/KirCute/zip v1.0.1
 	github.com/OpenListTeam/115-sdk-go v0.2.6
@@ -328,10 +328,8 @@ replace github.com/ProtonMail/go-proton-api => github.com/henrybear327/go-proton
 
 replace github.com/cronokirby/saferith => github.com/Da3zKi7/saferith v0.33.0-fixed
 
-replace github.com/OpenListTeam/115-sdk-go => ../115-sdk-go
+replace github.com/OpenListTeam/115-sdk-go => github.com/Ironboxplus/115-sdk-go v0.2.19
 
 replace github.com/KarpelesLab/reflink => github.com/OpenListTeam/reflink v0.0.0-20260701021214-78760eaeafef
 
-replace github.com/Ironboxplus/cfs => ../cfs
-
-replace github.com/rclone/rclone => ../rclone-fork
+replace github.com/rclone/rclone => github.com/Ironboxplus/rclone v0.0.0-20261028045822-c6c227a3f4d3
