@@ -392,8 +392,14 @@ func (m *Manager) onStorageHook(typ string, d driver.Driver) {
 	}
 	// add/update/del: LoadStorage and UpdateStorage fire this after the storage
 	// is registered, so a reconcile queued earlier for a not-yet-registered mount
-	// is satisfied here at the latest.
-	m.enqueueMount(d.GetStorage().MountPath)
+	// is satisfied here at the latest. An update that leaves the mount working
+	// is not woken: a refresh updates the storage before its new pair is
+	// catalogued, and reconciling inside that gap would weigh the old catalogued
+	// pairs against a pair of unknown version. onStorageCredential wakes the
+	// mount once the record exists.
+	if typ != "update" || d.GetStorage().Status != op.WORK {
+		m.enqueueMount(d.GetStorage().MountPath)
+	}
 	go m.refreshInventory()
 }
 
