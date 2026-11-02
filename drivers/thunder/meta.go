@@ -82,6 +82,8 @@ type Addition struct {
 	CreditKey string `json:"credit_key" help:"credit key,used for login"`
 	// 登录设备ID
 	DeviceID string `json:"device_id" default:""`
+	// 登录令牌（登录成功后自动保存，用于重启后恢复登录态，避免每次重启重新触发验证）
+	RefreshToken string `json:"refresh_token"`
 
 	Space string `json:"space" default:"" help:"device id for remote device"`
 }

@@ -17,9 +17,13 @@ import (
 )
 
 const (
-	API_URL             = "https://api-pan.xunlei.com/drive/v1"
-	FILE_API_URL        = API_URL + "/files"
-	TASK_API_URL        = API_URL + "/tasks"
+	API_URL      = "https://api-pan.xunlei.com/drive/v1"
+	FILE_API_URL = API_URL + "/files"
+	TASK_API_URL = API_URL + "/tasks"
+)
+
+// vars so that tests can point them at a local mock server
+var (
 	XLUSER_API_BASE_URL = "https://xluser-ssl.xunlei.com"
 	XLUSER_API_URL      = XLUSER_API_BASE_URL + "/v1"
 )

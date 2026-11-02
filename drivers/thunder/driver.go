@@ -21,6 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/go-resty/resty/v2"
+	log "github.com/sirupsen/logrus"
 )
 
 type Thunder struct {
@@ -77,21 +78,23 @@ func (x *Thunder) Init(ctx context.Context) (err error) {
 			},
 			refreshTokenFunc: func() error {
 				// 通过RefreshToken刷新
-				token, err := x.RefreshToken(x.TokenResp.RefreshToken)
+				token, err := x.XunLeiCommon.RefreshToken(x.TokenResp.RefreshToken)
 				if err != nil {
 					// 重新登录
 					token, err = x.Login(x.Username, x.Password)
 					if err != nil {
 						x.GetStorage().SetStatus(fmt.Sprintf("%+v", err.Error()))
-						op.MustSaveDriverStorage(x)
+					} else {
+						// 登录成功，清空已消费的信任密钥
+						x.Addition.CreditKey = ""
 					}
-					// 清空 信任密钥
-					x.Addition.CreditKey = ""
 				}
-				if token == nil {
-					return err
+				if token != nil {
+					x.SetTokenResp(token)
+					// 持久化最新的 refresh token，避免重启后重新登录
+					x.Addition.RefreshToken = token.RefreshToken
 				}
-				x.SetTokenResp(token)
+				op.MustSaveDriverStorage(x)
 				return err
 			},
 		}
@@ -118,14 +121,41 @@ func (x *Thunder) Init(ctx context.Context) (err error) {
 	identity := x.GetIdentity()
 	if x.identity != identity || !x.IsLogin() {
 		x.identity = identity
+		// 优先使用已保存的 RefreshToken 恢复登录态，避免每次重启都触发风控验证
+		if x.Addition.RefreshToken != "" {
+			token, err := x.XunLeiCommon.RefreshToken(x.Addition.RefreshToken)
+			if err == nil && token != nil && token.AccessToken != "" {
+				x.SetTokenResp(token)
+				// 更新并持久化最新的 refresh token（服务端未轮换时保留旧值）
+				if token.RefreshToken != "" {
+					x.Addition.RefreshToken = token.RefreshToken
+				}
+				// 清空已消费的信任密钥并落库
+				x.Addition.CreditKey = ""
+				op.MustSaveDriverStorage(x)
+				log.Infof("thunder: session restored via refresh token for %s", x.MountPath)
+				return nil
+			}
+			// 刷新失败，回退到账号密码登录
+			if err != nil {
+				log.Warnf("thunder: refresh token failed for %s: %v, fallback to login", x.MountPath, err)
+			} else {
+				log.Warnf("thunder: refresh token response has no access token for %s, fallback to login", x.MountPath)
+			}
+		} else {
+			log.Infof("thunder: no saved refresh token for %s, login with username/password", x.MountPath)
+		}
 		// 登录
 		token, err := x.Login(x.Username, x.Password)
 		if err != nil {
 			return err
 		}
-		// 清空 信任密钥
+		// 清空已消费的信任密钥并落库
 		x.Addition.CreditKey = ""
 		x.SetTokenResp(token)
+		x.Addition.RefreshToken = token.RefreshToken
+		op.MustSaveDriverStorage(x)
+		log.Infof("thunder: logged in for %s", x.MountPath)
 	}
 	return nil
 }
@@ -577,8 +607,13 @@ func (xc *XunLeiCommon) RefreshToken(refreshToken string) (*TokenResp, error) {
 		return nil, err
 	}
 
-	if resp.RefreshToken == "" {
+	// 以 access token 是否有效作为刷新成功的判据：
+	// 部分场景下服务端不轮换 refresh token（响应里该字段为空），此时保留旧值即可
+	if resp.AccessToken == "" {
 		return nil, errs.EmptyToken
+	}
+	if resp.RefreshToken == "" {
+		resp.RefreshToken = refreshToken
 	}
 	return &resp, nil
 }
