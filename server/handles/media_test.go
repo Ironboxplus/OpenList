@@ -64,6 +64,8 @@ func newMediaEnv(t *testing.T) *mediaEnv {
 		switch items[i].Key {
 		case conf.Token:
 			items[i].Value = "test-admin-token"
+		case conf.MediaEnabled:
+			items[i].Value = "true"
 		case conf.MediaTMDBKey:
 			items[i].Value = fakeTMDBSecret
 		case conf.MediaOMDbKeys:

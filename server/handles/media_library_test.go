@@ -253,10 +253,11 @@ func TestDetailHasRatingsEpisodesAndAdminOnlyCandidates(t *testing.T) {
 	if len(got.EpisodeList) != 2 || got.EpisodeList[0].Title != "one" || !strings.HasPrefix(got.EpisodeList[1].StillURL, "/api/public/media/thumb?") {
 		t.Fatalf("episode_list: %s", raw)
 	}
-	if strings.Contains(string(raw), `"provider"`) {
+	// candidates travel as a JSON string, so their quotes are escaped in the body
+	if strings.Contains(string(raw), "provider") || !strings.Contains(string(raw), `"candidates":""`) {
 		t.Fatalf("candidates visible to a non-admin: %s", raw)
 	}
-	if !strings.Contains(string(m.ok("GET", id, "admin", nil)), `"provider"`) {
+	if !strings.Contains(string(m.ok("GET", id, "admin", nil)), "provider") {
 		t.Fatal("an admin does not get the candidates")
 	}
 
@@ -266,7 +267,7 @@ func TestDetailHasRatingsEpisodesAndAdminOnlyCandidates(t *testing.T) {
 		t.Fatalf("list item: %+v", page.Content)
 	}
 	w := m.get("/api/fs/media/list?media_type=video", "alice")
-	if strings.Contains(w.Body.String(), `"provider"`) {
+	if strings.Contains(w.Body.String(), "provider") {
 		t.Fatalf("candidates in the list for a non-admin: %s", w.Body.String())
 	}
 }
