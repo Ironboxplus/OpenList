@@ -83,6 +83,7 @@ import (
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/sftp"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/sjtu_netdisk"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/smb"
+	_ "github.com/OpenListTeam/OpenList/v4/drivers/streamtape"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/strm"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/teambition"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/teldrive"
