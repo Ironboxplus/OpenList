@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
@@ -80,7 +81,7 @@ func (w *Watcher) check() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	result, err := FetchFromRolling(ctx)
+	result, err := fetchRolling(ctx)
 	if err != nil {
 		utils.Log.Warnf("[frontend] watcher check failed: %v", err)
 		return
@@ -94,6 +95,9 @@ func (w *Watcher) check() {
 	}
 }
 
+// fetchRolling is what a check fetches with (replaced in tests).
+var fetchRolling = FetchFromRolling
+
 // globalWatcher is the singleton watcher instance
 var (
 	globalWatcher *Watcher
@@ -105,6 +109,10 @@ func StartWatcher(onUpdated func()) {
 	watcherMu.Lock()
 	defer watcherMu.Unlock()
 	if globalWatcher != nil {
+		return
+	}
+	if OperatorManagedDist() {
+		utils.Log.Infof("[frontend] dist_dir %q is operator-managed, frontend watcher not started", conf.Conf.DistDir)
 		return
 	}
 	globalWatcher = NewWatcher(onUpdated)

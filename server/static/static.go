@@ -157,6 +157,10 @@ func UpdateIndex() {
 
 // ReloadStatic reloads the static files from disk (called by the watcher after an update)
 func ReloadStatic() {
+	if frontend.OperatorManagedDist() {
+		// dist_dir names a directory the operator maintains; never replace it.
+		return
+	}
 	utils.Log.Info("[static] reloading static files after frontend update...")
 	distPath := filepath.Join(frontend.GetDistPath(), "dist")
 	staticFS.swap(os.DirFS(distPath))

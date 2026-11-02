@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -476,8 +477,44 @@ func EnsureDist(ctx context.Context) string {
 }
 
 func shouldAutoFetch() bool {
+	if OperatorManagedDist() {
+		return false
+	}
 	v := conf.WebVersion
 	return v == "" || v == "rolling" || v == "beta" || v == "dev"
+}
+
+// OperatorManagedDist reports whether dist_dir points at a directory the
+// operator maintains: then nothing may be fetched and the served files must not
+// be swapped for a fetched copy. dist_dir that is empty, or that is the
+// watcher's own directory (GetDistPath()/dist, which deployments set so the
+// fetched frontend is also what dist_dir names), is not operator-managed and
+// keeps receiving updates.
+func OperatorManagedDist() bool {
+	if conf.Conf == nil || strings.TrimSpace(conf.Conf.DistDir) == "" {
+		return false
+	}
+	return !samePath(conf.Conf.DistDir, filepath.Join(GetDistPath(), distDirName))
+}
+
+// samePath compares two paths as absolute, cleaned (and, when they exist,
+// symlink-resolved) paths; case-insensitively on Windows.
+func samePath(a, b string) bool {
+	norm := func(p string) string {
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		p = filepath.Clean(p)
+		if resolved, err := filepath.EvalSymlinks(p); err == nil {
+			p = resolved
+		}
+		return p
+	}
+	na, nb := norm(a), norm(b)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(na, nb)
+	}
+	return na == nb
 }
 
 // Ensure the directory exists for the frontend dist
