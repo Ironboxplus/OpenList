@@ -30,24 +30,35 @@ func TestBB2_HolderDownFollowerTakesOverPullsFirstRefreshesOnce(t *testing.T) {
 	prime(t, c, n2)
 	pollers := []*poller{startPoller(n1), startPoller(n3)}
 
-	// Who should take over: the survivors ranked by node id (none preferred, both working).
-	expect, other := n1, n3
+	// The survivors are ranked by node id (none preferred, both working), but a
+	// claim also needs a recently heard link, so the better ranked one can lose
+	// by a frame's phase. Either survivor may take over; they must agree.
+	ranked, other := n1, n3
 	if n3.nodeID < n1.nodeID {
-		expect, other = n3, n1
+		ranked, other = n3, n1
 	}
 	before := c.emu.Stats().RefreshOK
 	killedAt := time.Now()
 	n2.stop() // killed by PID: no graceful lease release
-	record(t, "killed refresher n2 (pid %d); expected successor by node-id order: %s", n2.pid(), expect.name)
+	record(t, "killed refresher n2 (pid %d); best ranked successor by node id: %s", n2.pid(), ranked.name)
 
-	waitUntil(t, expect.name+" to take over", 60*time.Second, func() bool {
-		for _, n := range []*node{n1, n3} {
-			if c.holderSeenBy(n) != expect.nodeID {
-				return false
-			}
+	expect := ranked
+	waitUntil(t, "a survivor to take over", 60*time.Second, func() bool {
+		h := c.holderSeenBy(n1)
+		if h == "" || h != c.holderSeenBy(n3) {
+			return false
+		}
+		switch h {
+		case n1.nodeID:
+			expect, other = n1, n3
+		case n3.nodeID:
+			expect, other = n3, n1
+		default:
+			return false // still the dead holder
 		}
 		return true
 	})
+	record(t, "successor %s (best ranked %s)", expect.name, ranked.name)
 	takeover := time.Since(killedAt)
 	record(t, "takeover visible on both survivors %s after the kill (lease TTL %ds)", takeover.Round(100*time.Millisecond), fastTiming.LeaseTTL)
 	if takeover < time.Duration(fastTiming.LeaseTTL)*time.Second {
