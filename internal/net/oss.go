@@ -30,7 +30,8 @@ func NewOSSUploadHttpClient() *http.Client {
 	SetProxyIfConfigured(transport)
 
 	return &http.Client{
-		Timeout:   time.Hour * 48,
-		Transport: transport,
+		Timeout: time.Hour * 48,
+		// same guard as NewHttpClient (cloud metadata addresses); only the timeouts differ
+		Transport: &safeTransport{base: transport},
 	}
 }
