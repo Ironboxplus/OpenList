@@ -15,7 +15,7 @@ import (
 
 func mountFake(t *testing.T, mount string) *fakedriver.Driver {
 	t.Helper()
-	id, err := op.CreateStorage(context.Background(), model.Storage{Driver: fakedriver.DriverName, MountPath: mount, Addition: "{}"})
+	id, err := op.CreateStorage(context.Background(), model.Storage{Driver: fakedriver.DriverName, MountPath: mount, Addition: "{}", CacheExpiration: 30})
 	if err != nil {
 		t.Fatalf("create storage: %v", err)
 	}
