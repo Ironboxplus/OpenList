@@ -169,7 +169,7 @@ func StrmTargets(item *model.MediaItem) []StrmTarget {
 
 	switch item.MediaType {
 	case model.MediaTypeVideo:
-		if item.VideoType == "tv" {
+		if model.IsEpisodicVideo(item.VideoType) {
 			series := title
 			season := item.Season
 			if season <= 0 {

@@ -151,10 +151,10 @@ type embySeries struct {
 }
 
 // isEmbySeriesItem 判断视频条目是否属于剧集。
-// 电视剧按目录扫描（IsFolder=true，带 Episodes 选集），或被刮削为 tv；
-// 其余单文件视频一律按电影处理。仅看 video_type 会把目录型剧集误判为电影。
+// 已识别/刮削的条目按类型判断（tv、anime 为剧集；电影、合集目录不是）；
+// 尚未分类的条目按目录扫描结果判断（IsFolder=true 且带 Episodes 选集即剧集）。
 func isEmbySeriesItem(it *model.MediaItem) bool {
-	return it.IsFolder || it.VideoType == "tv"
+	return it.IsSeries()
 }
 
 func seriesKeyOf(item *model.MediaItem) string {

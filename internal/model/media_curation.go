@@ -60,3 +60,16 @@ type MediaCuration struct {
 	Locked        bool    `gorm:"default:false"   json:"locked"`       // true: scans and scrapes never overwrite the scraped fields
 	Candidates    string  `gorm:"type:text"       json:"candidates"`   // JSON: top candidates when the confidence is low
 }
+
+// IsSeries reports whether a video item is a show: an episodic type, or, for an
+// item no rule or scraper classified yet, any folder (the upstream scan reads a
+// folder as a series).
+func (m *MediaItem) IsSeries() bool {
+	switch m.VideoType {
+	case VideoTypeMovie, VideoTypeCollection, VideoTypeIgnore:
+		return false
+	case "":
+		return m.IsFolder
+	}
+	return IsEpisodicVideo(m.VideoType)
+}
