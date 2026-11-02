@@ -7,12 +7,33 @@ import (
 	"time"
 )
 
+// rotateTTL is the access-token lifetime of the rotateWhileDown scenarios. The
+// refresher rotates proactively at 80% of it; these scenarios assert that
+// recovery made zero provider refreshes over a window, so no proactive rotation
+// may fall inside that window. The long lifetime keeps it out; quietWindow checks
+// the arithmetic so a future change fails loudly instead of flaking.
+const rotateTTL = 240 * time.Second
+
+// quietWindow fails the test unless a window of the given length that starts
+// now cannot contain the refresher's proactive rotation of the pair obtained at
+// rotatedAt (80% of rotateTTL after it, minus a margin for scheduling).
+func quietWindow(t *testing.T, rotatedAt time.Time, window time.Duration) {
+	t.Helper()
+	const margin = 10 * time.Second
+	proactiveAt := rotatedAt.Add(time.Duration(float64(rotateTTL) * 0.8))
+	if end := time.Now().Add(window + margin); !end.Before(proactiveAt) {
+		t.Fatalf("test window (%s + %s margin from now) reaches the proactive rotation point (%s after the rotation): raise rotateTTL",
+			window, margin, proactiveAt.Sub(rotatedAt))
+	}
+}
+
 // rotateWhileDown builds a 3-node cluster, stops n3, lets the refresher rotate
 // the pair (so n3's stored pair is dead on the provider side), waits until the
-// surviving members hold the new pair, and returns the cluster.
-func rotateWhileDown(t *testing.T, name string) (c *cluster, n3 *node) {
+// surviving members hold the new pair, and returns the cluster and the time the
+// rotation was triggered.
+func rotateWhileDown(t *testing.T, name string) (c *cluster, n3 *node, rotatedAt time.Time) {
 	t.Helper()
-	const ttl = 20 * time.Second
+	const ttl = rotateTTL
 	c = buildCluster(t, name, ttl, fastTiming, newBin(t), true, 2)
 	n1, n2 := c.nodes[0], c.nodes[1]
 	n3 = c.nodes[2]
@@ -21,6 +42,7 @@ func rotateWhileDown(t *testing.T, name string) (c *cluster, n3 *node) {
 
 	n3.stop()
 	before, _ := n2.group(c.groupID)
+	rotatedAt = time.Now()
 	c.emu.ExpireAccess()
 	if err := n2.list(); err != nil {
 		t.Fatalf("refresher should recover transparently: %v", err)
@@ -30,14 +52,15 @@ func rotateWhileDown(t *testing.T, name string) (c *cluster, n3 *node) {
 		g2, ok2 := n2.group(c.groupID)
 		return ok1 && ok2 && g2.Version > before.Version && g1.Version == g2.Version
 	})
-	return c, n3
+	return c, n3, rotatedAt
 }
 
 // BB6 (T3): a member is stopped while the pair rotates. When it comes back its
 // stored pair is dead; the group's current pair is already in the cluster and
 // must be applied without anyone calling the provider's refresh again.
 func TestBB6_StoppedMemberRestartsAfterRotationConvergesWithoutRefresh(t *testing.T) {
-	c, n3 := rotateWhileDown(t, "s6-rotate-while-down")
+	c, n3, rotatedAt := rotateWhileDown(t, "s6-rotate-while-down")
+	quietWindow(t, rotatedAt, 60*time.Second) // the longest the wait below can take
 	c.emu.ResetStats()
 	n3 = c.restart(n3)
 	t0 := time.Now()
@@ -58,15 +81,17 @@ func TestBB6_StoppedMemberRestartsAfterRotationConvergesWithoutRefresh(t *testin
 // is when the old event-driven recovery lost its only chance. Recovery must
 // happen within a few resync periods.
 func TestBB7_StartWithExpiredPairAdoptsHeldRecordWithinResync(t *testing.T) {
-	c, n3 := rotateWhileDown(t, "s7-expired-start")
+	c, n3, rotatedAt := rotateWhileDown(t, "s7-expired-start")
+	bound := 4*time.Duration(fastTiming.Resync)*time.Second + 10*time.Second
+	const slowInit = 8 * time.Second
+	quietWindow(t, rotatedAt, bound+slowInit)
 	c.emu.ResetStats()
 	// Init of the restarted node's storage is slowed to 8 s: the cluster hands
 	// over the held record while the storage is still not registered.
-	slow := newSlowEmu(t, c.emuSrv.URL, 8*time.Second)
+	slow := newSlowEmu(t, c.emuSrv.URL, slowInit)
 	n3 = c.restartWith(n3, slow.srv.URL)
 	t0 := time.Now()
 	slow.delay.Store(0)
-	bound := 4*time.Duration(fastTiming.Resync)*time.Second + 10*time.Second
 	waitUntil(t, "the restarted member to recover on its own", bound, func() bool { return n3.list() == nil })
 	record(t, "recovered %s after start (resync %ds)", time.Since(t0).Round(100*time.Millisecond), fastTiming.Resync)
 	if st := c.emu.Stats(); st.RefreshCalls != 0 {
