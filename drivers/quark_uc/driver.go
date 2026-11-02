@@ -12,6 +12,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	streamPkg "github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/avast/retry-go"
@@ -35,14 +36,22 @@ func (d *QuarkOrUC) GetAddition() driver.Additional {
 
 func (d *QuarkOrUC) Init(ctx context.Context) error {
 	_, err := d.request("/config", http.MethodGet, nil, nil)
-	if err == nil {
-		if d.AdditionVersion != 2 {
-			d.AdditionVersion = 2
+	if err == nil && d.AdditionVersion != 3 {
+		if d.AdditionVersion < 2 {
 			if !d.UseTransCodingAddress && len(d.DownProxyURL) == 0 {
 				d.WebProxy = true
 				d.WebdavPolicy = "native_proxy"
 			}
 		}
+		// storages from before these two options get the old fixed values, so behavior is unchanged
+		if d.DownConcurrency <= 0 {
+			d.DownConcurrency = 3
+		}
+		if d.DownPartSize <= 0 {
+			d.DownPartSize = 10
+		}
+		d.AdditionVersion = 3
+		op.MustSaveDriverStorage(d)
 	}
 	return err
 }

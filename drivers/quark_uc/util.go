@@ -124,16 +124,30 @@ func (d *QuarkOrUC) getDownloadLink(file model.Obj) (*model.Link, error) {
 		return nil, err
 	}
 
-	return &model.Link{
+	link := &model.Link{
 		URL: resp.Data[0].DownloadUrl,
 		Header: http.Header{
 			"Cookie":     []string{d.Cookie},
 			"Referer":    []string{d.conf.referer},
 			"User-Agent": []string{ua},
 		},
-		Concurrency: 3,
-		PartSize:    10 * utils.MB,
-	}, nil
+	}
+	d.applyLinkLimit(link)
+	return link, nil
+}
+
+// applyLinkLimit sets the ranged download parameters from the storage options;
+// DownConcurrency 0 means no forced ranged download.
+func (d *QuarkOrUC) applyLinkLimit(link *model.Link) {
+	if d.DownConcurrency <= 0 {
+		return
+	}
+	partSize := d.DownPartSize
+	if partSize <= 0 {
+		partSize = 10
+	}
+	link.Concurrency = d.DownConcurrency
+	link.PartSize = partSize * utils.MB
 }
 
 func (d *QuarkOrUC) getTranscodingLink(file model.Obj) (*model.Link, error) {
@@ -155,12 +169,12 @@ func (d *QuarkOrUC) getTranscodingLink(file model.Obj) (*model.Link, error) {
 
 	for _, info := range resp.Data.VideoList {
 		if info.VideoInfo.URL != "" {
-			return &model.Link{
+			link := &model.Link{
 				URL:           info.VideoInfo.URL,
 				ContentLength: info.VideoInfo.Size,
-				Concurrency:   3,
-				PartSize:      10 * utils.MB,
-			}, nil
+			}
+			d.applyLinkLimit(link)
+			return link, nil
 		}
 	}
 
