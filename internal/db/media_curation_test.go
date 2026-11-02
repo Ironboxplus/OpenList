@@ -10,7 +10,7 @@ import (
 func newCurationDB(t *testing.T) {
 	t.Helper()
 	db = openTestDB(t, "x_")
-	if err := db.AutoMigrate(&model.MediaItem{}); err != nil {
+	if err := db.AutoMigrate(&model.MediaItem{}, &model.MediaRating{}, &model.MediaEpisode{}); err != nil {
 		t.Fatal(err)
 	}
 }

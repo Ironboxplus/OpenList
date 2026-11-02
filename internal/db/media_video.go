@@ -102,7 +102,7 @@ func ListVideoCoversUnder(prefix string, limit int) ([]model.MediaItem, error) {
 	err := db.Model(&model.MediaItem{}).
 		Select("id", "media_type", "folder_path", "file_name", "scraped_name", "release_date", "cover", "hidden").
 		Where("media_type = ? AND hidden = ? AND cover <> ''", model.MediaTypeVideo, false).
-		Where(`folder_path = ? OR folder_path LIKE ? ESCAPE ''`, prefix, escapeLike(strings.TrimSuffix(prefix, "/")+"/")+"%").
+		Where(`folder_path = ? OR folder_path LIKE ? ESCAPE '\'`, prefix, escapeLike(strings.TrimSuffix(prefix, "/")+"/")+"%").
 		Order("(release_date = '' OR release_date IS NULL), release_date, COALESCE(NULLIF(scraped_name, ''), file_name), folder_path, file_name").
 		Limit(limit).Find(&items).Error
 	return items, err

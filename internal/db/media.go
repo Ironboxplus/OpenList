@@ -119,7 +119,8 @@ func mediaItemsWhere(tx *gorm.DB, q MediaItemQuery) *gorm.DB {
 	}
 	if q.PathPrefix != "" {
 		prefix := strings.TrimSuffix(q.PathPrefix, "/") + "/"
-		tx = tx.Where(`folder_path LIKE ? ESCAPE '\'`, escapeLike(prefix)+"%")
+		// an item directly in the base path has folder_path equal to it, which counts too
+		tx = tx.Where(`(folder_path = ? OR folder_path LIKE ? ESCAPE '\')`, strings.TrimSuffix(q.PathPrefix, "/"), escapeLike(prefix)+"%")
 	}
 	if q.Hidden != nil {
 		tx = tx.Where("hidden = ?", *q.Hidden)
