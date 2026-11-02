@@ -52,6 +52,9 @@ const (
 	ForwardDirectLinkParams = "forward_direct_link_params"
 	IgnoreDirectLinkParams  = "ignore_direct_link_params"
 	WebauthnLoginEnabled    = "webauthn_login_enabled"
+	MaxDevices              = "max_devices"
+	DeviceEvictPolicy       = "device_evict_policy"
+	DeviceSessionTTL        = "device_session_ttl"
 	SharePreview            = "share_preview"
 	ShareArchivePreview     = "share_archive_preview"
 	ShareForceProxy         = "share_force_proxy"
@@ -281,4 +284,6 @@ const (
 	DirectUploadContentTypeKey
 	SkipNoOverwriteKey
 	ThumbnailBaseURLKey
+	// SessionIDKey holds the session ID (jti) of the JWT that authenticated the request.
+	SessionIDKey
 )

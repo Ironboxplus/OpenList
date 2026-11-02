@@ -17,6 +17,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/frontend"
 	"github.com/OpenListTeam/OpenList/v4/internal/plugin"
+	"github.com/OpenListTeam/OpenList/v4/internal/session"
 	"github.com/OpenListTeam/OpenList/v4/internal/stats"
 	"github.com/OpenListTeam/OpenList/v4/internal/transcode"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
@@ -44,6 +45,7 @@ func Init() {
 	InitUpgradePatch()
 	InitPlugins()
 	InitClusterSync()
+	session.StartCleanup()
 }
 
 func Release() {
@@ -52,6 +54,7 @@ func Release() {
 	}
 	// Before the database closes: the last minute of traffic is still pending.
 	stats.Stop()
+	session.Stop()
 	db.Close()
 }
 

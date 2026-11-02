@@ -111,12 +111,12 @@ func FinishAuthnLogin(c *gin.Context) {
 		return
 	}
 
-	token, err := common.GenerateToken(user)
+	token, sessionID, err := common.IssueSession(c, user)
 	if err != nil {
-		common.ErrorResp(c, err, 400, true)
+		common.ErrorResp(c, err, common.SessionErrCode(err, 400), true)
 		return
 	}
-	common.SuccessResp(c, gin.H{"token": token})
+	common.SuccessResp(c, gin.H{"token": token, "session_id": sessionID})
 }
 
 func BeginAuthnRegistration(c *gin.Context) {

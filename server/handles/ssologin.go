@@ -397,9 +397,9 @@ func OIDCLoginCallback(c *gin.Context) {
 				return
 			}
 		}
-		token, err := common.GenerateToken(user)
+		token, _, err := common.IssueSession(c, user)
 		if err != nil {
-			common.ErrorResp(c, err, 400)
+			common.ErrorResp(c, err, common.SessionErrCode(err, 400))
 			return
 		}
 		if useCompatibility {
@@ -559,9 +559,9 @@ func SSOLoginCallback(c *gin.Context) {
 			return
 		}
 	}
-	token, err := common.GenerateToken(user)
+	token, _, err := common.IssueSession(c, user)
 	if err != nil {
-		common.ErrorResp(c, err, 400)
+		common.ErrorResp(c, err, common.SessionErrCode(err, 400))
 		return
 	}
 	if usecompatibility {

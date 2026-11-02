@@ -11,6 +11,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/plugin"
+	"github.com/OpenListTeam/OpenList/v4/internal/session"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/OpenListTeam/go-cache"
 	"github.com/gin-gonic/gin"
@@ -78,12 +79,12 @@ func loginHash(c *gin.Context, req *LoginReq) {
 		}
 	}
 	// generate token
-	token, err := common.GenerateToken(user)
+	token, sessionID, err := common.IssueSession(c, user)
 	if err != nil {
-		common.ErrorResp(c, err, 500, true)
+		common.ErrorResp(c, err, common.SessionErrCode(err, 500), true)
 		return
 	}
-	common.SuccessResp(c, gin.H{"token": token})
+	common.SuccessResp(c, gin.H{"token": token, "session_id": sessionID})
 	model.LoginCache.Del(ip)
 	plugin.FireHook(plugin.HookUserLoginAfter, map[string]any{"username": user.Username})
 }
@@ -212,11 +213,15 @@ func Verify2FA(c *gin.Context) {
 	}
 }
 
+// LogOut ends the session of the token that made the request. The static admin
+// token and guests have no session, so there is nothing to end.
 func LogOut(c *gin.Context) {
-	err := common.InvalidateToken(c.GetHeader("Authorization"))
-	if err != nil {
-		common.ErrorResp(c, err, 500)
-	} else {
-		common.SuccessResp(c)
+	if id, ok := c.Request.Context().Value(conf.SessionIDKey).(string); ok && id != "" {
+		user := c.Request.Context().Value(conf.UserKey).(*model.User)
+		if _, err := session.Revoke(user.ID, id); err != nil {
+			common.ErrorResp(c, err, 500)
+			return
+		}
 	}
+	common.SuccessResp(c)
 }

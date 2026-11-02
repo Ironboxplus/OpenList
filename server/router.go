@@ -99,6 +99,8 @@ func Init(e *gin.Engine) {
 	auth.POST("/auth/2fa/generate", handles.Generate2FA)
 	auth.POST("/auth/2fa/verify", handles.Verify2FA)
 	auth.GET("/auth/logout", handles.LogOut)
+	auth.GET("/me/sessions", handles.ListMySessions)
+	auth.POST("/me/sessions/evict", handles.EvictMySession)
 
 	// auth
 	api.GET("/auth/sso", handles.SSOLoginRedirect)
@@ -197,6 +199,9 @@ func userManage(g *gin.RouterGroup) {
 }
 
 func admin(g *gin.RouterGroup) {
+	sessions := g.Group("/session")
+	sessions.GET("/list", handles.ListSessions)
+	sessions.POST("/evict", handles.EvictSession)
 	meta := g.Group("/meta")
 	meta.GET("/list", handles.ListMetas)
 	meta.GET("/get", handles.GetMeta)

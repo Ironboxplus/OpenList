@@ -4,11 +4,14 @@ import (
 	"crypto/subtle"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/internal/session"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
+	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -69,10 +72,33 @@ func Auth(allowDisabledGuest bool) func(c *gin.Context) {
 			c.Abort()
 			return
 		}
+		if !checkSession(c, userClaims, user) {
+			return
+		}
 		common.GinAppendValues(c, conf.UserKey, user)
 		log.Debugf("use login token: %+v", user)
 		c.Next()
 	}
+}
+
+// checkSession ties a JWT to its login session: a token whose session was
+// revoked (logout, evicted device, idle past device_session_ttl) or that has
+// none (issued before sessions existed) answers 401, which the web UI turns
+// into the login page. Only JWT logins go through here; the static admin
+// token, guests and every non-HTTP-login protocol do not have sessions.
+func checkSession(c *gin.Context, claims *common.UserClaims, user *model.User) bool {
+	err := session.Check(claims.ID, user.ID, session.Meta{UserAgent: c.Request.UserAgent(), IP: c.ClientIP()})
+	if err == nil {
+		common.GinAppendValues(c, conf.SessionIDKey, claims.ID)
+		return true
+	}
+	if errors.Is(err, errs.SessionInactive) {
+		common.ErrorStrResp(c, "Session revoked, login please", 401)
+	} else {
+		common.ErrorResp(c, err, 500)
+	}
+	c.Abort()
+	return false
 }
 
 func Authn(c *gin.Context) {
@@ -122,6 +148,9 @@ func Authn(c *gin.Context) {
 	if user.Disabled {
 		common.ErrorStrResp(c, "Current user is disabled, replace please", 401)
 		c.Abort()
+		return
+	}
+	if !checkSession(c, userClaims, user) {
 		return
 	}
 	common.GinAppendValues(c, conf.UserKey, user)
