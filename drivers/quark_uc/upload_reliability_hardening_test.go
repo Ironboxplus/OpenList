@@ -154,11 +154,11 @@ func TestUpPartReliableRetriesAuthBeforeSendingOSSOnce(t *testing.T) {
 		})
 	}))
 
-	oldClient := base.RestyClient
-	defer func() { base.RestyClient = oldClient }()
+	oldClient := base.HttpClient
+	defer func() { base.HttpClient = oldClient }()
 	ossCalls := 0
 	var gotBody string
-	base.RestyClient = resty.NewWithClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	base.HttpClient = (&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		ossCalls++
 		body, err := io.ReadAll(req.Body)
 		if err != nil {
@@ -202,10 +202,10 @@ func TestUpPartReliableDoesNotRetryOSSError(t *testing.T) {
 		})
 	}))
 
-	oldClient := base.RestyClient
-	defer func() { base.RestyClient = oldClient }()
+	oldClient := base.HttpClient
+	defer func() { base.HttpClient = oldClient }()
 	ossCalls := 0
-	base.RestyClient = resty.NewWithClient(&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+	base.HttpClient = (&http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		ossCalls++
 		return ossResponse(req, http.StatusInternalServerError, "inner error, requestId oss-1", nil), nil
 	})})

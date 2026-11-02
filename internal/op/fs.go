@@ -15,6 +15,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/singleflight"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+	"github.com/OpenListTeam/go-cache"
 	"github.com/bmatcuk/doublestar/v4"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
@@ -22,6 +23,62 @@ import (
 )
 
 var listG singleflight.Group[[]model.Obj]
+
+const recentWriteConsistencyWindow = time.Minute
+
+// recentWriteCache bridges a short write-after-read consistency window for
+// drivers that return an authoritative object from Put/Move/Rename. Entries are
+// bound to the stable identity of the parent directory, not its path, so a
+// stale child cannot be rebound to a newly-created same-name directory after
+// the original parent is moved, renamed, or removed. (AList bfa46d22)
+var recentWriteCache = cache.NewMemCache(cache.WithShards[model.Obj](64))
+
+func recentWriteIdentityKey(storage *model.Storage, parentID, name string) (string, bool) {
+	if storage == nil || parentID == "" || name == "" {
+		return "", false
+	}
+	// Storage ID plus MountPath isolates both concurrent mounts and a newly
+	// created storage that reuses a recently removed mount path. NUL cannot
+	// occur in provider object names or IDs, so it is an unambiguous separator.
+	return strconv.FormatUint(uint64(storage.ID), 10) + "\x00" + storage.MountPath + "\x00" + parentID + "\x00" + name, true
+}
+
+func recentWriteKey(storage driver.Driver, parent model.Obj, name string) (string, bool) {
+	if parent == nil {
+		return "", false
+	}
+	return recentWriteIdentityKey(storage.GetStorage(), parent.GetID(), name)
+}
+
+func setRecentWrite(storage driver.Driver, parent model.Obj, obj model.Obj) {
+	if obj == nil || obj.GetID() == "" {
+		return
+	}
+	key, ok := recentWriteKey(storage, parent, obj.GetName())
+	if !ok {
+		return
+	}
+	recentWriteCache.Set(key, obj, cache.WithEx[model.Obj](recentWriteConsistencyWindow))
+}
+
+func delRecentWrite(storage driver.Driver, parent model.Obj, name string) {
+	key, ok := recentWriteKey(storage, parent, name)
+	if ok {
+		recentWriteCache.Del(key)
+	}
+}
+
+func getRecentWrite(ctx context.Context, storage driver.Driver, dirPath, name string) (model.Obj, bool) {
+	parent, err := GetUnwrap(ctx, storage, dirPath)
+	if err != nil {
+		return nil, false
+	}
+	key, ok := recentWriteKey(storage, parent, name)
+	if !ok {
+		return nil, false
+	}
+	return recentWriteCache.Get(key)
+}
 
 // List files in storage, not contains virtual file
 func List(ctx context.Context, storage driver.Driver, path string, args model.ListArgs) ([]model.Obj, error) {
@@ -215,6 +272,10 @@ func Get(ctx context.Context, storage driver.Driver, path string, excludeTempObj
 		if obj != nil {
 			return obj, nil
 		}
+	}
+	if obj, ok := getRecentWrite(ctx, storage, dir, name); ok {
+		log.Debugf("use recent write when get %s", path)
+		return obj, nil
 	}
 	log.Debugf("cant find obj with name: %s", name)
 	return nil, errors.WithStack(errs.ObjectNotFound)
@@ -438,6 +499,7 @@ func Move(ctx context.Context, storage driver.Driver, srcPath, dstDirPath string
 		return errors.WithStack(errs.PermissionDenied)
 	}
 	srcObj := model.UnwrapObjName(srcRawObj)
+	srcDir, _ := GetUnwrap(ctx, storage, srcDirPath)
 	dstDir, err := GetUnwrap(ctx, storage, dstDirPath)
 	if err != nil {
 		return errors.WithMessage(err, "failed to get dst dir")
@@ -459,6 +521,10 @@ func Move(ctx context.Context, storage driver.Driver, srcPath, dstDirPath string
 		return errors.WithStack(err)
 	}
 
+	delRecentWrite(storage, srcDir, srcRawObj.GetName())
+	if newObj != nil {
+		setRecentWrite(storage, dstDir, wrapObjName(storage, newObj))
+	}
 	srcKey := Key(storage, srcDirPath)
 	dstKey := Key(storage, dstDirPath)
 	if !srcRawObj.IsDir() {
@@ -510,6 +576,7 @@ func Rename(ctx context.Context, storage driver.Driver, srcPath, dstName string)
 	}
 	oldName := srcRawObj.GetName()
 	srcObj := model.UnwrapObjName(srcRawObj)
+	srcDir, _ := GetUnwrap(ctx, storage, stdpath.Dir(srcPath))
 
 	var newObj model.Obj
 	switch s := storage.(type) {
@@ -524,6 +591,10 @@ func Rename(ctx context.Context, storage driver.Driver, srcPath, dstName string)
 		return errors.WithStack(err)
 	}
 
+	delRecentWrite(storage, srcDir, oldName)
+	if newObj != nil {
+		setRecentWrite(storage, srcDir, wrapObjName(storage, newObj))
+	}
 	dirKey := Key(storage, stdpath.Dir(srcPath))
 	if !srcRawObj.IsDir() {
 		Cache.linkCache.DeleteKey(stdpath.Join(dirKey, oldName))
@@ -640,11 +711,13 @@ func Remove(ctx context.Context, storage driver.Driver, path string) error {
 		return errors.WithStack(errs.PermissionDenied)
 	}
 	dirPath := stdpath.Dir(path)
+	parentDir, _ := GetUnwrap(ctx, storage, dirPath)
 
 	switch s := storage.(type) {
 	case driver.Remove:
 		err = s.Remove(ctx, model.UnwrapObjName(rawObj))
 		if err == nil {
+			delRecentWrite(storage, parentDir, rawObj.GetName())
 			Cache.removeDirectoryObject(storage, dirPath, rawObj)
 		}
 	default:
@@ -758,6 +831,9 @@ func PutInDir(ctx context.Context, storage driver.Driver, parentDir model.Obj, d
 	}
 	if err == nil {
 		Cache.linkCache.DeleteKey(Key(storage, dstPath))
+		if newObj != nil {
+			setRecentWrite(storage, parentDir, wrapObjName(storage, newObj))
+		}
 		if !storage.Config().NoCache {
 			if cache, exist := Cache.dirCache.Get(Key(storage, dstDirPath)); exist {
 				if newObj == nil {
