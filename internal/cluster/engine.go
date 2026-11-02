@@ -16,6 +16,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
+	"k8s.io/client-go/util/workqueue"
 )
 
 const (
@@ -48,15 +49,22 @@ type Manager struct {
 
 	recoveryMu          sync.Mutex
 	recoveryLocks       map[string]*sync.Mutex // per local mount: serialize credential adoption
-	recoveryQueues      map[string]*recoveryQueue
-	recoveryRetries     map[string]struct{} // (group, mount, credential) delayed retries
 	candidateRetryDelay time.Duration
 	probeCredentialFn   func(context.Context, model.Storage, string) error
+
+	// The reconcile queue is created on first use (see reconcileQueue), so a
+	// Manager that never saw an event costs nothing.
+	savedMu  sync.Mutex
+	saved    map[string]savedPair // mount -> pair the storage was last updated to
+	queueMu  sync.Mutex
+	queue    workqueue.TypedRateLimitingInterface[string]
+	pullMu   sync.Mutex
+	lastPull map[string]time.Time // group -> last pull request, for the cooldown
 
 	dialMu sync.Mutex
 	dials  map[string]*dialState // peer URL -> redial bookkeeping
 
-	links      linkBook     // per-peer link health history
+	links      linkBook // per-peer link health history
 	refr       refresherState
 	deliveries deliveryBook // credential versions awaiting member confirmation
 
@@ -68,15 +76,6 @@ type Manager struct {
 
 	stopCh chan struct{}
 	once   sync.Once
-}
-
-// recoveryQueue is one mount's event-driven recovery mailbox. It deliberately
-// contains no timer: a pair is enqueued by an observed 401, a newly received
-// signed candidate, or startup reconstruction. The source of truth remains the
-// durable candidate/tombstone state, so a crash can safely rebuild this queue.
-type recoveryQueue struct {
-	running bool
-	pending map[string]*credRecord // credential hash -> immutable signed candidate
 }
 
 // Default is the process-wide manager, set by Init. It is nil when cluster sync
@@ -95,25 +94,25 @@ func Init(dataDir string) (*Manager, error) {
 		return nil, err
 	}
 	m := &Manager{
-		dir:             dir,
-		id:              id,
-		cfgStore:        newConfigStore(dir),
-		state:           newStore(),
-		replay:          newReplayCache(replayWindowSec),
-		conns:           newConnRegistry(),
-		dials:           make(map[string]*dialState),
-		recoveryLocks:   make(map[string]*sync.Mutex),
-		recoveryQueues:  make(map[string]*recoveryQueue),
-		recoveryRetries: make(map[string]struct{}),
-		stopCh:          make(chan struct{}),
+		dir:           dir,
+		id:            id,
+		cfgStore:      newConfigStore(dir),
+		state:         newStore(),
+		replay:        newReplayCache(replayWindowSec),
+		conns:         newConnRegistry(),
+		dials:         make(map[string]*dialState),
+		recoveryLocks: make(map[string]*sync.Mutex),
+		stopCh:        make(chan struct{}),
 	}
 	if _, err := m.cfgStore.loadOrInit(); err != nil {
 		return nil, err
 	}
 	m.loadState()
+	m.loadSaved()
 	m.state.revRetentionSec = m.cfgStore.get().revocationRetentionSec()
 
 	op.RegisterStorageHook(m.onStorageHook)
+	op.RegisterStoragePreSaveHook(m.onStoragePreSave)
 	op.RegisterStorageCredentialHook(m.onStorageCredential)
 	op.RegisterStorageCredentialHealthHook(m.onStorageCredentialHealthy)
 	// Only the group's lease holder may spend a single-use refresh_token.
@@ -197,7 +196,7 @@ func (m *Manager) SetConfig(c Config) error {
 	// Drop all live connections so they reconnect with the new settings.
 	m.conns.closeAll(reasonConfig)
 	go m.refreshInventory()
-	go m.seedLocalCreds()
+	m.enqueueAll()
 	return nil
 }
 
@@ -239,7 +238,7 @@ func (m *Manager) SetGroups(specs []GroupSpec) error {
 	m.recordEvent("groups", "", fmt.Sprintf("updated to %d group(s)", len(groups)))
 	gd := d
 	m.broadcast(&syncMessage{Type: "push", Groups: &gd})
-	go m.seedLocalCreds()
+	m.enqueueAll()
 	return nil
 }
 
@@ -250,7 +249,8 @@ func (m *Manager) SetGroups(specs []GroupSpec) error {
 func (m *Manager) Start() {
 	m.once.Do(func() {
 		m.state.setLocalInventory(m.selfNodeInfo())
-		go m.seedLocalCreds()
+		m.enqueueAll()
+		go m.resyncLoop()
 		go m.announceLoop()
 		go m.dialSupervisor()
 		go m.refresherLoop()
@@ -265,6 +265,7 @@ func (m *Manager) Stop() {
 		close(m.stopCh)
 	}
 	m.conns.closeAll(reasonShutdown)
+	m.reconcileQueue().ShutDown()
 }
 
 // ---- self inventory ----
@@ -324,7 +325,7 @@ func (m *Manager) knownNodesForPEX() []*nodeInfo {
 	return out
 }
 
-/// helloMessage greets a freshly-connected peer with everything needed to
+// / helloMessage greets a freshly-connected peer with everything needed to
 // converge: our inventory, known dialable peers (PEX), the groups doc, our
 // credential digests, the refresher leases/policies and a revocation digest.
 func (m *Manager) helloMessage() *syncMessage {
@@ -375,32 +376,6 @@ func (m *Manager) announceLoop() {
 
 // ---- credential seeding / hooks ----
 
-// seedLocalCreds reconciles every locally failed mount after startup or a group
-// change. A persisted Storage.Status=WORK is not proof that its credential pair
-// is still accepted by the provider, so startup never mints a fresh candidate
-// from it; however, a persisted non-WORK mount must retry durable peer
-// candidates even when they arrived before this process started.
-func (m *Manager) seedLocalCreds() {
-	cfg := m.cfgStore.get()
-	if !cfg.active() {
-		return
-	}
-	selfID := m.id.NodeID
-	for _, d := range op.GetAllStorages() {
-		st := d.GetStorage()
-		groups := m.state.groupsForMount(selfID, st.MountPath)
-		if len(groups) == 0 {
-			continue
-		}
-		for _, g := range groups {
-			if st.Status != op.WORK {
-				m.enqueueKnownCandidates(g.ID, st.MountPath, credHash(extractCreds(st.Addition)))
-			}
-			m.pullGroup(g.ID)
-		}
-	}
-}
-
 // revokeOwnCandidate removes the local source candidate and returns a signed
 // tombstone that every relay can retain. The tombstone's version is newer than
 // the removed credential, so an old relay replay cannot re-enter state while a
@@ -419,6 +394,13 @@ func (m *Manager) onStorageHook(typ string, d driver.Driver) {
 	if typ == "token-valid" || typ == "token-invalid" {
 		return
 	}
+	// add/update/del: LoadStorage and UpdateStorage fire this after the storage
+	// is registered, so a reconcile queued earlier for a not-yet-registered mount
+	// is satisfied here at the latest.
+	if typ == "del" {
+		m.forgetSaved(d.GetStorage().MountPath)
+	}
+	m.enqueueMount(d.GetStorage().MountPath)
 	go m.refreshInventory()
 }
 
@@ -440,12 +422,13 @@ func (m *Manager) onStorageCredential(typ string, event op.StorageCredentialEven
 		return
 	}
 
+	// Whatever the result, the mount's desired state may now differ from its
+	// actual state. The reconcile loop decides; this handler only wakes it.
+	defer m.enqueueMount(st.MountPath)
+
 	switch typ {
 	case "token-valid":
 		if st.Status != op.WORK {
-			for _, g := range groups {
-				m.pullGroup(g.ID)
-			}
 			return
 		}
 		creds := extractCreds(event.Addition)
@@ -514,10 +497,6 @@ func (m *Manager) onStorageCredential(typ string, event op.StorageCredentialEven
 					rev.GroupID, shortHash(rev.CredHash), rev.Version, shortNode(rev.Origin), rev.OriginMount, m.linkCount())
 			}
 		}
-		for _, g := range groups {
-			m.enqueueKnownCandidates(g.ID, st.MountPath, credID)
-			m.pullGroup(g.ID)
-		}
 	}
 }
 
@@ -540,168 +519,6 @@ func (m *Manager) onStorageCredentialHealthy(event op.StorageCredentialEvent) {
 		if m.state.hasCredHash(g.ID, credID) {
 			m.state.markCandidateHealthy(g.ID, credID, now())
 			m.state.clearCandidateFailed(g.ID, st.MountPath, credID)
-		}
-	}
-}
-
-// enqueueKnownCandidates rebuilds a failed mount's durable recovery work. It is
-// used after a local 401 and after restart; it never creates candidates or
-// refreshes a token.
-func (m *Manager) enqueueKnownCandidates(groupID, mount, failedHash string) {
-	for _, candidate := range m.state.recoveryCandidates(groupID, mount, failedHash) {
-		m.enqueueCandidate(candidate, mount)
-	}
-}
-
-// enqueueCandidate queues one newly learned, signed candidate for one local
-// mount. A queue is keyed by credential hash, so duplicate frames and relay
-// paths cannot create probe storms. The worker is per (group, mount), making
-// activation deterministic and serial with storage replacement.
-func (m *Manager) enqueueCandidate(candidate *credRecord, mount string) {
-	if candidate == nil || mount == "" || !m.credentialAuthorized(candidate) {
-		return
-	}
-	key := candidate.GroupID + "\x00" + mount
-	m.recoveryMu.Lock()
-	if m.recoveryQueues == nil {
-		m.recoveryQueues = make(map[string]*recoveryQueue)
-	}
-	queue := m.recoveryQueues[key]
-	if queue == nil {
-		queue = &recoveryQueue{pending: make(map[string]*credRecord)}
-		m.recoveryQueues[key] = queue
-	}
-	if _, exists := queue.pending[candidate.CredHash]; !exists {
-		cp := *candidate
-		queue.pending[candidate.CredHash] = &cp
-	}
-	if queue.running {
-		m.recoveryMu.Unlock()
-		return
-	}
-	queue.running = true
-	m.recoveryMu.Unlock()
-	go m.runCandidateRecovery(key, candidate.GroupID, mount)
-}
-
-func (m *Manager) takeCandidate(key string) *credRecord {
-	m.recoveryMu.Lock()
-	defer m.recoveryMu.Unlock()
-	queue := m.recoveryQueues[key]
-	if queue == nil {
-		return nil
-	}
-	if len(queue.pending) == 0 {
-		queue.running = false
-		delete(m.recoveryQueues, key)
-		return nil
-	}
-	hashes := make([]string, 0, len(queue.pending))
-	for hash := range queue.pending {
-		hashes = append(hashes, hash)
-	}
-	sort.Strings(hashes)
-	candidate := queue.pending[hashes[0]]
-	delete(queue.pending, hashes[0])
-	return candidate
-}
-
-func (m *Manager) finishCandidateRecovery(key string) {
-	m.recoveryMu.Lock()
-	defer m.recoveryMu.Unlock()
-	delete(m.recoveryQueues, key)
-}
-
-// scheduleCandidateRetry keeps one delayed retry per credential and mount.
-// 40140117 is a provider cooldown, so retrying immediately with a new SDK
-// client would only extend the throttle; dropping the work item would leave a
-// still-valid catalogued pair dormant until restart.
-func (m *Manager) scheduleCandidateRetry(candidate *credRecord, mount string) {
-	if candidate == nil || mount == "" {
-		return
-	}
-	retryKey := candidate.GroupID + "\x00" + mount + "\x00" + candidate.CredHash
-	m.recoveryMu.Lock()
-	if m.recoveryRetries == nil {
-		m.recoveryRetries = make(map[string]struct{})
-	}
-	if _, exists := m.recoveryRetries[retryKey]; exists {
-		m.recoveryMu.Unlock()
-		return
-	}
-	m.recoveryRetries[retryKey] = struct{}{}
-	delay := m.candidateRetryDelay
-	if delay <= 0 {
-		delay = defaultCandidateRetryDelay
-	}
-	stopCh := m.stopCh
-	cp := *candidate
-	m.recoveryMu.Unlock()
-
-	go func() {
-		timer := time.NewTimer(delay)
-		defer timer.Stop()
-		select {
-		case <-timer.C:
-		case <-stopCh:
-			m.recoveryMu.Lock()
-			delete(m.recoveryRetries, retryKey)
-			m.recoveryMu.Unlock()
-			return
-		}
-		m.recoveryMu.Lock()
-		delete(m.recoveryRetries, retryKey)
-		m.recoveryMu.Unlock()
-		select {
-		case <-stopCh:
-			return
-		default:
-		}
-		if !m.state.hasCredHash(cp.GroupID, cp.CredHash) || m.state.candidateFailed(cp.GroupID, mount, cp.CredHash) {
-			return
-		}
-		storage, err := op.GetStorageByMountPath(mount)
-		if err != nil || storage.GetStorage().Status == op.WORK {
-			return
-		}
-		m.enqueueCandidate(&cp, mount)
-	}()
-}
-
-// runCandidateRecovery is the only place a received candidate may become the
-// mount's active storage. A successful probe stops the queue; a terminal
-// provider 401 emits a durable group-wide tombstone before the next candidate
-// is attempted. A 40140117 refresh throttle is retryable and must keep the
-// candidate catalogued.
-func (m *Manager) runCandidateRecovery(key, groupID, mount string) {
-	for {
-		candidate := m.takeCandidate(key)
-		if candidate == nil {
-			return
-		}
-		if !m.credentialAuthorized(candidate) {
-			continue
-		}
-		attempted, success, terminal, retryable := m.applyCredRecordToMount(candidate, mount)
-		if success {
-			m.finishCandidateRecovery(key)
-			return
-		}
-		if retryable {
-			m.scheduleCandidateRetry(candidate, mount)
-			continue
-		}
-		if !attempted || !terminal {
-			continue
-		}
-		if rev, revoked := m.state.revokePair(m.id, groupID, mount, candidate.CredHash, now()); revoked {
-			m.recordEvent("invalidate", groupID,
-				fmt.Sprintf("%s rejected candidate %s with provider 401", mount, shortHash(candidate.CredHash)))
-			if err := m.persist(); err != nil {
-				utils.Log.Errorf("[cluster] not relaying unpersisted candidate rejection for %s: %v", mount, err)
-				return
-			}
-			m.broadcast(&syncMessage{Type: "push", Revocations: []*credRevocation{rev}})
 		}
 	}
 }
@@ -783,107 +600,6 @@ func (m *Manager) recoveryLock(mount string) *sync.Mutex {
 	return lock
 }
 
-// applyCredRecord overlays a group's credential onto this node's member mounts.
-func (m *Manager) applyCredRecord(r *credRecord) {
-	if r == nil {
-		return
-	}
-	cfg := m.cfgStore.get()
-	if !cfg.ApplyRemote {
-		return
-	}
-	g, ok := m.state.groupByID(r.GroupID)
-	if !ok {
-		return
-	}
-	for _, mp := range g.mountsForNode(m.id.NodeID) {
-		m.applyCredRecordToMount(r, mp)
-	}
-}
-
-// applyCredRecordToMount adopts one candidate on one local mount. It returns
-// whether a probe was attempted, whether activation completed, whether the
-// probe received a terminal provider-auth 401, and whether it received the
-// retryable 40140117 throttle. Candidate payloads are verified by a temporary
-// real driver before production storage is changed.
-func (m *Manager) applyCredRecordToMount(r *credRecord, mp string) (attempted, success, terminal, retryable bool) {
-	if r == nil || !m.cfgStore.get().ApplyRemote || m.state.candidateFailed(r.GroupID, mp, r.CredHash) {
-		return false, false, false, false
-	}
-	ctx := context.Background()
-	{
-		lock := m.recoveryLock(mp)
-		lock.Lock()
-		defer lock.Unlock()
-		d, err := op.GetStorageByMountPath(mp)
-		if err != nil {
-			return false, false, false, false
-		}
-		before := *d.GetStorage() // preserve a local LKG for rollback
-		st := before
-		if r.OriginDriver != "" && st.Driver != r.OriginDriver {
-			utils.Log.Warnf("[cluster] skip applying %s creds to %s: driver mismatch (%s != %s)",
-				r.GroupID, mp, st.Driver, r.OriginDriver)
-			return false, false, false, false
-		}
-		if st.Status == op.WORK && r.Origin == m.id.NodeID {
-			// A self-authored record can only reach here via a relay echo
-			// (anti-entropy reply): it is never authority over itself, and
-			// applyCreds below reports changed=false once the payloads match
-			// anyway. Skip before paying for a probe.
-			return false, false, false, false
-		}
-		// WORK is not proof this mount's credential pair is still accepted by
-		// the provider: 115's refresh_token rotates on use, so a peer's
-		// successful refresh may already have killed this mount's own pair on
-		// the provider side before this node ever sees a local 401. A WORK
-		// mount must therefore be able to actively adopt a peer-authored
-		// candidate instead of waiting to fail on its own first — the
-		// temporary-driver probe below, not local status, is what proves a
-		// candidate live before it ever touches production storage.
-		//
-		// A live probe only proves the candidate works right now, not that it
-		// is newer: access_token carries its own TTL, so a pair that already
-		// lost a rotation race can still probe clean for a while even though
-		// its refresh_token was already consumed by whoever rotated past it.
-		// Reject a candidate whose version does not exceed what this node's
-		// own catalogue already has on record for the mount's current pair —
-		// otherwise a WORK mount could regress onto a dead refresh_token, and
-		// two WORK nodes could oscillate adopting each other's stale pairs.
-		if st.Status == op.WORK {
-			if current, ok := m.state.credByHash(r.GroupID, credHash(extractCreds(st.Addition))); ok && current.Version >= r.Version {
-				return false, false, false, false
-			}
-		}
-		newAdd, changed := applyCreds(st.Addition, r.Payload)
-		if !changed {
-			return false, false, false, false // already has these credentials — no churn, no re-init
-		}
-		probe := m.probeCredentialFn
-		if probe == nil {
-			probe = probeCredential
-		}
-		if err := probe(ctx, st, newAdd); err != nil {
-			utils.Log.Warnf("[cluster] probe candidate %s for %s failed: %v", shortHash(r.CredHash), mp, err)
-			return true, false, isProvider401(err), isProviderRefreshThrottle(err)
-		}
-		st.Addition = newAdd
-		if err := op.UpdateStorage(ctx, st); err != nil {
-			utils.Log.Warnf("[cluster] apply creds to %s failed: %v", mp, err)
-			// UpdateStorage persists before it initializes. Restore the complete
-			// previous storage record rather than leaving an unproven pair behind.
-			if rollbackErr := op.UpdateStorage(ctx, before); rollbackErr != nil {
-				utils.Log.Errorf("[cluster] rollback %s after failed candidate commit: %v", mp, rollbackErr)
-			}
-			return true, false, false, false
-		}
-		m.state.markCandidateHealthy(r.GroupID, r.CredHash, now())
-		m.recordEvent("apply", r.GroupID, fmt.Sprintf("%s adopted credentials from %s", mp, shortNode(r.Origin)))
-		utils.Log.Infof("[cluster] applied group %s credentials to %s (v%d from %s)", r.GroupID, mp, r.Version, r.Origin)
-		return true, true, false, false
-	}
-}
-
 // probeCredential constructs the registered production driver in isolation. It
 // runs that driver's actual Init path (115 Open performs UserInfo) without
 // registering it in op's storage map or writing SQLite. A failed candidate thus
@@ -951,7 +667,7 @@ func (m *Manager) absorbGroups(d *groupDoc) bool {
 			return false
 		}
 		m.recordEvent("groups", "", fmt.Sprintf("received %d group(s) from %s", len(d.Groups), shortNode(d.Origin)))
-		go m.seedLocalCreds()
+		m.enqueueAll()
 		return true
 	}
 	return false
@@ -989,16 +705,7 @@ func (m *Manager) absorbCredsFrom(recs []*credRecord, from string) []*credRecord
 			return nil
 		}
 		for _, r := range merged {
-			// A record newly arriving after a local 401 must wake recovery even if
-			// the earlier empty-candidate scan already completed. The queue itself
-			// deduplicates the pair and serializes the real driver probe.
-			g, ok := m.state.groupByID(r.GroupID)
-			if !ok {
-				continue
-			}
-			for _, mount := range g.mountsForNode(m.id.NodeID) {
-				m.enqueueCandidate(r, mount)
-			}
+			m.enqueueGroup(r.GroupID)
 		}
 	}
 	return merged
@@ -1022,6 +729,9 @@ func (m *Manager) absorbRevocations(revs []*credRevocation) []*credRevocation {
 		if err := m.persist(); err != nil {
 			utils.Log.Errorf("[cluster] not relaying unpersisted revocations: %v", err)
 			return nil
+		}
+		for _, rev := range merged {
+			m.enqueueGroup(rev.GroupID)
 		}
 	}
 	return merged
@@ -1132,7 +842,7 @@ func (m *Manager) buildReply(in *syncMessage) *syncMessage {
 
 // ---- networking ----
 
-/// seal wraps a message in an encrypted envelope addressed from this node. The
+// / seal wraps a message in an encrypted envelope addressed from this node. The
 // protocol level is stamped on a copy, so shared messages are never mutated.
 func (m *Manager) seal(msg *syncMessage) ([]byte, error) {
 	key, err := deriveAEADKey([]byte(m.cfgStore.get().Key))

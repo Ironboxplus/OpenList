@@ -229,6 +229,7 @@ func UpdateStorage(ctx context.Context, storage model.Storage) error {
 	}
 	storage.Modified = time.Now()
 	storage.MountPath = utils.FixAndCleanPath(storage.MountPath)
+	callStoragePreSaveHooks(storage)
 	err = db.UpdateStorage(&storage)
 	if err != nil {
 		return errors.WithMessage(err, "failed update storage in database")
@@ -303,6 +304,7 @@ func saveDriverStorage(driver driver.Driver) error {
 		return errors.Wrap(err, "error while marshal addition")
 	}
 	storage.Addition = str
+	callStoragePreSaveHooks(*storage)
 	err = db.UpdateStorage(storage)
 	if err != nil {
 		return errors.WithMessage(err, "failed update storage in database")

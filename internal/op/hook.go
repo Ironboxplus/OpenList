@@ -147,6 +147,24 @@ func RegisterStorageHook(hook StorageHook) {
 	storageHooks = append(storageHooks, hook)
 }
 
+// StoragePreSaveHook runs synchronously just before a storage record is written
+// to the database, with the record about to be written. It lets a listener note
+// what it knew when a new credential pair came into being; the "update" hook
+// only fires after the write, on its own goroutine.
+type StoragePreSaveHook func(storage model.Storage)
+
+var storagePreSaveHooks = make([]StoragePreSaveHook, 0)
+
+func RegisterStoragePreSaveHook(hook StoragePreSaveHook) {
+	storagePreSaveHooks = append(storagePreSaveHooks, hook)
+}
+
+func callStoragePreSaveHooks(storage model.Storage) {
+	for _, hook := range storagePreSaveHooks {
+		hook(storage)
+	}
+}
+
 // RegisterStorageHealthHook receives a cheap proof that an authenticated
 // request succeeded. It is distinct from StorageHook: callers use it for
 // in-memory liveness only, never for database writes or lifecycle work.

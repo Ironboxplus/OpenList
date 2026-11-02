@@ -224,7 +224,24 @@ func TestUnpackRefusesCorruptPack(t *testing.T) {
 	write(t, src, "big.bin", strings.Repeat("B", 3000))
 	// A pack per file, so one bad pack costs one file.
 	mustSucceed(t, runJob(t, m, packSpec(syncjob.ModeCopy, src, packed, syncjob.PackOptions{Threshold: 1024, MaxPackBytes: 1})))
-	f, err := os.OpenFile(filepath.Join(packed, ".oppack", "p-000001.zip"), os.O_APPEND|os.O_WRONLY, 0)
+	// Which pack holds bad/f0.txt depends on the order the files were packed in.
+	badPack := ""
+	for _, name := range packNames(t, packed) {
+		zr, err := zip.OpenReader(filepath.Join(packed, ".oppack", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, zf := range zr.File {
+			if zf.Name == "bad/f0.txt" {
+				badPack = name
+			}
+		}
+		_ = zr.Close()
+	}
+	if badPack == "" {
+		t.Fatal("bad/f0.txt is in no pack")
+	}
+	f, err := os.OpenFile(filepath.Join(packed, ".oppack", badPack), os.O_APPEND|os.O_WRONLY, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

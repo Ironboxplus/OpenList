@@ -14,12 +14,15 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -61,10 +64,10 @@ func freePort(t *testing.T) int {
 // ---- timing knobs given to every node (seconds) ----
 
 type timing struct {
-	LeaseTTL, ReqWait, MinGap, Resend, Announce int
+	LeaseTTL, ReqWait, MinGap, Resend, Announce, Resync int
 }
 
-var fastTiming = timing{LeaseTTL: 6, ReqWait: 4, MinGap: 1, Resend: 3, Announce: 3}
+var fastTiming = timing{LeaseTTL: 6, ReqWait: 4, MinGap: 1, Resend: 3, Announce: 3, Resync: 3}
 
 // ---- node process ----
 
@@ -87,12 +90,16 @@ func (n *node) base() string { return fmt.Sprintf("http://127.0.0.1:%d", n.port)
 type startOpts struct {
 	bin    string
 	emuURL string
+	// keep reuses an existing data directory (a restart) instead of wiping it.
+	keep bool
 }
 
 func startNode(t *testing.T, root, name string, o startOpts) *node {
 	t.Helper()
 	dir := filepath.Join(root, name)
-	_ = os.RemoveAll(dir)
+	if !o.keep {
+		_ = os.RemoveAll(dir)
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -359,6 +366,7 @@ func buildCluster(t *testing.T, name string, ttl time.Duration, tm timing, hubBi
 			cfg["refresh_request_wait_sec"] = tm.ReqWait
 			cfg["proactive_min_gap_sec"] = tm.MinGap
 			cfg["delivery_resend_sec"] = tm.Resend
+			cfg["resync_sec"] = tm.Resync
 		}
 		n.mustDo("POST", "/api/admin/cluster/config", cfg)
 		st, err := n.status()
@@ -501,6 +509,9 @@ const (
 	modePass proxyMode = iota
 	modeStall
 	modeRefuse
+	// modeDrop silently discards every byte in both directions: frames are lost
+	// for good, unlike modeStall which only delays them.
+	modeDrop
 )
 
 // faultProxy is a real TCP proxy between a follower and the hub. It can stall
@@ -578,6 +589,9 @@ func (p *faultProxy) pipe(src, dst net.Conn) {
 	buf := make([]byte, 32<<10)
 	for {
 		n, err := src.Read(buf)
+		if n > 0 && p.getMode() == modeDrop {
+			n = 0
+		}
 		if n > 0 {
 			// Stalled: hold the bytes until the path is restored. Nothing is lost,
 			// it is just late - like a stalled radio link.
@@ -617,3 +631,46 @@ func record(t *testing.T, format string, a ...any) {
 }
 
 func contains(s, sub string) bool { return strings.Contains(s, sub) }
+
+// restart starts the node again on its existing data directory (new port, same
+// identity, config and storages) and puts it in the old node's place.
+func (c *cluster) restart(n *node) *node { return c.restartWith(n, c.emuSrv.URL) }
+
+// restartWith is restart with a different provider base URL for the new process.
+func (c *cluster) restartWith(n *node, emuURL string) *node {
+	c.t.Helper()
+	n.stop()
+	nn := startNode(c.t, c.root, n.name, startOpts{bin: n.bin, emuURL: emuURL, keep: true})
+	nn.nodeID = n.nodeID
+	for i := range c.nodes {
+		if c.nodes[i] == n {
+			c.nodes[i] = nn
+		}
+	}
+	return nn
+}
+
+// slowEmu forwards to the emulator and holds every request for the current
+// delay first. A restarted node pointed at it spends that long inside its 115
+// storage's Init, which is where the cluster's credential push can land while the
+// storage is still unregistered.
+type slowEmu struct {
+	srv   *httptest.Server
+	delay atomic.Int64 // nanoseconds
+}
+
+func newSlowEmu(t *testing.T, target string, delay time.Duration) *slowEmu {
+	u, err := url.Parse(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := &slowEmu{}
+	s.delay.Store(int64(delay))
+	proxy := httputil.NewSingleHostReverseProxy(u)
+	s.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(time.Duration(s.delay.Load()))
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(s.srv.Close)
+	return s
+}

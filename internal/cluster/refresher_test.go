@@ -629,7 +629,7 @@ func TestStalledLinkBlocksTakeoverIsolatedNodeWaitsLonger(t *testing.T) {
 	// vacancy is not enough...
 	stalled.close("test")
 	r.m.conns.remove(stalled) // (a bare test link has no manager to do it)
-	vacant(40 * time.Second) // > TTL but < 3 x TTL
+	vacant(40 * time.Second)  // > TTL but < 3 x TTL
 	r.m.leaseStep(g)
 	time.Sleep(150 * time.Millisecond)
 	if r.m.isHolder("g1") {

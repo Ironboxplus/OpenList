@@ -599,7 +599,7 @@ func (s *store) hasCredForSource(groupID, origin, mount, hash string) bool {
 
 // credByHash returns the cataloged record matching a mount's current
 // credential hash, so a caller can compare its Version against an incoming
-// candidate before adopting it (see applyCredRecordToMount's regression
+// candidate before adopting it (see desiredCandidate's regression
 // guard).
 func (s *store) credByHash(groupID, hash string) (*credRecord, bool) {
 	if hash == "" {
@@ -1053,21 +1053,6 @@ func (s *store) candidateFailed(groupID, mount, hash string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.failedCandidates[groupID][mount][hash] > 0
-}
-
-// recoveryCandidates returns persisted alternatives for one local mount. The
-// current failed credential and any locally quarantined candidate are excluded;
-// the order is deterministic so a recovery attempt is bounded and reproducible.
-func (s *store) recoveryCandidates(groupID, mount, failedHash string) []*credRecord {
-	candidates := s.credsForGroup(groupID)
-	out := make([]*credRecord, 0, len(candidates))
-	for _, candidate := range candidates {
-		if candidate.CredHash == failedHash || s.candidateFailed(groupID, mount, candidate.CredHash) {
-			continue
-		}
-		out = append(out, candidate)
-	}
-	return out
 }
 
 // ---- inventory ----

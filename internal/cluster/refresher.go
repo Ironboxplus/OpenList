@@ -400,10 +400,17 @@ func (m *Manager) leaseStep(g group) {
 		// renewing: its lease simply runs out and is claimed below.
 		return
 	}
+	hold := func(reason string) {
+		if noLeaseFor >= ttl/2 && noLeaseFor < 4*ttl && int(noLeaseFor/time.Second)%2 == 0 {
+			utils.Log.Infof("[cluster] lease vacant group=%s for %s, not claiming: %s", g.ID, noLeaseFor.Round(time.Second), reason)
+		}
+	}
 	if taking || noLeaseFor < 0 {
+		hold("takeover already running")
 		return
 	}
 	if time.Since(started) < m.startupGrace(ttl) {
+		hold("startup grace")
 		return
 	}
 	// "No renewal heard" must mean "the holder is gone", not "the path to it is
@@ -414,9 +421,11 @@ func (m *Manager) leaseStep(g group) {
 	// a longer silence, since its refresh_token may already be stale.
 	if len(m.conns.all()) > 0 {
 		if !m.responsiveWithin(ttl) {
+			hold("links silent")
 			return
 		}
 	} else if noLeaseFor < 3*ttl {
+		hold("isolated, waiting longer")
 		return
 	}
 	rank := -1
@@ -426,6 +435,7 @@ func (m *Manager) leaseStep(g group) {
 		}
 	}
 	if rank < 0 {
+		hold(fmt.Sprintf("not a candidate (order %v)", order))
 		return
 	}
 	stagger := ttl / 3
@@ -433,6 +443,7 @@ func (m *Manager) leaseStep(g group) {
 		stagger = time.Second
 	}
 	if noLeaseFor < time.Duration(rank)*stagger {
+		hold(fmt.Sprintf("rank %d of %v (candidates %+v)", rank, order, cands))
 		return
 	}
 	m.refr.mu.Lock()
@@ -632,6 +643,7 @@ func (m *Manager) absorbLeases(leases []*refresherLease) []*refresherLease {
 			continue
 		}
 		merged = append(merged, l)
+		m.enqueueGroup(l.GroupID)
 		if prev == nil || prev.lease.Holder != l.Holder || prev.lease.Epoch != l.Epoch || (prev.lease.TTLSec == 0) != (l.TTLSec == 0) {
 			changedHolder = true
 			if l.TTLSec > 0 {
@@ -672,6 +684,7 @@ func (m *Manager) absorbPolicies(ps []*groupPolicy) []*groupPolicy {
 		}
 		if m.state.mergePolicy(p) {
 			merged = append(merged, p)
+			m.enqueueGroup(p.GroupID)
 			utils.Log.Infof("[cluster] preferred refresher for group=%s set to %q by %s (v%d)", p.GroupID, shortNode(p.Preferred), shortNode(p.Origin), p.Version)
 		}
 	}

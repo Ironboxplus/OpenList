@@ -18,6 +18,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
+	"k8s.io/client-go/util/workqueue"
 )
 
 func TestProvider401ClassificationKeepsRefreshThrottleRetryable(t *testing.T) {
@@ -667,7 +668,7 @@ func TestDroppedOwnCredentialRejectsStaleRelayReplay(t *testing.T) {
 	}
 }
 
-func TestRecoveryCandidatesSkipCurrentAndQuarantinedCredentials(t *testing.T) {
+func TestDesiredCandidateSkipsCurrentAndQuarantinedCredentials(t *testing.T) {
 	idA, _ := newIdentity()
 	idB, _ := newIdentity()
 	idC, _ := newIdentity()
@@ -686,12 +687,20 @@ func TestRecoveryCandidatesSkipCurrentAndQuarantinedCredentials(t *testing.T) {
 		}
 	}
 	failedHash := credHash(map[string]json.RawMessage{"access_token": json.RawMessage(`"A"`)})
-	currentHash := credHash(map[string]json.RawMessage{"access_token": json.RawMessage(`"B"`)})
+
 	s.markCandidateFailed("g1", "/local", failedHash, 2)
 
-	candidates := s.recoveryCandidates("g1", "/local", currentHash)
-	if len(candidates) != 1 || candidates[0].CredHash != credHash(map[string]json.RawMessage{"access_token": json.RawMessage(`"C"`)}) {
-		t.Fatalf("recovery candidates = %#v, want only remaining C candidate", candidates)
+	local, _ := newIdentity()
+	admin, _ := newIdentity()
+	s.setGroups(admin, []group{{ID: "g1", Members: []member{
+		{NodeID: idA.NodeID, MountPath: "/a"}, {NodeID: idB.NodeID, MountPath: "/b"},
+		{NodeID: idC.NodeID, MountPath: "/c"}, {NodeID: local.NodeID, MountPath: "/local"},
+	}}}, 1)
+	m := &Manager{id: local, state: s}
+	failing := model.Storage{Driver: "115 Open", MountPath: "/local", Status: "token invalid", Addition: `{"access_token":"B"}`}
+	got := m.desiredCandidate("g1", "/local", failing)
+	if got == nil || got.CredHash != credHash(map[string]json.RawMessage{"access_token": json.RawMessage(`"C"`)}) {
+		t.Fatalf("desired candidate = %#v, want only remaining C candidate", got)
 	}
 }
 
@@ -787,7 +796,7 @@ func additionField(t *testing.T, additionJSON, key string) string {
 	return v
 }
 
-// applyCredRecordToMount is the sole gate deciding whether a candidate may
+// reconcile is the sole gate deciding whether a candidate may
 // touch production storage. A WORK mount is not proof its pair is still
 // accepted by the provider — 115's refresh_token rotates on use, so a peer's
 // successful refresh can kill this mount's own pair before this node ever
@@ -795,7 +804,7 @@ func additionField(t *testing.T, additionJSON, key string) string {
 // peer-authored candidate. It must still block a self-authored record
 // (reachable only via a relay echo) and must still require the temporary
 // driver probe to actually pass before committing anything.
-func TestApplyCredRecordToMountReturnValues(t *testing.T) {
+func TestReconcileMountOutcomes(t *testing.T) {
 	dbName := fmt.Sprintf("file:apply-cred-matrix-%d?mode=memory&cache=shared", time.Now().UnixNano())
 	database, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})
 	if err != nil {
@@ -821,7 +830,7 @@ func TestApplyCredRecordToMountReturnValues(t *testing.T) {
 		// empty payload (applyCreds short-circuits on an empty map before it
 		// ever looks at the current Addition). This keeps the case selection
 		// independent of that round-trip quirk while still exercising the
-		// exact changed/unchanged branch in applyCredRecordToMount.
+		// exact changed/unchanged branch in reconcile.
 		initialWork  bool
 		selfOrigin   bool
 		emptyPayload bool
@@ -910,11 +919,12 @@ func TestApplyCredRecordToMountReturnValues(t *testing.T) {
 
 			var probes atomic.Int32
 			manager := &Manager{
-				dir:      t.TempDir(),
-				id:       localID,
-				state:    state,
-				conns:    newConnRegistry(),
-				cfgStore: &configStore{cfg: Config{Enabled: true, Key: "test-key", ApplyRemote: true}},
+				dir:                 t.TempDir(),
+				id:                  localID,
+				state:               state,
+				conns:               newConnRegistry(),
+				cfgStore:            &configStore{cfg: Config{Enabled: true, Key: "test-key", ApplyRemote: true}},
+				candidateRetryDelay: 20 * time.Millisecond,
 				probeCredentialFn: func(context.Context, model.Storage, string) error {
 					probes.Add(1)
 					return tc.probeErr
@@ -942,10 +952,22 @@ func TestApplyCredRecordToMountReturnValues(t *testing.T) {
 				UpdatedAt:    now(),
 			}
 
-			attempted, success, terminal, retryable := manager.applyCredRecordToMount(candidate, mount)
+			candidate.Sig = origin.sign(candidate.signingBytes())
+			candidate.MountSig = origin.sign(candidate.mountSigningBytes())
+			if !state.mergeCred(candidate) {
+				t.Fatal("candidate not merged")
+			}
+			requeued := reconcileOnce(manager, mount)
+			attempted := probes.Load() > 0
+			success := storageModified(t, mount).After(beforeModified)
+			terminal := len(state.revocationSnapshot()) > 0
+			retryable := attempted && !success && !terminal && requeued
 			if attempted != tc.want.attempted || success != tc.want.success || terminal != tc.want.terminal || retryable != tc.want.retryable {
-				t.Fatalf("applyCredRecordToMount = (attempted=%v success=%v terminal=%v retryable=%v), want %+v",
+				t.Fatalf("reconcile = (attempted=%v success=%v terminal=%v retryable=%v), want %+v",
 					attempted, success, terminal, retryable, tc.want)
+			}
+			if requeued != (terminal || retryable) {
+				t.Fatalf("requeued = %v, want %v", requeued, terminal || retryable)
 			}
 			if got := probes.Load(); got != tc.wantProbes {
 				t.Fatalf("probe called %d times, want %d", got, tc.wantProbes)
@@ -1067,8 +1089,8 @@ func TestReceivedCandidateRecoversInvalidMountWithRealDriver(t *testing.T) {
 }
 
 // A WORK mount must actively adopt a peer's newer credential through the same
-// full recovery pipeline (absorbCreds -> enqueueCandidate -> runCandidateRecovery)
-// used for an already-invalid mount, not just via a direct applyCredRecordToMount
+// full recovery pipeline (absorbCreds -> reconcile)
+// used for an already-invalid mount, not just via a direct reconcile
 // call. This is the regression for Bug 2: node B never fails locally (its old
 // refresh_token still reads WORK), but A's rotation already killed it on the
 // provider side, and B must not wait for its own 401 before taking A's pair.
@@ -1182,7 +1204,7 @@ func TestReceivedCandidateIsAdoptedByWorkMountWithRealDriver(t *testing.T) {
 
 // A candidate that fails the temporary-driver probe must never touch
 // production storage, even through the full async recovery queue (not just a
-// direct applyCredRecordToMount call). UpdateStorage persists before it
+// direct reconcile call). UpdateStorage persists before it
 // initializes, so a bug here would be a real durable corruption, not just a
 // returned error.
 func TestFailedProbeLeavesWorkMountStorageUntouched(t *testing.T) {
@@ -1260,7 +1282,7 @@ func TestFailedProbeLeavesWorkMountStorageUntouched(t *testing.T) {
 	}
 
 	// A terminal probe failure ends in a signed group-wide revocation of the
-	// candidate (runCandidateRecovery's terminal branch calls revokePair, not
+	// candidate (reconcile's terminal branch calls revokePair, not
 	// markCandidateFailed) — that tombstone is the queue's real termination
 	// signal; there is no separate "done" event for a doomed candidate.
 	deadline := time.Now().Add(5 * time.Second)
@@ -1299,13 +1321,13 @@ func TestFailedProbeLeavesWorkMountStorageUntouched(t *testing.T) {
 // race can still probe clean for a while -- without a version check a WORK
 // mount could regress onto that dead pair, and two WORK nodes could
 // oscillate adopting each other's stale credentials. This exercises the
-// guard in applyCredRecordToMount: a candidate is rejected before ever
+// guard in reconcile: a candidate is rejected before ever
 // reaching the probe when this node's own catalogue already has an
 // equal-or-newer record for the mount's current credential hash, and is
 // otherwise let through unchanged (including when no catalog record exists
 // yet, where the guard has no regression information and must stay
 // permissive).
-func TestApplyCredRecordToMountRejectsVersionRegression(t *testing.T) {
+func TestReconcileRejectsVersionRegression(t *testing.T) {
 	dbName := fmt.Sprintf("file:apply-cred-regression-%d?mode=memory&cache=shared", time.Now().UnixNano())
 	database, err := gorm.Open(sqlite.Open(dbName), &gorm.Config{})
 	if err != nil {
@@ -1376,7 +1398,7 @@ func TestApplyCredRecordToMountRejectsVersionRegression(t *testing.T) {
 			// Stamp a credential field directly onto the live storage's Addition.
 			// The Local driver's typed Addition struct has no credential-shaped
 			// field, so this could never survive an op.UpdateStorage round trip
-			// (see op.saveDriverStorage) -- but applyCredRecordToMount reads the
+			// (see op.saveDriverStorage) -- but reconcile reads the
 			// storage struct as-is and never re-marshals it through the driver
 			// before the regression check, so a direct field write faithfully
 			// models what a real credentialed driver's Addition already contains.
@@ -1412,11 +1434,12 @@ func TestApplyCredRecordToMountRejectsVersionRegression(t *testing.T) {
 
 			var probes atomic.Int32
 			manager := &Manager{
-				dir:      t.TempDir(),
-				id:       localID,
-				state:    state,
-				conns:    newConnRegistry(),
-				cfgStore: &configStore{cfg: Config{Enabled: true, Key: "test-key", ApplyRemote: true}},
+				dir:                 t.TempDir(),
+				id:                  localID,
+				state:               state,
+				conns:               newConnRegistry(),
+				cfgStore:            &configStore{cfg: Config{Enabled: true, Key: "test-key", ApplyRemote: true}},
+				candidateRetryDelay: 20 * time.Millisecond,
 				probeCredentialFn: func(context.Context, model.Storage, string) error {
 					probes.Add(1)
 					return nil
@@ -1437,15 +1460,23 @@ func TestApplyCredRecordToMountRejectsVersionRegression(t *testing.T) {
 				UpdatedAt:    now(),
 			}
 
-			attempted, success, terminal, retryable := manager.applyCredRecordToMount(candidate, mount)
+			candidate.Sig = peerID.sign(candidate.signingBytes())
+			candidate.MountSig = peerID.sign(candidate.mountSigningBytes())
+			if !state.mergeCred(candidate) {
+				t.Fatal("candidate not merged")
+			}
+			beforeModified := storageModified(t, mount)
+			reconcileOnce(manager, mount)
+			attempted := probes.Load() > 0
+			success := storageModified(t, mount).After(beforeModified)
 			if attempted != tc.wantAttempted {
-				t.Fatalf("attempted = %v, want %v (success=%v terminal=%v retryable=%v)", attempted, tc.wantAttempted, success, terminal, retryable)
+				t.Fatalf("attempted = %v, want %v (success=%v)", attempted, tc.wantAttempted, success)
 			}
 			if got := probes.Load(); got != tc.wantProbes {
 				t.Fatalf("probe called %d times, want %d", got, tc.wantProbes)
 			}
 			if tc.wantAttempted && !success {
-				t.Fatalf("expected the newer/unknown-version candidate to be adopted, got success=false (terminal=%v retryable=%v)", terminal, retryable)
+				t.Fatalf("expected the newer/unknown-version candidate to be adopted, got success=false")
 			}
 		})
 	}
@@ -1599,4 +1630,30 @@ func TestInventoryMergeAndDialTargets(t *testing.T) {
 	if len(addrs) != 1 || addrs[0] != "https://n1b" {
 		t.Fatalf("dialableAddrs should exclude self: %#v", addrs)
 	}
+}
+
+// reconcileOnce runs one reconcile of (g1, mount) against a private queue, so no
+// worker re-runs it behind the test's back, and reports whether the key was put
+// back for another pass.
+func reconcileOnce(m *Manager, mount string) bool {
+	q := workqueue.NewTypedRateLimitingQueue(workqueue.DefaultTypedControllerRateLimiter[string]())
+	defer q.ShutDown()
+	m.reconcile(q, reconcileKey("g1", mount))
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if q.Len() > 0 {
+			return true
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return false
+}
+
+func storageModified(t *testing.T, mount string) time.Time {
+	t.Helper()
+	d, err := op.GetStorageByMountPath(mount)
+	if err != nil {
+		t.Fatalf("get storage: %v", err)
+	}
+	return d.GetStorage().Modified
 }
