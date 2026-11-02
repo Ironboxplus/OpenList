@@ -209,6 +209,56 @@ func (m *Manager) mountInGroup(groupID, mount string) bool {
 	return false
 }
 
+// savedPair is what the node knew when a mount's storage was updated to a pair
+// the catalogue had no record of: a local rotation (the driver saves the new
+// pair before onStorageCredential catalogues it) or an administrator's edit. The
+// pair was made after the records in known, so none of them is newer than it.
+// Records absorbed later are not in known and compete normally.
+type savedPair struct {
+	hash  string
+	known map[string]struct{} // group, separator, credential hash
+}
+
+// notePairSaved remembers, at the moment a storage is updated, which catalogued
+// records the new pair is ahead of. It must run before anything can reconcile
+// the mount, which is why the storage hook calls it before enqueueing.
+func (m *Manager) notePairSaved(st *model.Storage) {
+	hash := credHash(extractCreds(st.Addition))
+	known := map[string]struct{}{}
+	catalogued := false
+	for _, g := range m.state.groupsForMount(m.id.NodeID, st.MountPath) {
+		if _, ok := m.state.credByHash(g.ID, hash); ok {
+			catalogued = true
+		}
+		for _, r := range m.state.credsForGroup(g.ID) {
+			known[g.ID+reconcileKeySep+r.CredHash] = struct{}{}
+		}
+	}
+	m.savedMu.Lock()
+	defer m.savedMu.Unlock()
+	if m.saved == nil {
+		m.saved = make(map[string]savedPair)
+	}
+	if hash == "" || catalogued {
+		delete(m.saved, st.MountPath)
+		return
+	}
+	m.saved[st.MountPath] = savedPair{hash: hash, known: known}
+}
+
+// aheadOfRunningPair reports whether the record predates the uncatalogued pair
+// the mount is running, so adopting it would move the mount backwards.
+func (m *Manager) aheadOfRunningPair(groupID, mount, currentHash, recHash string) bool {
+	m.savedMu.Lock()
+	defer m.savedMu.Unlock()
+	sp, ok := m.saved[mount]
+	if !ok || sp.hash != currentHash {
+		return false
+	}
+	_, older := sp.known[groupID+reconcileKeySep+recHash]
+	return older
+}
+
 // desiredCandidate picks the record this mount should be running: the highest
 // version among the catalogued candidates that are allowed on it. Revoked pairs
 // are already absent from the catalogue (revokePair and mergeRevocation delete
@@ -223,8 +273,9 @@ func (m *Manager) mountInGroup(groupID, mount string) bool {
 func (m *Manager) desiredCandidate(groupID, mount string, st model.Storage) *credRecord {
 	var currentVer uint64
 	haveCurrent := false
+	currentHash := credHash(extractCreds(st.Addition))
 	if st.Status == op.WORK {
-		if cur, ok := m.state.credByHash(groupID, credHash(extractCreds(st.Addition))); ok {
+		if cur, ok := m.state.credByHash(groupID, currentHash); ok {
 			currentVer, haveCurrent = cur.Version, true
 		}
 	}
@@ -237,6 +288,9 @@ func (m *Manager) desiredCandidate(groupID, mount string, st model.Storage) *cre
 			continue
 		}
 		if st.Status == op.WORK && (r.Origin == m.id.NodeID || (haveCurrent && currentVer >= r.Version)) {
+			continue
+		}
+		if st.Status == op.WORK && !haveCurrent && m.aheadOfRunningPair(groupID, mount, currentHash, r.CredHash) {
 			continue
 		}
 		if _, changed := applyCreds(st.Addition, r.Payload); !changed {

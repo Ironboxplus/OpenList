@@ -54,6 +54,8 @@ type Manager struct {
 
 	// The reconcile queue is created on first use (see reconcileQueue), so a
 	// Manager that never saw an event costs nothing.
+	savedMu  sync.Mutex
+	saved    map[string]savedPair // mount -> pair the storage was last updated to
 	queueMu  sync.Mutex
 	queue    workqueue.TypedRateLimitingInterface[string]
 	pullMu   sync.Mutex
@@ -321,7 +323,7 @@ func (m *Manager) knownNodesForPEX() []*nodeInfo {
 	return out
 }
 
-/// helloMessage greets a freshly-connected peer with everything needed to
+// / helloMessage greets a freshly-connected peer with everything needed to
 // converge: our inventory, known dialable peers (PEX), the groups doc, our
 // credential digests, the refresher leases/policies and a revocation digest.
 func (m *Manager) helloMessage() *syncMessage {
@@ -392,14 +394,11 @@ func (m *Manager) onStorageHook(typ string, d driver.Driver) {
 	}
 	// add/update/del: LoadStorage and UpdateStorage fire this after the storage
 	// is registered, so a reconcile queued earlier for a not-yet-registered mount
-	// is satisfied here at the latest. An update that leaves the mount working
-	// is not woken: a refresh updates the storage before its new pair is
-	// catalogued, and reconciling inside that gap would weigh the old catalogued
-	// pairs against a pair of unknown version. onStorageCredential wakes the
-	// mount once the record exists.
-	if typ != "update" || d.GetStorage().Status != op.WORK {
-		m.enqueueMount(d.GetStorage().MountPath)
+	// is satisfied here at the latest.
+	if typ == "update" {
+		m.notePairSaved(d.GetStorage())
 	}
+	m.enqueueMount(d.GetStorage().MountPath)
 	go m.refreshInventory()
 }
 
@@ -841,7 +840,7 @@ func (m *Manager) buildReply(in *syncMessage) *syncMessage {
 
 // ---- networking ----
 
-/// seal wraps a message in an encrypted envelope addressed from this node. The
+// / seal wraps a message in an encrypted envelope addressed from this node. The
 // protocol level is stamped on a copy, so shared messages are never mutated.
 func (m *Manager) seal(msg *syncMessage) ([]byte, error) {
 	key, err := deriveAEADKey([]byte(m.cfgStore.get().Key))
