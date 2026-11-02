@@ -2,12 +2,14 @@ package store
 
 import (
 	"bytes"
-	"errors"
+	"context"
 	"fmt"
 	"image"
 	"image/color"
 	"image/png"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,32 +18,31 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
 
-func newTestStore(t *testing.T) *Store {
+func newStore(t *testing.T) *Store {
 	t.Helper()
 	conf.Conf = conf.DefaultConfig(t.TempDir())
-	name := fmt.Sprintf("file:media-store-%d?mode=memory&cache=shared", time.Now().UnixNano())
-	d, err := gorm.Open(sqlite.Open(name), &gorm.Config{})
+	old := conf.DataDir
+	conf.DataDir = t.TempDir()
+	t.Cleanup(func() { conf.DataDir = old })
+	d, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:store-%d?mode=memory&cache=shared", time.Now().UnixNano())),
+		&gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: "x_"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	db.Init(d)
-	return New(t.TempDir())
+	return New("runtime", "/imgs")
 }
 
-func str(s string) *string   { return &s }
-func i32(f float32) *float32 { return &f }
-func boolp(b bool) *bool     { return &b }
-func intp(i int) *int        { return &i }
+func ptr[T any](v T) *T { return &v }
 
-func pngBytes(t *testing.T, w, h int, c color.Color) []byte {
+func png1(t *testing.T) []byte {
 	t.Helper()
-	img := image.NewRGBA(image.Rect(0, 0, w, h))
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			img.Set(x, y, c)
-		}
+	img := image.NewRGBA(image.Rect(0, 0, 4, 4))
+	for x := 0; x < 4; x++ {
+		img.Set(x, x, color.RGBA{255, 0, 0, 255})
 	}
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {
@@ -50,200 +51,168 @@ func pngBytes(t *testing.T, w, h int, c color.Color) []byte {
 	return buf.Bytes()
 }
 
-func TestSetOnlyOverwritesGivenFields(t *testing.T) {
-	s := newTestStore(t)
-	it, err := s.Set(model.MediaSetReq{
-		Path: "/115/云下载/EVA/", Kind: str("tv"), Title: str("EVA"), Year: intp(1995),
-		Overview: str("old overview"), ExternalIDs: map[string]string{"tmdb": "tv/890"},
+func TestSetCreatesAWorkOnTheUpstreamModel(t *testing.T) {
+	s := newStore(t)
+	got, err := s.Set(model.MediaSetReq{
+		Path: "/lib/EVA", Kind: ptr("anime"), Title: ptr("新世纪福音战士"), OriginalTitle: ptr("Neon Genesis Evangelion"), Year: ptr(1995),
+		ExternalIDs: map[string]string{"tmdb": "tv/890", "imdb": "tt0112159"},
+		Ratings:     map[string]any{"tmdb": 8.3, "imdb": 8.5, "rt": "93%"},
+		Genres:      []string{"动画", "科幻"}, Overview: ptr("o"), Source: ptr("scraper"), Confidence: ptr(float32(0.9)),
 	}, SetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if it.Path != "/115/云下载/EVA" {
-		t.Fatalf("path not normalised: %q", it.Path)
+	if got.MediaType != model.MediaTypeVideo || got.FolderPath != "/lib" || got.FileName != "EVA" || !got.IsFolder || got.AlbumName != "" {
+		t.Fatalf("identity: %+v", got)
 	}
-	// second write names only the title and the lock
-	if _, err := s.Set(model.MediaSetReq{Path: "/115/云下载/EVA", Title: str("新世纪福音战士"), Locked: boolp(true)}, SetOptions{}); err != nil {
-		t.Fatal(err)
+	if got.VideoType != "anime" || got.ScrapedName != "新世纪福音战士" || got.OriginalTitle != "Neon Genesis Evangelion" ||
+		got.ReleaseDate != "1995-01-01" || got.Genre != "动画,科幻" || got.Plot != "o" || got.ExternalID != "tmdb:890" {
+		t.Fatalf("fields: %+v", got)
 	}
-	got, _ := s.Get("/115/云下载/EVA")
-	if got.Title != "新世纪福音战士" || !got.Locked {
-		t.Fatalf("given fields not written: %+v", got)
+	if got.Rating != 8.3 || got.ScrapedAt == nil || got.Source != "scraper" || got.Confidence != 0.9 {
+		t.Fatalf("rating/source: rating=%v scrapedAt=%v source=%q", got.Rating, got.ScrapedAt, got.Source)
 	}
-	if got.Kind != "tv" || got.Year != 1995 || got.Overview != "old overview" || got.ExternalIDs != `{"tmdb":"tv/890"}` {
-		t.Fatalf("fields not in the request were changed: %+v", got)
+	rs, _ := db.ListMediaRatings(got.ID)
+	if m := RatingsToMap(rs[got.ID]); len(m) != 3 || m["rt"] != "93%" || m["imdb"] != float32(8.5) {
+		t.Fatalf("ratings: %v", m)
 	}
-	// an explicitly empty overview does clear it
-	if _, err := s.Set(model.MediaSetReq{Path: "/115/云下载/EVA", Overview: str("")}, SetOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	got, _ = s.Get("/115/云下载/EVA")
-	if got.Overview != "" || got.Title != "新世纪福音战士" {
-		t.Fatalf("explicit empty not applied or collateral change: %+v", got)
+	// a file at the top is a file, not a folder
+	f, err := s.Set(model.MediaSetReq{Path: "/lib/Film (2010).mkv", Kind: ptr("movie")}, SetOptions{})
+	if err != nil || f.IsFolder || f.ScrapedName != "Film (2010)" {
+		t.Fatalf("file work: %+v %v", f, err)
 	}
 }
 
-func TestSetValidation(t *testing.T) {
-	s := newTestStore(t)
-	if _, err := s.Set(model.MediaSetReq{Path: "/a"}, SetOptions{}); err == nil {
-		t.Fatal("new item without kind accepted")
+func TestSetOnlyWritesTheGivenFields(t *testing.T) {
+	s := newStore(t)
+	if _, err := s.Set(model.MediaSetReq{Path: "/lib/A", Kind: ptr("tv"), Title: ptr("A"), Year: ptr(2001), Overview: ptr("keep"),
+		Ratings: map[string]any{"tmdb": 7.0}}, SetOptions{}); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := s.Set(model.MediaSetReq{Path: "/a", Kind: str("bogus")}, SetOptions{}); err == nil {
-		t.Fatal("invalid kind accepted")
+	if _, err := s.Set(model.MediaSetReq{Path: "/lib/A", Title: ptr("B")}, SetOptions{}); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := s.Set(model.MediaSetReq{Path: "/", Kind: str("movie")}, SetOptions{}); err == nil {
-		t.Fatal("root accepted")
+	got, _ := s.Get("/lib/A")
+	if got.ScrapedName != "B" || got.VideoType != "tv" || got.ReleaseDate != "2001-01-01" || got.Plot != "keep" || got.Rating != 7 {
+		t.Fatalf("%+v", got)
+	}
+	rs, _ := db.ListMediaRatings(got.ID)
+	if len(rs[got.ID]) != 1 {
+		t.Fatalf("ratings not in the request must stay: %+v", rs)
+	}
+	// ratings given as an empty set clear them
+	if _, err := s.Set(model.MediaSetReq{Path: "/lib/A", Ratings: map[string]any{}}, SetOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	rs, _ = db.ListMediaRatings(got.ID)
+	if len(rs[got.ID]) != 0 {
+		t.Fatalf("an empty ratings set must clear: %+v", rs)
+	}
+	if _, err := s.Set(model.MediaSetReq{Path: "/lib/Nope"}, SetOptions{}); err == nil {
+		t.Error("a new work without a kind must be refused")
+	}
+	if _, err := s.Set(model.MediaSetReq{Path: "/lib/A", Kind: ptr("library")}, SetOptions{}); err == nil {
+		t.Error("library is not a kind of work")
+	}
+	if _, err := s.Set(model.MediaSetReq{Path: "/", Kind: ptr("movie")}, SetOptions{}); err == nil {
+		t.Error("the root cannot be a work")
 	}
 }
 
-func TestLockedItemRefusesAutomaticWrite(t *testing.T) {
-	s := newTestStore(t)
-	if _, err := s.Set(model.MediaSetReq{Path: "/m/a", Kind: str("movie"), Title: str("mine"), Locked: boolp(true)}, SetOptions{}); err != nil {
+func TestSetRespectsTheLockOnlyWhenAsked(t *testing.T) {
+	s := newStore(t)
+	if _, err := s.Set(model.MediaSetReq{Path: "/lib/L", Kind: ptr("movie"), Title: ptr("mine"), Locked: ptr(true)}, SetOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	_, err := s.Set(model.MediaSetReq{Path: "/m/a", Title: str("scraped"), Source: str("scraper")}, SetOptions{RespectLock: true})
-	if !errors.Is(err, ErrLocked) {
+	if _, err := s.Set(model.MediaSetReq{Path: "/lib/L", Title: ptr("auto")}, SetOptions{RespectLock: true}); err != ErrLocked {
 		t.Fatalf("err = %v, want ErrLocked", err)
 	}
-	got, _ := s.Get("/m/a")
-	if got.Title != "mine" {
-		t.Fatalf("locked title overwritten: %q", got.Title)
+	if got, _ := s.Get("/lib/L"); got.ScrapedName != "mine" {
+		t.Fatalf("locked title changed: %q", got.ScrapedName)
 	}
-	// the admin's explicit edit still goes through
-	if _, err := s.Set(model.MediaSetReq{Path: "/m/a", Title: str("edited")}, SetOptions{}); err != nil {
+	if _, err := s.Set(model.MediaSetReq{Path: "/lib/L", Title: ptr("admin")}, SetOptions{}); err != nil {
 		t.Fatal(err)
+	}
+	if got, _ := s.Get("/lib/L"); got.ScrapedName != "admin" {
+		t.Fatalf("an admin edit must go through: %q", got.ScrapedName)
 	}
 }
 
-func TestEpisodesReplacedOnlyWhenGiven(t *testing.T) {
-	s := newTestStore(t)
-	_, err := s.Set(model.MediaSetReq{Path: "/tv/x", Kind: str("tv"), Episodes: []model.MediaEpisodeIn{
-		{FileName: "S01E01.mkv", Season: 1, Episode: 1, Title: "a"},
-		{FileName: "S01E02.mkv", Season: 1, Episode: 2, Title: "b"},
+func TestIgnoreHidesAndLeavingIgnoreShows(t *testing.T) {
+	s := newStore(t)
+	got, err := s.Set(model.MediaSetReq{Path: "/lib/OST", Kind: ptr("ignore")}, SetOptions{})
+	if err != nil || !got.Hidden {
+		t.Fatalf("ignored work must be hidden: %+v %v", got, err)
+	}
+	got, err = s.Set(model.MediaSetReq{Path: "/lib/OST", Kind: ptr("movie")}, SetOptions{})
+	if err != nil || got.Hidden {
+		t.Fatalf("a work no longer ignored must be shown: %+v %v", got, err)
+	}
+}
+
+func TestSetEpisodesFillsBothTables(t *testing.T) {
+	s := newStore(t)
+	got, err := s.Set(model.MediaSetReq{Path: "/lib/Show", Kind: ptr("tv"), Episodes: []model.MediaEpisodeIn{
+		{FileName: "Season 1/Show.S01E02.mkv", Season: 1, Episode: 2, Title: "two"},
+		{FileName: "Season 1/Show.S01E01.mkv", Season: 1, Episode: 1, Title: "one", Overview: "o", Still: "thumb:/imgs/s.jpg"},
 	}}, SetOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	it, _ := s.Get("/tv/x")
-	if eps, _ := db.GetMediaWorkEpisodes(it.ID); len(eps) != 2 {
-		t.Fatalf("episodes = %d", len(eps))
+	eps, _ := db.ListMediaEpisodes(got.ID)
+	if len(eps) != 2 || eps[0].Title != "one" || eps[0].Still != "thumb:/imgs/s.jpg" {
+		t.Fatalf("rows: %+v", eps)
 	}
-	if _, err := s.Set(model.MediaSetReq{Path: "/tv/x", Title: str("t")}, SetOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	if eps, _ := db.GetMediaWorkEpisodes(it.ID); len(eps) != 2 {
-		t.Fatalf("episodes lost by a set without episodes: %d", len(eps))
-	}
-	if _, err := s.Set(model.MediaSetReq{Path: "/tv/x", Episodes: []model.MediaEpisodeIn{{FileName: "S01E03.mkv", Season: 1, Episode: 3}}}, SetOptions{}); err != nil {
-		t.Fatal(err)
-	}
-	if eps, _ := db.GetMediaWorkEpisodes(it.ID); len(eps) != 1 || eps[0].Episode != 3 {
-		t.Fatalf("episodes not replaced: %+v", eps)
+	if !strings.Contains(got.Episodes, `"file_name":"Season 1/Show.S01E01.mkv"`) || !strings.Contains(got.Episodes, `"index":2`) {
+		t.Fatalf("upstream JSON: %s", got.Episodes)
 	}
 }
 
-func TestChildrenAreDirectOnlyAndLikeIsEscaped(t *testing.T) {
-	s := newTestStore(t)
-	for _, p := range []string{"/lib/A", "/lib/B", "/lib/A/S1", "/lib/100%_x", "/libx/C", "/lib/B/deep/er"} {
-		if _, err := s.Set(model.MediaSetReq{Path: p, Kind: str("movie")}, SetOptions{}); err != nil {
+func TestSaveImageKeepsPosterAndBackdropApart(t *testing.T) {
+	s := newStore(t)
+	data := png1(t)
+	poster, err := s.SaveImage(context.Background(), "/lib/EVA", "poster", data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backdrop, err := s.SaveImage(context.Background(), "/lib/EVA", "backdrop", data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(poster, "thumb:/imgs/") || !strings.HasPrefix(backdrop, "thumb:/imgs/") || poster == backdrop {
+		t.Fatalf("poster=%q backdrop=%q", poster, backdrop)
+	}
+	for _, ref := range []string{poster, backdrop} {
+		if _, err := os.Stat(filepath.Join(conf.DataDir, filepath.FromSlash(strings.TrimPrefix(ref, "thumb:/")))); err != nil {
+			t.Errorf("%s not on disk: %v", ref, err)
+		}
+	}
+	if _, err := s.SaveImage(context.Background(), "/lib/EVA", "poster", []byte("not an image at all")); err == nil {
+		t.Error("a non-image was stored")
+	}
+	if _, err := s.SaveImage(context.Background(), "/lib/EVA", "poster", make([]byte, MaxImageBytes+1)); err == nil {
+		t.Error("an oversized image was stored")
+	}
+}
+
+func TestDeleteAndDeletePrefix(t *testing.T) {
+	s := newStore(t)
+	for _, p := range []string{"/d/a", "/d/a/s1", "/d/b", "/dd/x", "/e/z"} {
+		if _, err := s.Set(model.MediaSetReq{Path: p, Kind: ptr("tv")}, SetOptions{}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	kids, err := db.ListMediaWorkChildren("/lib")
-	if err != nil {
-		t.Fatal(err)
+	n, err := s.DeletePrefix("/d")
+	if err != nil || n != 3 {
+		t.Fatalf("deleted %d, %v; /d, /d/a/s1 and /d/b go, /dd/x stays", n, err)
 	}
-	var got []string
-	for _, k := range kids {
-		got = append(got, k.Path)
+	if it, _ := s.Get("/dd/x"); it == nil {
+		t.Fatal("a sibling with the same leading characters was deleted")
 	}
-	want := []string{"/lib/100%_x", "/lib/A", "/lib/B"}
-	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Fatalf("children = %v, want %v", got, want)
+	if n, _ := s.Delete("/e/z"); n != 1 {
+		t.Fatalf("single delete = %d", n)
 	}
-	// a LIKE wildcard in the parent path must not match siblings
-	kids, _ = db.ListMediaWorkChildren("/l_b")
-	if len(kids) != 0 {
-		t.Fatalf("'_' acted as a wildcard: %v", kids)
-	}
-	n, err := s.DeletePrefix("/lib/A")
-	if err != nil || n != 2 {
-		t.Fatalf("DeletePrefix = %d, %v; want 2", n, err)
-	}
-	if it, _ := s.Get("/libx/C"); it == nil {
-		t.Fatal("prefix delete leaked into /libx")
-	}
-}
-
-func TestPendingFilter(t *testing.T) {
-	s := newTestStore(t)
-	mk := func(p string, conf float32, locked bool, cands []model.MediaCandidate) {
-		if _, err := s.Set(model.MediaSetReq{Path: p, Kind: str("movie"), Confidence: i32(conf), Locked: boolp(locked), Candidates: cands}, SetOptions{}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	mk("/p/low", 0.3, false, nil)
-	mk("/p/high", 0.9, false, nil)
-	mk("/p/highcand", 0.9, false, []model.MediaCandidate{{Provider: "tmdb", ID: "tv/1"}})
-	mk("/p/lowlocked", 0.1, true, nil)
-	mk("/p/emptycand", 0.9, false, []model.MediaCandidate{})
-	items, total, err := db.ListMediaWorks(db.MediaWorkListFilter{Prefix: "/p", Pending: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got []string
-	for _, it := range items {
-		got = append(got, it.Path)
-	}
-	if total != 2 || fmt.Sprint(got) != "[/p/highcand /p/low]" {
-		t.Fatalf("pending = %v (total %d)", got, total)
-	}
-}
-
-func TestAssetDedupBySHA(t *testing.T) {
-	s := newTestStore(t)
-	data := pngBytes(t, 600, 900, color.RGBA{200, 10, 10, 255})
-	a, err := s.AddAsset(data, "https://img.example/a.png")
-	if err != nil {
-		t.Fatal(err)
-	}
-	b, err := s.AddAsset(data, "https://img.example/other-url.png")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if a.ID != b.ID || a.SHA256 != b.SHA256 {
-		t.Fatalf("same bytes got two assets: %d vs %d", a.ID, b.ID)
-	}
-	if a.Width != 600 || a.Height != 900 || a.Mime != "image/png" {
-		t.Fatalf("asset meta: %+v", a)
-	}
-	for _, thumb := range []bool{false, true} {
-		if _, err := os.Stat(s.AssetFile(a, thumb)); err != nil {
-			t.Fatalf("file missing (thumb=%v): %v", thumb, err)
-		}
-	}
-	f, _ := os.Open(s.AssetFile(a, true))
-	defer f.Close()
-	cfg, _, err := image.DecodeConfig(f)
-	if err != nil || cfg.Width != ThumbWidth {
-		t.Fatalf("thumb = %+v, %v; want width %d", cfg, err, ThumbWidth)
-	}
-	other, err := s.AddAsset(pngBytes(t, 50, 50, color.RGBA{0, 0, 200, 255}), "")
-	if err != nil || other.ID == a.ID {
-		t.Fatalf("different bytes shared an asset: %v", err)
-	}
-	if _, err := s.AddAsset([]byte("not an image"), ""); err == nil {
-		t.Fatal("garbage accepted as an image")
-	}
-}
-
-func TestLibraryKindIsAccepted(t *testing.T) {
-	s := newTestStore(t)
-	it, err := s.Set(model.MediaSetReq{Path: "/lib", Kind: str("library"), Title: str("Lib")}, SetOptions{})
-	if err != nil || it.Kind != "library" {
-		t.Fatalf("library rejected: %v", err)
-	}
-	if items, total, err := db.ListMediaWorks(db.MediaWorkListFilter{Kind: "library", Page: 1, PerPage: 10}); err != nil || total != 1 || items[0].Path != "/lib" {
-		t.Fatalf("list by kind: %v %d", err, total)
+	if n, _ := s.Delete("/e/z"); n != 0 {
+		t.Fatalf("deleting twice = %d", n)
 	}
 }

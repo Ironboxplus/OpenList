@@ -73,3 +73,46 @@ func (m *MediaItem) IsSeries() bool {
 	}
 	return IsEpisodicVideo(m.VideoType)
 }
+
+// MediaCandidate is one search hit kept for a person to confirm.
+type MediaCandidate struct {
+	Provider  string  `json:"provider"`
+	ID        string  `json:"id"`
+	Title     string  `json:"title"`
+	Year      int     `json:"year"`
+	PosterURL string  `json:"poster_url"`
+	Score     float32 `json:"score"`
+}
+
+// MediaEpisodeIn is an episode in a set request.
+type MediaEpisodeIn struct {
+	FileName string `json:"file_name"`
+	Season   int    `json:"season"`
+	Episode  int    `json:"episode"`
+	Title    string `json:"title"`
+	Overview string `json:"overview"`
+	Still    string `json:"still"`
+}
+
+// MediaSetReq is the body of /api/admin/media/curate/set. Only the fields
+// present in the request are written; nil means "leave as it is". Cover and
+// Backdrop take the spellings MediaItem.Cover does (an http(s) URL, thumb:/...,
+// a data URI).
+type MediaSetReq struct {
+	Path          string            `json:"path"`
+	Kind          *string           `json:"kind,omitempty"`
+	Title         *string           `json:"title,omitempty"`
+	OriginalTitle *string           `json:"original_title,omitempty"`
+	Year          *int              `json:"year,omitempty"`
+	ExternalIDs   map[string]string `json:"external_ids,omitempty"`
+	Ratings       map[string]any    `json:"ratings,omitempty"`
+	Genres        []string          `json:"genres,omitempty"`
+	Overview      *string           `json:"overview,omitempty"`
+	Cover         *string           `json:"cover,omitempty"`
+	Backdrop      *string           `json:"backdrop,omitempty"`
+	Locked        *bool             `json:"locked,omitempty"`
+	Source        *string           `json:"source,omitempty"`
+	Confidence    *float32          `json:"confidence,omitempty"`
+	Candidates    []MediaCandidate  `json:"candidates,omitempty"`
+	Episodes      []MediaEpisodeIn  `json:"episodes,omitempty"`
+}

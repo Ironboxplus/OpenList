@@ -52,21 +52,24 @@ func TestAddTrafficDailyUpserts(t *testing.T) {
 func TestMediaStatsCountsWorksOnly(t *testing.T) {
 	testDB(t)
 	scraped := time.Now()
-	items := []model.MediaWork{
-		{Path: "/a", Kind: model.MediaKindMovie, ScrapedAt: &scraped},
-		{Path: "/b", Kind: model.MediaKindMovie},
-		{Path: "/c", Kind: model.MediaKindTV, ScrapedAt: &scraped},
-		{Path: "/d", Kind: model.MediaKindAnime},
-		{Path: "/e", Kind: model.MediaKindCollection, ScrapedAt: &scraped},
-		{Path: "/f", Kind: model.MediaKindIgnore},
-		{Path: "/g", Kind: model.MediaKindLibrary},
+	items := []model.MediaItem{
+		{FolderPath: "/", FileName: "a", VideoType: model.MediaKindMovie, ScrapedAt: &scraped},
+		{FolderPath: "/", FileName: "b", VideoType: model.MediaKindMovie},
+		{FolderPath: "/", FileName: "c", VideoType: model.MediaKindTV, ScrapedAt: &scraped},
+		{FolderPath: "/", FileName: "d", VideoType: model.MediaKindAnime},
+		{FolderPath: "/", FileName: "e", VideoType: model.MediaKindCollection, ScrapedAt: &scraped},
+		{FolderPath: "/", FileName: "f", VideoType: model.MediaKindIgnore},
+		{FolderPath: "/", FileName: "g.mp3", MediaType: model.MediaTypeMusic},
 	}
 	for i := range items {
-		var eps []model.MediaWorkEpisode
-		if items[i].Kind == model.MediaKindTV {
-			eps = []model.MediaWorkEpisode{{FileName: "1.mkv", Season: 1, Episode: 1}, {FileName: "2.mkv", Season: 1, Episode: 2}}
+		if items[i].MediaType == "" {
+			items[i].MediaType = model.MediaTypeVideo
 		}
-		if err := SaveMediaWork(&items[i], eps); err != nil {
+		var eps []model.MediaEpisode
+		if items[i].VideoType == model.MediaKindTV {
+			eps = []model.MediaEpisode{{FileName: "1.mkv", Season: 1, Episode: 1}, {FileName: "2.mkv", Season: 1, Episode: 2}}
+		}
+		if err := SaveVideoItem(&items[i], nil, eps); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -11,15 +11,15 @@ import (
 func TestStatsOverviewAdminOnlyAndShape(t *testing.T) {
 	m := newMediaEnv(t)
 	// a library with a movie and a show with episodes
-	for _, it := range []*model.MediaWork{
-		{Path: "/lib/m", Kind: model.MediaKindMovie},
-		{Path: "/lib/s", Kind: model.MediaKindTV},
+	for _, it := range []*model.MediaItem{
+		{MediaType: model.MediaTypeVideo, FolderPath: "/lib", FileName: "m", VideoType: model.MediaKindMovie},
+		{MediaType: model.MediaTypeVideo, FolderPath: "/lib", FileName: "s", VideoType: model.MediaKindTV},
 	} {
-		var eps []model.MediaWorkEpisode
-		if it.Kind == model.MediaKindTV {
-			eps = []model.MediaWorkEpisode{{FileName: "1.mkv", Season: 1, Episode: 1}}
+		var eps []model.MediaEpisode
+		if it.VideoType == model.MediaKindTV {
+			eps = []model.MediaEpisode{{FileName: "1.mkv", Season: 1, Episode: 1}}
 		}
-		if err := db.SaveMediaWork(it, eps); err != nil {
+		if err := db.SaveVideoItem(it, nil, eps); err != nil {
 			t.Fatal(err)
 		}
 	}

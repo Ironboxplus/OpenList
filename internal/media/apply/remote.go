@@ -54,13 +54,13 @@ type mediaListResp struct {
 	Total   int64      `json:"total"`
 }
 
-// Existing pages through /api/admin/media/works/list.
+// Existing pages through /api/admin/media/curate/list.
 func (r Remote) Existing(_ context.Context, prefix string) (map[string]Existing, error) {
 	out := map[string]Existing{}
 	for page := 1; ; page++ {
 		var resp mediaListResp
 		q := url.Values{"prefix": {prefix}, "page": {strconv.Itoa(page)}, "per_page": {"1000"}}
-		if err := r.API.Call("GET", "/api/admin/media/works/list?"+q.Encode(), nil, &resp); err != nil {
+		if err := r.API.Call("GET", "/api/admin/media/curate/list?"+q.Encode(), nil, &resp); err != nil {
 			return nil, err
 		}
 		for _, e := range resp.Content {
@@ -72,32 +72,28 @@ func (r Remote) Existing(_ context.Context, prefix string) (map[string]Existing,
 	}
 }
 
-// UploadAsset posts the image as multipart.
-func (r Remote) UploadAsset(_ context.Context, data []byte, srcURL string) (uint, error) {
-	name := "image"
-	if srcURL != "" {
-		if u, err := url.Parse(srcURL); err == nil && u.Path != "" {
-			name = u.Path[strings.LastIndex(u.Path, "/")+1:]
-		}
-	}
+// SaveImage posts the image as multipart; the server keeps it the way the
+// library keeps covers and answers with the cover reference.
+func (r Remote) SaveImage(_ context.Context, p, role string, data []byte) (string, error) {
 	var out struct {
-		ID uint `json:"id"`
+		Cover string `json:"cover"`
 	}
-	if err := r.API.Upload("/api/admin/media/works/asset?source_url="+url.QueryEscape(srcURL), "file", name, data, &out); err != nil {
-		return 0, err
+	q := url.Values{"path": {p}, "role": {role}}
+	if err := r.API.Upload("/api/admin/media/curate/image?"+q.Encode(), "file", role, data, &out); err != nil {
+		return "", err
 	}
-	return out.ID, nil
+	return out.Cover, nil
 }
 
-// Set posts to /api/admin/media/works/set, which is an admin's explicit edit and so
+// Set posts to /api/admin/media/curate/set, which is an admin's explicit edit and so
 // overwrites a locked item as well.
 func (r Remote) Set(_ context.Context, req model.MediaSetReq, _ bool) error {
-	return r.API.Call("POST", "/api/admin/media/works/set", req, nil)
+	return r.API.Call("POST", "/api/admin/media/curate/set", req, nil)
 }
 
 // ServerScrape asks the server to scrape provider:id into path.
 func (r Remote) ServerScrape(_ context.Context, p, provider, id string, lock, force bool) error {
-	return r.API.Call("POST", "/api/admin/media/works/scrape",
+	return r.API.Call("POST", "/api/admin/media/curate/scrape",
 		map[string]any{"path": p, "provider": provider, "id": id, "lock": lock, "force": force}, nil)
 }
 
@@ -110,7 +106,7 @@ func (r Remote) search(provider, q, kind string, year int) ([]scraper.Candidate,
 		v.Set("year", strconv.Itoa(year))
 	}
 	var cs []scraper.Candidate
-	if err := r.API.Call("GET", "/api/admin/media/works/search?"+v.Encode(), nil, &cs); err != nil {
+	if err := r.API.Call("GET", "/api/admin/media/curate/search?"+v.Encode(), nil, &cs); err != nil {
 		return nil, wrapRemoteErr(err)
 	}
 	return cs, nil

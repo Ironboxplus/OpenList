@@ -11,9 +11,8 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/media/apply"
 )
 
-// RemoteItems reads the stored items over the HTTP API: the admin list for
-// the paths, and /api/fs/media (database only, no storage access) for each
-// item's external ids, which the list leaves out.
+// RemoteItems reads the stored items over the HTTP API: the curate list gives
+// the paths, kinds and external ids.
 type RemoteItems struct{ API apply.API }
 
 // Items implements ItemSource.
@@ -28,20 +27,7 @@ func (r RemoteItems) Items(ctx context.Context, root string) ([]Item, error) {
 		if p != root && !strings.HasPrefix(p, root+"/") {
 			continue
 		}
-		it := Item{Path: p, Kind: e.Kind, Locked: e.Locked}
-		if e.Kind != "ignore" && e.Kind != "collection" {
-			var resp struct {
-				Item *struct {
-					ExternalIDs map[string]string `json:"external_ids"`
-				} `json:"item"`
-			}
-			if err := r.API.Call("POST", "/api/fs/media", map[string]any{"path": p}, &resp); err != nil {
-				return nil, fmt.Errorf("%s: %w", p, err)
-			}
-			if resp.Item != nil {
-				it.ExternalIDs = resp.Item.ExternalIDs
-			}
-		}
+		it := Item{Path: p, Kind: e.Kind, Locked: e.Locked, ExternalIDs: e.ExternalIDs}
 		out = append(out, it)
 	}
 	return out, nil

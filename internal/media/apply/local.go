@@ -2,6 +2,7 @@ package apply
 
 import (
 	"context"
+	"encoding/json"
 	"path"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
@@ -37,23 +38,25 @@ func (LocalLister) List(ctx context.Context, p string) ([]identify.Entry, error)
 type LocalWriter struct{ Store *store.Store }
 
 func (w LocalWriter) Existing(_ context.Context, prefix string) (map[string]Existing, error) {
-	items, err := db.AllMediaWorks(prefix)
+	items, err := db.ListVideoItemsUnder(prefix)
 	if err != nil {
 		return nil, err
 	}
 	m := make(map[string]Existing, len(items))
-	for _, it := range items {
-		m[it.Path] = Existing{Path: it.Path, Kind: it.Kind, Title: it.Title, Locked: it.Locked, Confidence: it.Confidence}
+	for i := range items {
+		it := &items[i]
+		p := db.MediaItemPath(it)
+		e := Existing{Path: p, Kind: it.VideoType, Title: it.ScrapedName, Locked: it.Locked, Confidence: it.Confidence}
+		if it.ExternalIDs != "" {
+			_ = json.Unmarshal([]byte(it.ExternalIDs), &e.ExternalIDs)
+		}
+		m[p] = e
 	}
 	return m, nil
 }
 
-func (w LocalWriter) UploadAsset(_ context.Context, data []byte, srcURL string) (uint, error) {
-	a, err := w.Store.AddAsset(data, srcURL)
-	if err != nil {
-		return 0, err
-	}
-	return a.ID, nil
+func (w LocalWriter) SaveImage(ctx context.Context, p, role string, data []byte) (string, error) {
+	return w.Store.SaveImage(ctx, p, role, data)
 }
 
 func (w LocalWriter) Set(_ context.Context, req model.MediaSetReq, force bool) error {

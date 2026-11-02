@@ -655,3 +655,22 @@ func ImportMediaScanPaths(paths []model.MediaScanPath) (idMap map[uint]uint, cre
 	}
 	return idMap, created, updated, nil
 }
+
+// FindScanPathFor returns the scan path of the media type that contains
+// p (the deepest one when they nest), or nil.
+func FindScanPathFor(mediaType model.MediaType, p string) (*model.MediaScanPath, error) {
+	paths, err := ListMediaScanPaths(mediaType)
+	if err != nil {
+		return nil, err
+	}
+	var best *model.MediaScanPath
+	for i := range paths {
+		root := strings.TrimSuffix(paths[i].Path, "/")
+		if root == "" || p == root || strings.HasPrefix(p, root+"/") {
+			if best == nil || len(paths[i].Path) > len(best.Path) {
+				best = &paths[i]
+			}
+		}
+	}
+	return best, nil
+}

@@ -1,7 +1,6 @@
 package apply
 
 import (
-	"errors"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -56,15 +55,15 @@ func (w *memWriter) Existing(_ context.Context, prefix string) (map[string]Exist
 	return out, nil
 }
 
-func (w *memWriter) UploadAsset(_ context.Context, data []byte, _ string) (uint, error) {
+func (w *memWriter) SaveImage(_ context.Context, p, role string, data []byte) (string, error) {
 	w.uploads++
 	key := string(data)
-	if id, ok := w.assets[key]; ok {
-		return id, nil
+	id, ok := w.assets[key]
+	if !ok {
+		id = uint(len(w.assets) + 1)
+		w.assets[key] = id
 	}
-	id := uint(len(w.assets) + 1)
-	w.assets[key] = id
-	return id, nil
+	return fmt.Sprintf("thumb:/imgs/%d-%s.jpg", id, role), nil
 }
 
 func (w *memWriter) Set(_ context.Context, req model.MediaSetReq, _ bool) error {
@@ -315,40 +314,10 @@ func dump(v any) string {
 	return string(b)
 }
 
-func TestLibraryRootsAreNotPlannedOrScraped(t *testing.T) {
-	root := "/115/arc/MOV"
-	ls := &fakeLister{tree: map[string][]identify.Entry{
-		root:                {{Name: "Anime", IsDir: true}, {Name: "盗梦空间", IsDir: true}},
-		root + "/盗梦空间": {{Name: "Inception.2010.mkv", Size: 8 << 30}},
-	}}
-	w := newMemWriter()
-	lib := "library"
-	w.items[root+"/Anime"] = model.MediaSetReq{Path: root + "/Anime", Kind: &lib} // unlocked on purpose
-	o := &Orchestrator{Lister: ls, Writer: w}
-	res, err := o.Plan(context.Background(), PlanOpts{Root: root})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(res.Rows) != 1 || res.Rows[0].Path != root+"/盗梦空间" || len(res.Skipped) != 1 {
-		t.Fatalf("rows=%+v skipped=%v", res.Rows, res.Skipped)
-	}
-	for _, c := range ls.calls {
-		if c == root+"/Anime" {
-			t.Error("the library directory was listed by plan")
-		}
-	}
-	o.Providers = &scraper.Set{}
-	if _, err := o.ScrapeOne(context.Background(), root+"/Anime", ScrapeOpts{Force: true}); !errors.Is(err, ErrLibrary) {
-		t.Fatalf("scraping a library root: %v", err)
-	}
-	// a plan row of kind library is accepted and written as is, without a fetch
-	rows, err := ParseTSV(strings.NewReader("/115/arc/MOV/Live\tlibrary\n"))
-	if err != nil || len(rows) != 1 {
-		t.Fatalf("tsv: %v %+v", err, rows)
-	}
-	rep, err := o.Apply(context.Background(), rows, ApplyOpts{})
-	if err != nil || rep.Failed != 0 || *w.items[root+"/Live"].Kind != "library" {
-		t.Fatalf("apply: %v %+v", err, rep)
+func TestTSVRejectsLibraryKind(t *testing.T) {
+	// a library root is a scan path now, not a kind of work
+	if _, err := ParseTSV(strings.NewReader("/115/arc/MOV/Live\tlibrary\n")); err == nil {
+		t.Fatal("kind library must be rejected")
 	}
 }
 

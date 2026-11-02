@@ -25,7 +25,7 @@ type Report struct {
 }
 
 // Apply writes a reviewed plan. For every row it fetches the details by
-// provider and id, downloads the poster and backdrop here and uploads them,
+// provider and id, downloads the poster and backdrop here and hands them to the Writer,
 // and stores the item (locked, source manual) with its episode map. Running it
 // again with the same plan gives the same result: assets deduplicate by hash
 // and Set overwrites in place. With DryRun nothing is fetched or written.
@@ -67,7 +67,7 @@ func (o *Orchestrator) applyRow(ctx context.Context, row Row, opts ApplyOpts) (s
 	what := fmt.Sprintf("%s [%s]", row.Path, row.Kind)
 
 	switch {
-	case row.Provider == "" || row.Kind == "ignore" || row.Kind == "library":
+	case row.Provider == "" || row.Kind == "ignore":
 		if opts.DryRun {
 			return "would set " + what, nil
 		}
@@ -136,10 +136,15 @@ func (o *Orchestrator) fillRequest(ctx context.Context, req *model.MediaSetReq, 
 	req.Overview = ptr(tg.Overview)
 
 	for _, img := range []struct {
-		url string
-		dst **uint
-	}{{tg.PosterURL, &req.PosterID}, {tg.BackdropURL, &req.BackdropID}} {
-		if img.url == "" || o.Download == nil {
+		url, role string
+		dst       **string
+	}{{tg.PosterURL, "poster", &req.Cover}, {tg.BackdropURL, "backdrop", &req.Backdrop}} {
+		if img.url == "" {
+			continue
+		}
+		if o.Download == nil {
+			// no way to fetch here: the work keeps the provider's URL
+			*img.dst = ptr(img.url)
 			continue
 		}
 		data, err := o.Download(ctx, img.url)
@@ -150,12 +155,12 @@ func (o *Orchestrator) fillRequest(ctx context.Context, req *model.MediaSetReq, 
 			*warns = append(*warns, "image: "+scraper.MaskSecrets(err.Error()))
 			continue
 		}
-		id, err := o.Writer.UploadAsset(ctx, data, img.url)
+		cover, err := o.Writer.SaveImage(ctx, row.Path, img.role, data)
 		if err != nil {
 			*warns = append(*warns, "upload: "+err.Error())
 			continue
 		}
-		*img.dst = ptr(id)
+		*img.dst = ptr(cover)
 	}
 
 	if (row.Kind == "tv" || row.Kind == "anime") && o.Lister != nil && tg.Kind != "movie" && !strings.HasPrefix(tg.ExternalIDs[scraper.ProviderTMDB], "movie/") {

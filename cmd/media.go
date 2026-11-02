@@ -138,10 +138,10 @@ one /api/fs/get and one Range request per work.`,
 
 	lib := &cobra.Command{
 		Use:   "library",
-		Short: "Mark directories as library roots (kind=library): they open as a poster wall of their entries",
+		Short: "Library roots: video scan paths whose entries are the works",
 	}
-	libAdd := &cobra.Command{Use: "add", Short: "Mark --path as a library root (locked, source manual)", Args: cobra.NoArgs, RunE: runLibraryAdd}
-	libRm := &cobra.Command{Use: "rm", Short: "Remove the library mark of --path (its entries stay)", Args: cobra.NoArgs, RunE: runLibraryRm}
+	libAdd := &cobra.Command{Use: "add", Short: "Make --path a library root (a video scan path that scans each entry as a work)", Args: cobra.NoArgs, RunE: runLibraryAdd}
+	libRm := &cobra.Command{Use: "rm", Short: "Remove the scan path --path (the works already scanned stay)", Args: cobra.NoArgs, RunE: runLibraryRm}
 	libLs := &cobra.Command{Use: "ls", Short: "List library roots", Args: cobra.NoArgs, RunE: runLibraryLs}
 	for _, c := range []*cobra.Command{libAdd, libRm} {
 		c.Flags().StringVar(&mediaFlags.path, "path", "", "the library directory, e.g. /115/arc/MOV/Anime (required)")
@@ -283,7 +283,7 @@ func runMediaScrape(cmd *cobra.Command, args []string) error {
 	if o.Providers == nil {
 		// no keys here: let the server scrape
 		var res apply.ScrapeResult
-		err := c.Call("POST", "/api/admin/media/works/scrape", map[string]any{
+		err := c.Call("POST", "/api/admin/media/curate/scrape", map[string]any{
 			"path": mediaFlags.path, "provider": mediaFlags.provider, "id": mediaFlags.id,
 			"lock": mediaFlags.lock, "force": mediaFlags.force,
 		}, &res)
@@ -387,7 +387,7 @@ func runMediaLs(cmd *cobra.Command, args []string) error {
 		if mediaFlags.pending {
 			q.Set("pending", "true")
 		}
-		if err := c.Call("GET", "/api/admin/media/works/list?"+q.Encode(), nil, &resp); err != nil {
+		if err := c.Call("GET", "/api/admin/media/curate/list?"+q.Encode(), nil, &resp); err != nil {
 			return err
 		}
 		for _, it := range resp.Content {
@@ -419,30 +419,38 @@ func libraryPath() string {
 	return p
 }
 
+// videoScanPaths lists the library roots: the video scan paths of the server.
+func videoScanPaths(c *syncClient) ([]mdl.MediaScanPath, error) {
+	var paths []mdl.MediaScanPath
+	if err := c.Call("GET", "/api/admin/media/scan_paths?media_type="+string(mdl.MediaTypeVideo), nil, &paths); err != nil {
+		return nil, err
+	}
+	return paths, nil
+}
+
 func runLibraryAdd(cmd *cobra.Command, args []string) error {
 	c, err := newSyncClient()
 	if err != nil {
 		return err
 	}
 	p := libraryPath()
-	ctx, stop := mediaContext()
-	defer stop()
-	remote := apply.Remote{API: c}
-	ex, err := remote.Existing(ctx, p)
+	paths, err := videoScanPaths(c)
 	if err != nil {
 		return err
 	}
-	switch cur := ex[p]; cur.Kind {
-	case "movie", "tv", "anime":
-		return fmt.Errorf("%s is already a %s item; remove it first (openlist media library rm does not touch works)", p, cur.Kind)
+	for _, sp := range paths {
+		if strings.TrimRight(sp.Path, "/") == p {
+			return fmt.Errorf("%s is already a library", p)
+		}
 	}
-	title := p[strings.LastIndex(p, "/")+1:]
-	kind, src, lock := mdl.MediaKindLibrary, mdl.MediaSourceManual, true
-	req := mdl.MediaSetReq{Path: p, Kind: &kind, Title: &title, Source: &src, Locked: &lock}
-	if err := remote.Set(ctx, req, true); err != nil {
+	req := map[string]any{
+		"media_type": mdl.MediaTypeVideo, "name": p[strings.LastIndex(p, "/")+1:], "path": p,
+		"path_merge": true, "enable_scrape": true,
+	}
+	if err := c.Call("POST", "/api/admin/media/scan_paths/create", req, nil); err != nil {
 		return err
 	}
-	fmt.Fprintf(cmd.OutOrStdout(), "%s is a library\n", p)
+	fmt.Fprintf(cmd.OutOrStdout(), "%s is a library (a video scan path; its entries are the works)\n", p)
 	return nil
 }
 
@@ -452,20 +460,21 @@ func runLibraryRm(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	p := libraryPath()
-	ctx, stop := mediaContext()
-	defer stop()
-	ex, err := apply.Remote{API: c}.Existing(ctx, p)
+	paths, err := videoScanPaths(c)
 	if err != nil {
 		return err
 	}
-	if ex[p].Kind != mdl.MediaKindLibrary {
-		return fmt.Errorf("%s is not a library", p)
+	for _, sp := range paths {
+		if strings.TrimRight(sp.Path, "/") != p {
+			continue
+		}
+		if err := c.Call("POST", "/api/admin/media/scan_paths/delete?id="+strconv.FormatUint(uint64(sp.ID), 10), nil, nil); err != nil {
+			return err
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "%s is no longer a library (its works stay)\n", p)
+		return nil
 	}
-	if err := c.Call("POST", "/api/admin/media/works/delete", map[string]any{"path": p}, nil); err != nil {
-		return err
-	}
-	fmt.Fprintf(cmd.OutOrStdout(), "%s is no longer a library\n", p)
-	return nil
+	return fmt.Errorf("%s is not a library", p)
 }
 
 func runLibraryLs(cmd *cobra.Command, args []string) error {
@@ -473,22 +482,12 @@ func runLibraryLs(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	for page := 1; ; page++ {
-		var resp struct {
-			Content []struct {
-				Path string `json:"path"`
-			} `json:"content"`
-			Total int64 `json:"total"`
-		}
-		q := url.Values{"kind": {mdl.MediaKindLibrary}, "page": {strconv.Itoa(page)}, "per_page": {"500"}}
-		if err := c.Call("GET", "/api/admin/media/works/list?"+q.Encode(), nil, &resp); err != nil {
-			return err
-		}
-		for _, it := range resp.Content {
-			fmt.Fprintln(cmd.OutOrStdout(), it.Path)
-		}
-		if len(resp.Content) == 0 || int64(page*500) >= resp.Total {
-			return nil
-		}
+	paths, err := videoScanPaths(c)
+	if err != nil {
+		return err
 	}
+	for _, sp := range paths {
+		fmt.Fprintln(cmd.OutOrStdout(), sp.Path)
+	}
+	return nil
 }

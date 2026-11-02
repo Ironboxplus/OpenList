@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -34,7 +35,8 @@ type fakeOP struct {
 	lists   []string
 	uploads int
 	scrapes []map[string]any
-	ids     map[string]map[string]string // path -> external ids, for /api/fs/media
+	ids     map[string]map[string]string // path -> external ids, for the curate list
+	paths   []mm.MediaScanPath           // the video scan paths
 	rawURL  string                       // what /api/fs/get answers
 	gets    []string
 }
@@ -67,16 +69,16 @@ func (f *fakeOP) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		reply(200, "success", map[string]any{"content": ents, "total": len(ents)})
-	case "/api/admin/media/works/list":
+	case "/api/admin/media/curate/list":
 		prefix := r.URL.Query().Get("prefix")
 		var out []map[string]any
 		for p, it := range f.items {
 			if strings.HasPrefix(p, prefix) && (r.URL.Query().Get("kind") == "" || r.URL.Query().Get("kind") == *it.Kind) {
-				out = append(out, map[string]any{"path": p, "kind": *it.Kind, "locked": f.locked[p], "confidence": 1})
+				out = append(out, map[string]any{"path": p, "kind": *it.Kind, "locked": f.locked[p], "confidence": 1, "external_ids": f.ids[p]})
 			}
 		}
 		reply(200, "success", map[string]any{"content": out, "total": len(out)})
-	case "/api/admin/media/works/set":
+	case "/api/admin/media/curate/set":
 		var req mm.MediaSetReq
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		f.sets = append(f.sets, req)
@@ -85,7 +87,7 @@ func (f *fakeOP) serve(w http.ResponseWriter, r *http.Request) {
 			f.locked[req.Path] = *req.Locked
 		}
 		reply(200, "success", nil)
-	case "/api/admin/media/works/asset":
+	case "/api/admin/media/curate/image":
 		f.uploads++
 		file, _, err := r.FormFile("file")
 		if err != nil {
@@ -99,30 +101,45 @@ func (f *fakeOP) serve(w http.ResponseWriter, r *http.Request) {
 			id = len(f.assets) + 1
 			f.assets[key] = id
 		}
-		reply(200, "success", map[string]any{"id": id, "w": 10, "h": 10})
-	case "/api/admin/media/works/search":
+		reply(200, "success", map[string]any{"cover": fmt.Sprintf("thumb:/imgs/%d-%s.jpg", id, r.URL.Query().Get("role"))})
+	case "/api/admin/media/curate/search":
 		q := r.URL.Query().Get("q")
 		if q == "盗梦空间" {
 			reply(200, "success", []scraper.Candidate{{Provider: "tmdb", ID: "movie/27205", Title: "盗梦空间", Year: 2010, Score: 0.92}})
 			return
 		}
 		reply(200, "success", []scraper.Candidate{{Provider: "tmdb", ID: "tv/1", Title: "Something", Year: 2001, Score: 0.31}, {Provider: "tmdb", ID: "tv/2", Title: "Other", Year: 2002, Score: 0.3}})
-	case "/api/admin/media/works/delete":
+	case "/api/admin/media/curate/delete":
 		var req struct{ Path string }
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		delete(f.items, req.Path)
 		delete(f.locked, req.Path)
 		reply(200, "success", nil)
-	case "/api/fs/media":
-		var req struct{ Path string }
+	case "/api/admin/media/scan_paths":
+		reply(200, "success", f.paths)
+	case "/api/admin/media/scan_paths/create":
+		var req struct {
+			Name, Path string
+			PathMerge  bool `json:"path_merge"`
+		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
-		reply(200, "success", map[string]any{"item": map[string]any{"path": req.Path, "external_ids": f.ids[req.Path]}})
+		f.paths = append(f.paths, mm.MediaScanPath{ID: uint(len(f.paths) + 1), MediaType: mm.MediaTypeVideo, Name: req.Name, Path: req.Path, PathMerge: req.PathMerge})
+		reply(200, "success", nil)
+	case "/api/admin/media/scan_paths/delete":
+		id := r.URL.Query().Get("id")
+		for i, p := range f.paths {
+			if fmt.Sprint(p.ID) == id {
+				f.paths = append(f.paths[:i], f.paths[i+1:]...)
+				break
+			}
+		}
+		reply(200, "success", nil)
 	case "/api/fs/get":
 		var req struct{ Path string }
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		f.gets = append(f.gets, req.Path)
 		reply(200, "success", map[string]any{"raw_url": f.rawURL})
-	case "/api/admin/media/works/scrape":
+	case "/api/admin/media/curate/scrape":
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		f.scrapes = append(f.scrapes, body)
@@ -306,12 +323,12 @@ func TestApplyWithEnvFetchesAndUploadsFromThisMachine(t *testing.T) {
 	if *got.Title != "新世纪福音战士" || *got.Year != 1995 || got.ExternalIDs["imdb"] != "tt0112159" || got.ExternalIDs["tmdb"] != "tv/890" {
 		t.Fatalf("details: %+v", got)
 	}
-	if got.PosterID == nil || *got.PosterID == 0 || got.BackdropID == nil || !*got.Locked || *got.Source != "manual" {
+	if got.Cover == nil || !strings.HasSuffix(*got.Cover, "-poster.jpg") || got.Backdrop == nil || !strings.HasSuffix(*got.Backdrop, "-backdrop.jpg") || !*got.Locked || *got.Source != "manual" {
 		t.Fatalf("images / lock / source: %+v", got)
 	}
-	// both images are the same bytes here, so they deduplicate to one asset
-	if f.uploads != 2 || len(f.assets) != 1 {
-		t.Fatalf("uploads=%d distinct assets=%d", f.uploads, len(f.assets))
+	// the server stores each image: poster and backdrop are two uploads
+	if f.uploads != 2 {
+		t.Fatalf("uploads=%d", f.uploads)
 	}
 	if len(got.Episodes) != 3 || got.Episodes[0].FileName != "Season 1/EVA.S01E01.mkv" || got.Episodes[0].Title != "使徒，来袭" || got.Episodes[2].Title != "" {
 		t.Fatalf("episodes: %+v", got.Episodes)
@@ -332,7 +349,7 @@ func TestTokenFile(t *testing.T) {
 	var out struct {
 		Total int `json:"total"`
 	}
-	if err := c.Call("GET", "/api/admin/media/works/list", nil, &out); err != nil {
+	if err := c.Call("GET", "/api/admin/media/curate/list", nil, &out); err != nil {
 		t.Fatalf("the token from the file was not used: %v", err)
 	}
 	_ = os.WriteFile(p, []byte("  \n"), 0o600)
@@ -438,26 +455,25 @@ func TestLibraryAddLsRm(t *testing.T) {
 	if out, err := run(t, runLibraryAdd); err != nil || !strings.Contains(out, "/115/arc/MOV/Anime is a library") {
 		t.Fatalf("add: %q %v", out, err)
 	}
-	got := f.items["/115/arc/MOV/Anime"]
-	if got.Kind == nil || *got.Kind != "library" || got.Locked == nil || !*got.Locked || got.Source == nil || *got.Source != "manual" || *got.Title != "Anime" {
-		t.Fatalf("stored: %+v", got)
+	if len(f.paths) != 1 || f.paths[0].Path != "/115/arc/MOV/Anime" || !f.paths[0].PathMerge || f.paths[0].MediaType != mm.MediaTypeVideo {
+		t.Fatalf("stored: %+v", f.paths)
 	}
-	f.items["/115/arc/MOV/Anime/EVA"] = mm.MediaSetReq{Path: "/115/arc/MOV/Anime/EVA", Kind: ptr("tv")}
+	if _, err := run(t, runLibraryAdd); err == nil {
+		t.Fatal("a library was added twice")
+	}
 	if out, _ := run(t, runLibraryLs); strings.TrimSpace(out) != "/115/arc/MOV/Anime" {
 		t.Fatalf("ls: %q", out)
 	}
+	f.items["/115/arc/MOV/Anime/EVA"] = mm.MediaSetReq{Path: "/115/arc/MOV/Anime/EVA", Kind: ptr("tv")}
 	mediaFlags.path = "/115/arc/MOV/Anime/EVA"
 	if _, err := run(t, runLibraryRm); err == nil {
-		t.Fatal("rm removed a work")
-	}
-	if _, err := run(t, runLibraryAdd); err == nil {
-		t.Fatal("add overwrote a work")
+		t.Fatal("rm removed something that is not a library")
 	}
 	mediaFlags.path = "/115/arc/MOV/Anime"
 	if _, err := run(t, runLibraryRm); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := f.items["/115/arc/MOV/Anime"]; ok || f.items["/115/arc/MOV/Anime/EVA"].Path == "" {
-		t.Fatalf("rm should delete only the root: %v", f.items)
+	if len(f.paths) != 0 || f.items["/115/arc/MOV/Anime/EVA"].Path == "" {
+		t.Fatalf("rm should delete only the scan path: %v %v", f.paths, f.items)
 	}
 }

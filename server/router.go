@@ -146,9 +146,6 @@ func Init(e *gin.Engine) {
 	api.GET("/plugin/manifest", handles.PluginManifest)
 	api.GET("/plugin/asset/:name", handles.PluginAsset)
 
-	// Media images: <img> can't send Authorization, so the URL carries a
-	// signature over "/media/asset/<id>" (see handles.MediaAsset).
-	api.GET("/media/asset/:id", handles.MediaAsset)
 
 	// Cluster storage-sync peer endpoint: a persistent WebSocket so NAT'd nodes
 	// can dial out and stay connected. Authentication/encryption come from the
@@ -241,16 +238,14 @@ func admin(g *gin.RouterGroup) {
 	syncGrp.GET("/bwlimit", handles.SyncBwLimit)
 	syncGrp.POST("/bwlimit", handles.SyncBwLimit)
 
-	// staged copy of our media admin API; the upstream library owns /media/* until the merge (section 4)
-	mediaGrp := g.Group("/media/works")
-	mediaGrp.POST("/set", handles.MediaSet)
-	mediaGrp.POST("/delete", handles.MediaDelete)
-	mediaGrp.GET("/list", handles.MediaAdminList)
-	mediaGrp.POST("/asset", handles.MediaAssetUpload)
-	mediaGrp.POST("/scrape", handles.MediaScrape)
-	mediaGrp.GET("/search", handles.MediaSearch)
-	mediaGrp.GET("/export", handles.MediaExport)
-	mediaGrp.POST("/import", handles.MediaImport)
+	// curation of video works by path: the backend of `openlist media`
+	curate := g.Group("/media/curate")
+	curate.POST("/set", handles.CurateSet)
+	curate.POST("/delete", handles.CurateDelete)
+	curate.GET("/list", handles.CurateList)
+	curate.POST("/image", handles.CurateImage)
+	curate.POST("/scrape", handles.CurateScrape)
+	curate.GET("/search", handles.CurateSearch)
 
 	// Admin-only user operations (create/delete/role-affecting). The profile-edit
 	// endpoints (list/get/update) live in a separate group that also accepts a

@@ -17,10 +17,6 @@ import (
 // ErrLocked is returned when a locked item would be overwritten.
 var ErrLocked = errors.New("media item is locked")
 
-// ErrLibrary is returned when a library root itself would be scraped: only its
-// entries are works.
-var ErrLibrary = errors.New("path is a library root; scrape its entries (media plan --root <path>)")
-
 // ErrNotDir is returned by a Lister for a path that is a file.
 var ErrNotDir = errors.New("not a directory")
 
@@ -36,14 +32,18 @@ type Existing struct {
 	Title      string  `json:"title"`
 	Locked     bool    `json:"locked"`
 	Confidence float32 `json:"confidence"`
+	// ExternalIDs are the provider ids of a matched work (tmdb "tv/890", imdb "tt...").
+	ExternalIDs map[string]string `json:"external_ids,omitempty"`
 }
 
 // Writer reads and writes the media store.
 type Writer interface {
 	// Existing returns the items at prefix and below, by path.
 	Existing(ctx context.Context, prefix string) (map[string]Existing, error)
-	// UploadAsset stores an image and returns its asset id.
-	UploadAsset(ctx context.Context, data []byte, srcURL string) (uint, error)
+	// SaveImage stores a poster or backdrop of the work at path (role is
+	// "poster" or "backdrop") and returns the cover reference to put in the
+	// work's Cover or Backdrop.
+	SaveImage(ctx context.Context, path, role string, data []byte) (string, error)
 	// Set upserts an item. force lets it overwrite a locked one.
 	Set(ctx context.Context, req model.MediaSetReq, force bool) error
 }
