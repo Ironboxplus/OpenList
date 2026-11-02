@@ -15,8 +15,8 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/pkg/cookie"
+	"github.com/glebarez/sqlite"
 	"github.com/go-resty/resty/v2"
-	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
 
