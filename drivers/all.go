@@ -14,6 +14,7 @@ import (
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/189pc"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/alias"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/alidoc"
+	_ "github.com/OpenListTeam/OpenList/v4/drivers/alist_v2"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/alist_v3"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/aliyundrive"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/aliyundrive_open"
