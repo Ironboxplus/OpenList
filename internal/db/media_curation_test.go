@@ -116,3 +116,61 @@ func TestClearScrapedDataSparesLocked(t *testing.T) {
 		t.Errorf("unlocked item was not cleared: %+v", gb)
 	}
 }
+
+func TestMediaRatingsReplaceAndClear(t *testing.T) {
+	newCurationDB(t)
+	if err := db.AutoMigrate(&model.MediaRating{}, &model.MediaAnnotation{}); err != nil {
+		t.Fatal(err)
+	}
+	a, b := scanned("A"), scanned("B")
+	b.Locked = true
+	for _, it := range []*model.MediaItem{a, b} {
+		if err := CreateOrUpdateMediaItem(it); err != nil {
+			t.Fatal(err)
+		}
+	}
+	two := []model.MediaRating{{Source: "tmdb", Value: 8.3}, {Source: "rt", Text: "93%"}}
+	if err := ReplaceMediaRatings(a.ID, two); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReplaceMediaRatings(b.ID, []model.MediaRating{{Source: "imdb", Value: 7}}); err != nil {
+		t.Fatal(err)
+	}
+	// replacing leaves exactly the new set
+	if err := ReplaceMediaRatings(a.ID, []model.MediaRating{{Source: "douban", Value: 9.1}}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ListMediaRatings(a.ID, b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got[a.ID]) != 1 || got[a.ID][0].Source != "douban" || len(got[b.ID]) != 1 {
+		t.Fatalf("ratings = %+v", got)
+	}
+	if _, err := ClearMediaScrapedData(model.MediaTypeVideo); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = ListMediaRatings(a.ID, b.ID)
+	if len(got[a.ID]) != 0 || len(got[b.ID]) != 1 {
+		t.Errorf("clear must drop the unlocked item's ratings only: %+v", got)
+	}
+	if err := DeleteMediaItem(b.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = ListMediaRatings(b.ID)
+	if len(got[b.ID]) != 0 {
+		t.Errorf("deleting an item must delete its ratings")
+	}
+}
+
+func TestPrimaryRating(t *testing.T) {
+	if got := model.PrimaryRating(map[string]float32{"imdb": 7, "douban": 9}); got != 9 {
+		t.Errorf("douban outranks imdb, got %v", got)
+	}
+	if got := model.PrimaryRating(map[string]float32{"tmdb": 8, "douban": 9}); got != 8 {
+		t.Errorf("tmdb is the main rating, got %v", got)
+	}
+	if got := model.PrimaryRating(nil); got != 0 {
+		t.Errorf("got %v", got)
+	}
+}

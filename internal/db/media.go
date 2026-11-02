@@ -262,7 +262,7 @@ func DeleteMediaItem(id uint) error {
 		if err := tx.Unscoped().Delete(&model.MediaItem{}, id).Error; err != nil {
 			return err
 		}
-		return tx.Where("item_id = ?", id).Delete(&model.MediaAnnotation{}).Error
+		return deleteMediaChildren(tx, []uint{id})
 	})
 }
 
@@ -278,10 +278,7 @@ func ClearMediaItems(mediaType model.MediaType) error {
 			Delete(&model.MediaItem{}).Error; err != nil {
 			return err
 		}
-		if len(ids) == 0 {
-			return nil
-		}
-		return tx.Where("item_id IN ?", ids).Delete(&model.MediaAnnotation{}).Error
+		return deleteMediaChildren(tx, ids)
 	})
 }
 
@@ -297,10 +294,7 @@ func ClearMediaItemsByScanPath(scanPathID uint) error {
 			Delete(&model.MediaItem{}).Error; err != nil {
 			return err
 		}
-		if len(ids) == 0 {
-			return nil
-		}
-		return tx.Where("item_id IN ?", ids).Delete(&model.MediaAnnotation{}).Error
+		return deleteMediaChildren(tx, ids)
 	})
 }
 
@@ -312,6 +306,14 @@ func ClearMediaScrapedData(mediaType model.MediaType) (int64, error) {
 	tx := db.Unscoped().Model(&model.MediaItem{}).Where("locked = ?", false)
 	if mediaType != "" {
 		tx = tx.Where("media_type = ?", mediaType)
+	}
+	// 多源评分表随之清空
+	idQuery := db.Unscoped().Model(&model.MediaItem{}).Select("id").Where("locked = ?", false)
+	if mediaType != "" {
+		idQuery = idQuery.Where("media_type = ?", mediaType)
+	}
+	if err := db.Where("item_id IN (?)", idQuery).Delete(&model.MediaRating{}).Error; err != nil {
+		return 0, err
 	}
 	updates := map[string]interface{}{
 		"original_title": "",
@@ -362,7 +364,7 @@ func DeleteMediaItemsByIDs(ids []uint) error {
 		if err := tx.Unscoped().Where("id IN ?", ids).Delete(&model.MediaItem{}).Error; err != nil {
 			return err
 		}
-		return tx.Where("item_id IN ?", ids).Delete(&model.MediaAnnotation{}).Error
+		return deleteMediaChildren(tx, ids)
 	})
 }
 
