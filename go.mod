@@ -59,6 +59,7 @@ require (
 	github.com/jlaffaye/ftp v0.2.4
 	github.com/json-iterator/go v1.1.12
 	github.com/kdomanski/iso9660 v0.4.0
+	github.com/larksuite/oapi-sdk-go/v3 v3.12.2
 	github.com/maruel/natural v1.3.0
 	github.com/meilisearch/meilisearch-go v0.32.0
 	github.com/mholt/archives v0.1.5
@@ -231,7 +232,6 @@ require (
 	github.com/klauspost/pgzip v1.2.6 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/lanrat/extsort v1.4.2 // indirect
-	github.com/larksuite/oapi-sdk-go/v3 v3.12.2
 	github.com/leodido/go-urn v1.4.0 // indirect
 	github.com/libp2p/go-buffer-pool v0.1.0 // indirect
 	github.com/libp2p/go-flow-metrics v0.1.0 // indirect
