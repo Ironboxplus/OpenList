@@ -116,6 +116,7 @@ type downloader struct {
 	written   atomic.Int64 //total bytes of file downloaded from remote
 
 	concurrency int //剩余的并发数，递减。到0时停止并发
+	workers     int //仍在运行的 downloadPart 数量（mu 保护）；放弃并发的 worker 退出前要保证还剩一个来接手重新入队的分片
 	pos         int64
 	maxPos      int64
 	delayMu     sync.Mutex
@@ -495,8 +496,12 @@ func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int
 			d.concurrency = -d.concurrency
 			isCancelConcurrency = true
 		}
-		if isCancelConcurrency {
+		// A worker may only give up its slot while another one is left to take the
+		// requeued chunk; two workers that both gave up would leave their chunks in
+		// the channel with nobody to download them.
+		if isCancelConcurrency && d.workers > 1 {
 			d.concurrency--
+			d.workers--
 			d.mu.Unlock()
 			// Hand the chunk to a worker that is already established: once it is
 			// requeued it no longer counts as a new connection, otherwise every
