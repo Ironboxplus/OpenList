@@ -287,6 +287,7 @@ func (d *downloader) sendChunkTask(newConcurrency bool) (err error) {
 		if newConcurrency {
 			// The worker owns the acquired slot only after its chunk is queued.
 			go d.downloadPart()
+			d.workers++
 			d.concurrency--
 		}
 		return nil
@@ -418,6 +419,8 @@ func (d *downloader) downloadChunk(ch *chunk) bool {
 				return false
 			}
 			retry--
+		} else if err == errYieldChunk {
+			return true // 分片已放回队列，继续取下一个
 		} else if err == errCancelConcurrency {
 			return false // 取消一个的并发
 		} else {
@@ -443,6 +446,7 @@ func (d *downloader) delay(ti time.Duration) bool {
 
 var errCancelConcurrency = errors.New("")
 var errOverloadRetry = errors.New("overload retry")
+var errYieldChunk = errors.New("chunk handed back to the queue")
 
 // Backoff between the retries of an overloaded server: overloadRetry*unit, at
 // most max. Variables so that tests can shrink them.
@@ -522,6 +526,15 @@ func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int
 			defer d.delayMu.Unlock()
 			if !d.delay(time.Millisecond * time.Duration(rand.Uint32N(300)+200)) {
 				return 0, errCancelConcurrency
+			}
+			// Do not sit on a part nobody is waiting for while others (the one being
+			// read among them) are queued: put it behind them and take the next.
+			if len(d.chunkCh) > 0 {
+				select {
+				case d.chunkCh <- *ch:
+					return 0, errYieldChunk
+				default:
+				}
 			}
 		}
 		return 0, errOverloadRetry
