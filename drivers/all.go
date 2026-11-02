@@ -23,6 +23,7 @@ import (
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/azure_blob"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/baidu_netdisk"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/baidu_photo"
+	_ "github.com/OpenListTeam/OpenList/v4/drivers/baidu_share"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/baidu_youth"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/cfs"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/bunny_storage"
