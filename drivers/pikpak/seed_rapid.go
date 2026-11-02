@@ -32,7 +32,7 @@ func (d *PikPak) RapidUploadByHashes(ctx context.Context, dstDir model.Obj, req 
 	}
 
 	var resp UploadTaskData
-	_, err := d.request("https://api-drive.mypikpak.net/drive/v1/files", http.MethodPost, func(r *resty.Request) {
+	_, err := d.request(d.apiURL("/drive/v1/files"), http.MethodPost, func(r *resty.Request) {
 		r.SetContext(ctx).SetBody(base.Json{
 			"kind":        "drive#file",
 			"name":        req.Name,
