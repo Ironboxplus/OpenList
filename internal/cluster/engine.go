@@ -108,9 +108,11 @@ func Init(dataDir string) (*Manager, error) {
 		return nil, err
 	}
 	m.loadState()
+	m.loadSaved()
 	m.state.revRetentionSec = m.cfgStore.get().revocationRetentionSec()
 
 	op.RegisterStorageHook(m.onStorageHook)
+	op.RegisterStoragePreSaveHook(m.onStoragePreSave)
 	op.RegisterStorageCredentialHook(m.onStorageCredential)
 	op.RegisterStorageCredentialHealthHook(m.onStorageCredentialHealthy)
 	// Only the group's lease holder may spend a single-use refresh_token.
@@ -395,8 +397,8 @@ func (m *Manager) onStorageHook(typ string, d driver.Driver) {
 	// add/update/del: LoadStorage and UpdateStorage fire this after the storage
 	// is registered, so a reconcile queued earlier for a not-yet-registered mount
 	// is satisfied here at the latest.
-	if typ == "update" {
-		m.notePairSaved(d.GetStorage())
+	if typ == "del" {
+		m.forgetSaved(d.GetStorage().MountPath)
 	}
 	m.enqueueMount(d.GetStorage().MountPath)
 	go m.refreshInventory()

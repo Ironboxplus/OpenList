@@ -2,7 +2,11 @@ package cluster
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -140,6 +144,9 @@ func (m *Manager) reconcile(q workqueue.TypedRateLimitingInterface[string], key 
 	}
 	before := *d.GetStorage() // also the rollback point
 
+	if _, ok := m.state.credByHash(groupID, credHash(extractCreds(before.Addition))); ok {
+		m.forgetSaved(mount) // catalogued now: the version rule decides
+	}
 	want := m.desiredCandidate(groupID, mount, before)
 	if want == nil {
 		if before.Status == op.WORK {
@@ -209,9 +216,11 @@ func (m *Manager) mountInGroup(groupID, mount string) bool {
 	return false
 }
 
-// savedPair is what the node knew when a mount's storage was updated to a pair
-// the catalogue had no record of: a local rotation (the driver saves the new
-// pair before onStorageCredential catalogues it) or an administrator's edit. The
+// savedPair is what the node knew when a mount's storage was about to be saved
+// with a pair the catalogue had no record of: a local rotation (the driver saves
+// the new pair before onStorageCredential catalogues it) or an administrator's
+// edit. It is persisted (saved_pairs.json) because a restart between the save
+// and the cataloguing leaves the same uncatalogued pair behind. The
 // pair was made after the records in known, so none of them is newer than it.
 // Records absorbed later are not in known and compete normally.
 type savedPair struct {
@@ -219,9 +228,26 @@ type savedPair struct {
 	known map[string]struct{} // group, separator, credential hash
 }
 
-// notePairSaved remembers, at the moment a storage is updated, which catalogued
-// records the new pair is ahead of. It must run before anything can reconcile
-// the mount, which is why the storage hook calls it before enqueueing.
+// onStoragePreSave runs just before op writes a storage record. It is the only
+// point that precedes both the database write and the asynchronous "update"
+// hook, so a crash or a resync after the write cannot find the pair without its
+// snapshot.
+func (m *Manager) onStoragePreSave(st model.Storage) {
+	select {
+	case <-m.stopCh:
+		return
+	default:
+	}
+	if !m.cfgStore.get().active() {
+		return
+	}
+	m.notePairSaved(&st)
+}
+
+// notePairSaved remembers which catalogued records the pair about to be saved is
+// ahead of, and persists that before the save so a restart keeps it. Only hashes
+// are stored, never credentials. A pair that is already catalogued needs no
+// snapshot: its version decides.
 func (m *Manager) notePairSaved(st *model.Storage) {
 	hash := credHash(extractCreds(st.Addition))
 	known := map[string]struct{}{}
@@ -239,11 +265,99 @@ func (m *Manager) notePairSaved(st *model.Storage) {
 	if m.saved == nil {
 		m.saved = make(map[string]savedPair)
 	}
-	if hash == "" || catalogued {
-		delete(m.saved, st.MountPath)
+	if hash == "" || catalogued || len(known) == 0 {
+		m.dropSavedLocked(st.MountPath)
 		return
 	}
 	m.saved[st.MountPath] = savedPair{hash: hash, known: known}
+	m.persistSavedLocked()
+}
+
+// forgetSaved drops a mount's snapshot (storage deleted, or its pair is
+// catalogued and the version rule applies).
+func (m *Manager) forgetSaved(mount string) {
+	m.savedMu.Lock()
+	defer m.savedMu.Unlock()
+	m.dropSavedLocked(mount)
+}
+
+func (m *Manager) dropSavedLocked(mount string) {
+	if _, ok := m.saved[mount]; !ok {
+		return
+	}
+	delete(m.saved, mount)
+	m.persistSavedLocked()
+}
+
+func (m *Manager) savedPath() string { return filepath.Join(m.dir, "saved_pairs.json") }
+
+type savedPairFile struct {
+	Hash  string   `json:"hash"`
+	Known []string `json:"known"`
+}
+
+func (m *Manager) loadSaved() {
+	b, err := os.ReadFile(m.savedPath())
+	if err != nil {
+		return
+	}
+	var in map[string]savedPairFile
+	if err := json.Unmarshal(b, &in); err != nil {
+		utils.Log.Warnf("[cluster] corrupt saved-pair file, ignoring: %v", err)
+		return
+	}
+	m.savedMu.Lock()
+	defer m.savedMu.Unlock()
+	m.saved = make(map[string]savedPair, len(in))
+	for mount, f := range in {
+		sp := savedPair{hash: f.Hash, known: make(map[string]struct{}, len(f.Known))}
+		for _, k := range f.Known {
+			sp.known[k] = struct{}{}
+		}
+		m.saved[mount] = sp
+	}
+}
+
+// persistSavedLocked writes the snapshots atomically: temp file, fsync, rename.
+func (m *Manager) persistSavedLocked() {
+	out := make(map[string]savedPairFile, len(m.saved))
+	for mount, sp := range m.saved {
+		f := savedPairFile{Hash: sp.hash, Known: make([]string, 0, len(sp.known))}
+		for k := range sp.known {
+			f.Known = append(f.Known, k)
+		}
+		sort.Strings(f.Known)
+		out[mount] = f
+	}
+	b, err := json.Marshal(out)
+	if err == nil {
+		err = os.MkdirAll(m.dir, 0o700)
+	}
+	if err == nil {
+		err = writeFileSynced(m.savedPath(), b)
+	}
+	if err != nil {
+		utils.Log.Errorf("[cluster] failed to persist saved-pair snapshots: %v", err)
+	}
+}
+
+func writeFileSynced(path string, b []byte) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err = f.Write(b); err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // aheadOfRunningPair reports whether the record predates the uncatalogued pair
