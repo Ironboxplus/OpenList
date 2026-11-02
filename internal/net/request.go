@@ -379,6 +379,7 @@ func (d *downloader) downloadChunk(ch *chunk) bool {
 	log.Debugf("start chunk_%d, %+v", ch.id, ch)
 	params := d.getParamsFromChunk(ch)
 	var err error
+	overloadRetry := 0
 	for retry := 0; retry <= d.cfg.PartBodyMaxRetries; retry++ {
 		var n int64
 		n, err = d.tryDownloadChunk(params, ch)
@@ -406,7 +407,15 @@ func (d *downloader) downloadChunk(ch *chunk) bool {
 			}
 			log.Warnf("err chunk_%d, object part download error %s, retrying attempt %d. %v",
 				ch.id, params.URL, retry, err)
-		} else if err == errInfiniteRetry {
+		} else if err == errOverloadRetry {
+			overloadRetry++
+			if overloadRetry > d.cfg.PartBodyMaxRetries*10 {
+				err = fmt.Errorf("chunk_%d: giving up after %d retries while server is overloaded", ch.id, overloadRetry)
+				break
+			}
+			if !d.delay(min(time.Duration(overloadRetry)*overloadBackoffUnit, overloadBackoffMax)) {
+				return false
+			}
 			retry--
 		} else if err == errCancelConcurrency {
 			return false // 取消一个的并发
@@ -432,7 +441,25 @@ func (d *downloader) delay(ti time.Duration) bool {
 }
 
 var errCancelConcurrency = errors.New("")
-var errInfiniteRetry = errors.New("")
+var errOverloadRetry = errors.New("overload retry")
+
+// Backoff between the retries of an overloaded server: overloadRetry*unit, at
+// most max. Variables so that tests can shrink them.
+var (
+	overloadBackoffUnit = 100 * time.Millisecond
+	overloadBackoffMax  = 2 * time.Second
+)
+
+// isOverloadStatus reports whether an HTTP status means the server is limiting
+// or temporarily unable to serve us (worth retrying) rather than refusing the
+// request (an expired link is a 403, which retrying never fixes).
+func isOverloadStatus(code int) bool {
+	switch code {
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return true
+	}
+	return false
+}
 
 func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int64, error) {
 	resp, err := d.cfg.HttpClient(d.ctx, params)
@@ -445,13 +472,8 @@ func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int
 			return 0, err
 		}
 		if ch.id == 0 { //第1个任务 有限的重试，超过重试就会结束请求
-			switch statusCode {
-			default:
+			if !isOverloadStatus(int(statusCode)) {
 				return 0, err
-			case http.StatusTooManyRequests:
-			case http.StatusBadGateway:
-			case http.StatusServiceUnavailable:
-			case http.StatusGatewayTimeout:
 			}
 			if !d.delay(time.Millisecond * time.Duration(rand.Uint32N(300)+200)) {
 				return 0, errCancelConcurrency
@@ -460,7 +482,10 @@ func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int
 		}
 
 		// 来到这 说明第1个分片下载 连接成功了
-		// 后续分片下载出错都当超载处理
+		// 后续分片仅在限流/网关类错误时当超载处理，其余错误（如链接过期 403）直接失败
+		if !isOverloadStatus(int(statusCode)) {
+			return 0, err
+		}
 		log.Debugf("err chunk_%d, try downloading:%v", ch.id, err)
 
 		d.mu.Lock()
@@ -488,7 +513,7 @@ func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int
 				return 0, errCancelConcurrency
 			}
 		}
-		return 0, errInfiniteRetry
+		return 0, errOverloadRetry
 	}
 
 	defer resp.Body.Close()
