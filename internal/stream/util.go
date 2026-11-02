@@ -241,6 +241,13 @@ func (s *selfHealingReadCloser) shouldReconnectAfterRead(wasFirstRead bool, n in
 		return false
 	}
 
+	// The downloader gives up on an expired link (403 and the like) and the
+	// reader sees that error mid-stream: refresh and go on from here.
+	if IsLinkExpiredError(err) {
+		log.Warnf("Detected expired link after %d bytes (%v), attempting to refresh link...", s.bytesRead, err)
+		return true
+	}
+
 	if wasFirstRead && n == 0 && (err == io.EOF || err == io.ErrUnexpectedEOF) {
 		log.Warnf("Detected 0-byte read on first attempt, attempting to refresh link...")
 		return true

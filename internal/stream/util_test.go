@@ -3,6 +3,7 @@ package stream
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -493,4 +495,70 @@ func sliceForRange(data []byte, httpRange http_range.Range) []byte {
 		length = len(data) - start
 	}
 	return data[start : start+length]
+}
+
+// The old link dies in the middle of a concurrent download: the first part
+// comes, the later ones are refused with 403. The downloader must give up with
+// that error (it used to retry the 403 forever) and the reader must refresh the
+// link once and carry on from where it was, so that the whole content arrives.
+func TestRefreshableRangeReader_ConcurrentDownloadSurvivesLinkExpiry(t *testing.T) {
+	ensureConfForHTTP()
+	data := make([]byte, 64)
+	for i := range data {
+		data[i] = byte(i*5 + 1)
+	}
+	size := int64(len(data))
+	const part = 8
+
+	serve := func(allow func(start int64) bool) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			ranges, err := http_range.ParseRange(r.Header.Get("Range"), size)
+			if err != nil || len(ranges) != 1 {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			rg := ranges[0]
+			if !allow(rg.Start) {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			w.Header().Set("Content-Range", rg.ContentRange(size))
+			w.Header().Set("Content-Length", strconv.FormatInt(rg.Length, 10))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[rg.Start : rg.Start+rg.Length])
+		})
+	}
+	old := httptest.NewServer(serve(func(start int64) bool { return start < part })) // only the first part
+	defer old.Close()
+	fresh := httptest.NewServer(serve(func(int64) bool { return true }))
+	defer fresh.Close()
+
+	var refreshes int32
+	link := &model.Link{URL: old.URL, Concurrency: 3, PartSize: part}
+	link.Refresher = func(ctx context.Context) (*model.Link, model.Obj, error) {
+		atomic.AddInt32(&refreshes, 1)
+		return &model.Link{URL: fresh.URL, Concurrency: 3, PartSize: part}, nil, nil
+	}
+
+	rr, err := GetRangeReaderFromLink(size, link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	rc, err := rr.RangeRead(ctx, http_range.Range{Start: 0, Length: size})
+	if err != nil {
+		t.Fatalf("RangeRead: %v", err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("ReadAll: %v (refreshes %d)", err, atomic.LoadInt32(&refreshes))
+	}
+	if sha1.Sum(got) != sha1.Sum(data) {
+		t.Fatalf("content differs: got %d bytes", len(got))
+	}
+	if n := atomic.LoadInt32(&refreshes); n != 1 {
+		t.Fatalf("refreshes = %d, want exactly 1", n)
+	}
 }
