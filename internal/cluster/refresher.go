@@ -401,7 +401,7 @@ func (m *Manager) leaseStep(g group) {
 		return
 	}
 	hold := func(reason string) {
-		if noLeaseFor >= ttl && int(noLeaseFor/time.Second)%5 == 0 {
+		if noLeaseFor >= ttl/2 && noLeaseFor < 4*ttl && int(noLeaseFor/time.Second)%2 == 0 {
 			utils.Log.Infof("[cluster] lease vacant group=%s for %s, not claiming: %s", g.ID, noLeaseFor.Round(time.Second), reason)
 		}
 	}
@@ -443,7 +443,7 @@ func (m *Manager) leaseStep(g group) {
 		stagger = time.Second
 	}
 	if noLeaseFor < time.Duration(rank)*stagger {
-		hold(fmt.Sprintf("rank %d of %v", rank, order))
+		hold(fmt.Sprintf("rank %d of %v (candidates %+v)", rank, order, cands))
 		return
 	}
 	m.refr.mu.Lock()
