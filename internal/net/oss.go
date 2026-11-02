@@ -11,7 +11,11 @@ import (
 )
 
 func NewOSSClient(endpoint, accessKeyID, accessKeySecret string, options ...oss.ClientOption) (*oss.Client, error) {
-	clientOptions := []oss.ClientOption{oss.HTTPClient(NewOSSUploadHttpClient())}
+	// NewOSSUploadHttpClient has the longer upload timeouts; the guard against
+	// cloud metadata addresses (safeTransport) is the same as NewHttpClient's.
+	httpClient := NewOSSUploadHttpClient()
+	httpClient.Transport = &safeTransport{base: httpClient.Transport}
+	clientOptions := []oss.ClientOption{oss.HTTPClient(httpClient)}
 	clientOptions = append(clientOptions, options...)
 	return oss.New(endpoint, accessKeyID, accessKeySecret, clientOptions...)
 }
@@ -30,8 +34,7 @@ func NewOSSUploadHttpClient() *http.Client {
 	SetProxyIfConfigured(transport)
 
 	return &http.Client{
-		Timeout: time.Hour * 48,
-		// same guard as NewHttpClient (cloud metadata addresses); only the timeouts differ
-		Transport: &safeTransport{base: transport},
+		Timeout:   time.Hour * 48,
+		Transport: transport,
 	}
 }
