@@ -93,7 +93,7 @@ func migrateMediaItems() error {
 		log.Warnf("media_items: 检测到旧版本数据（表 %s 缺少索引 %s）。", table, idx)
 		log.Warnf("media_items: 旧数据的路径语义已变更，建议清空后重新扫描；为避免误删，本次启动不会自动清库。")
 		log.Warnf("media_items: 如确认清空，请设置环境变量 %s=1 后重启；也可在管理后台对各媒体库点击「清空数据库」再重扫。", MediaMigrateWipeEnv)
-		return nil
+		return addLegacyMediaType(table)
 	}
 	log.Warnf("media_items: 已确认 %s，清空旧版本数据（表 %s）后重新迁移", MediaMigrateWipeEnv, table)
 	// 先尝试删除旧的单字段唯一索引（如果存在），避免 AutoMigrate 冲突
@@ -107,6 +107,21 @@ func migrateMediaItems() error {
 		return err
 	}
 	return nil
+}
+
+// addLegacyMediaType 给旧版 media_items 补上 NOT NULL 的 media_type 列。
+// 让 AutoMigrate 自己加会失败：SQLite 不允许往非空表加没有默认值的 NOT NULL 列，
+// 启动因此中止。旧版的行都是影视条目（kind=movie/tv/anime...），所以用 'video' 作默认值；
+// 列加好之后 AutoMigrate 只会看到它已存在。不删除、不改写任何旧行。
+// 只在 SQLite 上验证过；MySQL / PostgreSQL 的 ADD COLUMN ... NOT NULL DEFAULT 语法同样合法，
+// 但未实际测试（我们只运行 SQLite）。
+func addLegacyMediaType(table string) error {
+	m := db.Migrator()
+	if m.HasColumn(table, "media_type") {
+		return nil
+	}
+	log.Warnf("media_items: 旧表缺少 media_type 列，补充该列并把旧条目标为 %s（不删除数据）", model.MediaTypeVideo)
+	return db.Exec("ALTER TABLE " + quoteIdent(table) + " ADD " + quoteIdent("media_type") + " varchar(32) NOT NULL DEFAULT 'video'").Error
 }
 
 // quoteIdent 按当前数据库方言给标识符加引号，表名来自 gorm schema 解析而非用户输入。
