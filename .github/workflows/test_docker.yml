@@ -20,6 +20,7 @@ on:
   push:
     branches:
       - feat/dynamic-frontend
+      - canary
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -88,9 +89,16 @@ jobs:
             shift 2
 
             local image="${REGISTRY}/${GHCR_ORG_NAME}/${image_name}"
-            local -a tags=(--tag "${image}:front-${FRONTEND_CHANNEL}")
-            if [ "${FRONTEND_CHANNEL}" = "latest" ]; then
-              tags+=(--tag "${image}:latest")
+            local -a tags
+            if [ "${GITHUB_REF_NAME}" = "canary" ]; then
+              # The canary branch is only for the node that runs :canary; it must
+              # never move a tag the other nodes follow.
+              tags=(--tag "${image}:canary")
+            else
+              tags=(--tag "${image}:front-${FRONTEND_CHANNEL}")
+              if [ "${FRONTEND_CHANNEL}" = "latest" ]; then
+                tags+=(--tag "${image}:latest")
+              fi
             fi
 
             docker buildx build \
