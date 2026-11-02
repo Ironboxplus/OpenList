@@ -550,3 +550,127 @@ func TestReconcileDoesNotRegressOntoOlderRecordWhileFreshPairIsUncatalogued(t *t
 	s, _ := rowStatus(mount)
 	t.Fatalf("a record newer than the fresh pair was not adopted: %q", s.Addition)
 }
+
+func restartHarness(t *testing.T, tag string) (dir, mount string, peer *identity, start func() *Manager) {
+	t.Helper()
+	reconcileDB(t)
+	dir = t.TempDir()
+	mount = fmt.Sprintf("/rc-%s-%d", tag, reconcileSeq.Add(1))
+	peer, _ = newIdentity()
+	admin, _ := newIdentity()
+	m, err := Init(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.cfgStore.save(Config{Enabled: true, Key: "test-key", ApplyRemote: true}); err != nil {
+		t.Fatal(err)
+	}
+	m.state.setGroups(admin, []group{{
+		ID: "g1",
+		Members: []member{
+			{NodeID: m.id.NodeID, MountPath: mount},
+			{NodeID: peer.NodeID, MountPath: "/peer"},
+		},
+	}}, 1)
+	if err := m.persist(); err != nil {
+		t.Fatal(err)
+	}
+	m.Stop()
+	return dir, mount, peer, nil
+}
+
+// T8: the node rotated (new pair saved) and was restarted before the pair was
+// catalogued. The snapshot of what it knew must survive the restart, or the
+// first reconcile after start moves the mount back onto the older record.
+func TestReconcileRestartKeepsSnapshotOfUncataloguedPair(t *testing.T) {
+	dir, mount, peer, _ := restartHarness(t, "t8")
+	a, err := Init(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.probeCredentialFn = func(context.Context, model.Storage, string) error { return nil }
+	id, err := op.CreateStorage(context.Background(), model.Storage{
+		Driver: "ReconcileFake", MountPath: mount,
+		Addition: `{"access_token":"base","refresh_token":"r"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = op.DeleteStorageById(context.Background(), id) })
+	time.Sleep(300 * time.Millisecond)
+	if !a.state.mergeCred(signedRecord(peer, "/peer", "old", 1)) {
+		t.Fatal("old record not merged")
+	}
+	if err := a.persist(); err != nil {
+		t.Fatal(err)
+	}
+	row, _ := rowStatus(mount)
+	row.Addition = `{"access_token":"fresh","refresh_token":"r2"}`
+	if err := op.UpdateStorage(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	// Restart before onStorageCredential could catalogue the fresh pair.
+	a.Stop()
+
+	b, err := Init(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var probes atomic.Int32
+	b.probeCredentialFn = func(context.Context, model.Storage, string) error {
+		probes.Add(1)
+		return nil
+	}
+	t.Cleanup(b.Stop)
+	b.Start()
+	time.Sleep(1500 * time.Millisecond)
+	if n := probes.Load(); n != 0 {
+		s, _ := rowStatus(mount)
+		t.Fatalf("after a restart an older record was probed %d time(s); addition=%q", n, s.Addition)
+	}
+	if s, _ := rowStatus(mount); !strings.Contains(s.Addition, `"fresh"`) {
+		t.Fatalf("fresh pair was replaced after the restart: %q", s.Addition)
+	}
+}
+
+// A follower's initial pair has no snapshot (it was not produced here), so after
+// a restart it still adopts the newest catalogued record.
+func TestReconcileRestartStillAdoptsNewestForInitialPair(t *testing.T) {
+	dir, mount, peer, _ := restartHarness(t, "t8b")
+	a, err := Init(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !a.state.mergeCred(signedRecord(peer, "/peer", "newest", 5)) {
+		t.Fatal("record not merged")
+	}
+	if err := a.persist(); err != nil {
+		t.Fatal(err)
+	}
+	a.Stop()
+	id, err := op.CreateStorage(context.Background(), model.Storage{
+		Driver: "ReconcileFake", MountPath: mount,
+		Addition: `{"access_token":"base","refresh_token":"r"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = op.DeleteStorageById(context.Background(), id) })
+
+	b, err := Init(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.probeCredentialFn = func(context.Context, model.Storage, string) error { return nil }
+	t.Cleanup(b.Stop)
+	b.Start()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if s, ok := rowStatus(mount); ok && strings.Contains(s.Addition, `"newest"`) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	s, _ := rowStatus(mount)
+	t.Fatalf("initial pair did not adopt the newest record after a restart: %q", s.Addition)
+}
