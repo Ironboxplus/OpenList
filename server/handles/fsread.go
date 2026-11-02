@@ -59,7 +59,12 @@ type FsListResp struct {
 	Write              bool      `json:"write"`
 	WriteContentBypass bool      `json:"write_content_bypass"`
 	Provider           string    `json:"provider"`
-	DirectUploadTools  []string  `json:"direct_upload_tools,omitempty"`
+	// AllowPreview / AllowDownload are set for /@s/ shares only: what the share
+	// lets a visitor do with file content (so the UI can say "preview disabled"
+	// instead of showing a player that will get a 403).
+	AllowPreview      *bool    `json:"allow_preview,omitempty"`
+	AllowDownload     *bool    `json:"allow_download,omitempty"`
+	DirectUploadTools []string `json:"direct_upload_tools,omitempty"`
 	// MountDetails is the disk usage of the storage that the *current directory*
 	// belongs to (nil at the virtual storages-root or when hidden). It lets the
 	// web header show the current mount's usage dynamically on folder navigation
@@ -292,6 +297,9 @@ type FsGetResp struct {
 	Header   string    `json:"header"`
 	Provider string    `json:"provider"`
 	Related  []ObjResp `json:"related"`
+	// see FsListResp: set for shares only
+	AllowPreview  *bool `json:"allow_preview,omitempty"`
+	AllowDownload *bool `json:"allow_download,omitempty"`
 }
 
 func FsGetSplit(c *gin.Context) {

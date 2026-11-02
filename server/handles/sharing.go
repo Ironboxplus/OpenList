@@ -86,11 +86,13 @@ func SharingGet(c *gin.Context, req *FsGetReq) {
 			Type:        utils.GetObjType(obj.GetName(), obj.IsDir()),
 			Thumb:       thumb,
 		},
-		RawURL:   url,
-		Readme:   s.Readme,
-		Header:   s.Header,
-		Provider: "unknown",
-		Related:  nil,
+		RawURL:        url,
+		Readme:        s.Readme,
+		Header:        s.Header,
+		Provider:      "unknown",
+		Related:       nil,
+		AllowPreview:  boolPtr(s.AllowPreview()),
+		AllowDownload: boolPtr(s.AllowDownload()),
 	})
 }
 
@@ -143,11 +145,13 @@ func SharingList(c *gin.Context, req *ListReq) {
 				Type:        utils.GetObjType(obj.GetName(), obj.IsDir()),
 			}
 		}),
-		Total:    int64(total),
-		Readme:   s.Readme,
-		Header:   s.Header,
-		Write:    false,
-		Provider: "unknown",
+		Total:         int64(total),
+		Readme:        s.Readme,
+		Header:        s.Header,
+		Write:         false,
+		Provider:      "unknown",
+		AllowPreview:  boolPtr(s.AllowPreview()),
+		AllowDownload: boolPtr(s.AllowDownload()),
 	})
 }
 
@@ -239,7 +243,9 @@ func SharingDown(c *gin.Context) {
 	path = utils.FixAndCleanPath(path)
 	access := shareAccess(c)
 	s, err := op.GetSharingById(sid)
-	if err == nil {
+	if err != nil {
+		err = errors.WithStack(errs.SharingNotFound)
+	} else {
 		if len(s.Files) != 1 && path == "/" {
 			err = errors.New("cannot get sharing root link")
 		} else {
@@ -313,7 +319,9 @@ func SharingArchiveExtract(c *gin.Context) {
 	innerPath := utils.FixAndCleanPath(c.Query("inner"))
 	archivePass := c.Query("pass")
 	s, err := op.GetSharingById(sid)
-	if err == nil {
+	if err != nil {
+		err = errors.WithStack(errs.SharingNotFound)
+	} else {
 		if len(s.Files) != 1 && path == "/" {
 			err = errors.New("cannot extract sharing root")
 		} else {
@@ -379,17 +387,29 @@ func SharingArchiveExtract(c *gin.Context) {
 	}
 }
 
+// Response codes of a share request. 403 means "password required or wrong"
+// and nothing else, so a client may open its password prompt on it.
+const (
+	shareCodeNotFound   = 404 // no such share
+	shareCodeGone       = 410 // expired, disabled, or its access limit is used up
+	shareCodeNeedPwd    = 403 // password missing or wrong
+	shareCodeTooMany    = 429 // too many wrong passwords from this IP, wait
+	shareCodeNotAllowed = 423 // the share does not allow this (preview or download)
+)
+
 func dealError(c *gin.Context, err error) bool {
 	if err == nil {
 		return false
 	} else if errors.Is(err, errs.SharingNotFound) {
-		common.ErrorStrResp(c, "the share does not exist", 500)
+		common.ErrorStrResp(c, "the share does not exist", shareCodeNotFound)
 	} else if errors.Is(err, errs.InvalidSharing) {
-		common.ErrorStrResp(c, "the share has expired or is no longer valid", 500)
-	} else if errors.Is(err, errs.WrongShareCode) || errors.Is(err, errs.ShareActionNotAllowed) {
-		common.ErrorResp(c, err, 403)
+		common.ErrorStrResp(c, "the share has expired or is no longer valid", shareCodeGone)
+	} else if errors.Is(err, errs.ShareActionNotAllowed) {
+		common.ErrorResp(c, err, shareCodeNotAllowed)
+	} else if errors.Is(err, errs.WrongShareCode) {
+		common.ErrorResp(c, err, shareCodeNeedPwd)
 	} else if errors.Is(err, errs.TooManyShareAttempts) {
-		common.ErrorResp(c, err, 429)
+		common.ErrorResp(c, err, shareCodeTooMany)
 	} else if errors.Is(err, errs.WrongArchivePassword) {
 		common.ErrorResp(c, err, 202)
 	} else {
@@ -402,13 +422,15 @@ func dealErrorPage(c *gin.Context, err error) bool {
 	if err == nil {
 		return false
 	} else if errors.Is(err, errs.SharingNotFound) {
-		common.ErrorPage(c, errors.New("the share does not exist"), 500)
+		common.ErrorPage(c, errors.New("the share does not exist"), shareCodeNotFound)
 	} else if errors.Is(err, errs.InvalidSharing) {
-		common.ErrorPage(c, errors.New("the share has expired or is no longer valid"), 500)
-	} else if errors.Is(err, errs.WrongShareCode) || errors.Is(err, errs.ShareActionNotAllowed) {
-		common.ErrorPage(c, err, 403)
+		common.ErrorPage(c, errors.New("the share has expired or is no longer valid"), shareCodeGone)
+	} else if errors.Is(err, errs.ShareActionNotAllowed) {
+		common.ErrorPage(c, err, shareCodeNotAllowed)
+	} else if errors.Is(err, errs.WrongShareCode) {
+		common.ErrorPage(c, err, shareCodeNeedPwd)
 	} else if errors.Is(err, errs.TooManyShareAttempts) {
-		common.ErrorPage(c, err, 429)
+		common.ErrorPage(c, err, shareCodeTooMany)
 	} else if errors.Is(err, errs.WrongArchivePassword) {
 		common.ErrorPage(c, err, 202)
 	} else {
@@ -739,3 +761,5 @@ func SetEnableSharing(disable bool) func(ctx *gin.Context) {
 		}
 	}
 }
+
+func boolPtr(b bool) *bool { return &b }

@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -64,6 +63,8 @@ func newShareEnv(t *testing.T) *shareEnv {
 	e.GET("/sd/:sid/*path", middlewares.PathParse, middlewares.SharingIdParse, SharingDown)
 	e.HEAD("/sd/:sid", middlewares.EmptyPathParse, middlewares.SharingIdParse, SharingDown)
 	e.HEAD("/sd/:sid/*path", middlewares.PathParse, middlewares.SharingIdParse, SharingDown)
+	e.POST("/api/fs/get", FsGetSplit)
+	e.POST("/api/fs/list", FsListSplit)
 	e.POST("/api/public/sharing_auth", SharingAuth)
 	e.POST("/api/share/create", CreateSharing)
 	e.POST("/api/share/update", UpdateSharing)
@@ -93,7 +94,14 @@ func (e *shareEnv) do(method, target string, body any, hdr ...string) *httptest.
 // share makes a share of /s/a.txt (or file) directly in the database.
 func (e *shareEnv) share(file string, mod func(*model.SharingDB)) *model.Sharing {
 	e.t.Helper()
-	s := &model.Sharing{SharingDB: &model.SharingDB{}, Files: []string{file}, Creator: e.admin}
+	return e.shareFiles([]string{file}, mod)
+}
+
+// shareFiles shares several objects: its root is a folder (so fs/list works)
+// and files are reached as /sd/<id>/<name>.
+func (e *shareEnv) shareFiles(files []string, mod func(*model.SharingDB)) *model.Sharing {
+	e.t.Helper()
+	s := &model.Sharing{SharingDB: &model.SharingDB{}, Files: files, Creator: e.admin}
 	if mod != nil {
 		mod(s.SharingDB)
 	}
@@ -172,7 +180,7 @@ func TestSharePreviewDownloadSwitchesOverHTTP(t *testing.T) {
 	e := newShareEnv(t)
 	s := e.share("/s/a.txt", func(d *model.SharingDB) { d.DenyDownload = true })
 	url := "/sd/" + s.ID
-	if w := e.do("GET", url, nil); w.Code != 403 {
+	if w := e.do("GET", url, nil); w.Code != shareCodeNotAllowed {
 		t.Fatalf("download of a preview-only share: %d", w.Code)
 	}
 	if w := e.do("GET", url+"?preview=1", nil); w.Code != 200 {
@@ -186,7 +194,7 @@ func TestSharePreviewDownloadSwitchesOverHTTP(t *testing.T) {
 	}
 
 	p := e.share("/s/a.txt", func(d *model.SharingDB) { d.DenyPreview = true })
-	if w := e.do("GET", "/sd/"+p.ID+"?preview=1", nil); w.Code != 403 {
+	if w := e.do("GET", "/sd/"+p.ID+"?preview=1", nil); w.Code != shareCodeNotAllowed {
 		t.Fatalf("preview of a download-only share: %d", w.Code)
 	}
 	if w := e.do("GET", "/sd/"+p.ID, nil); w.Code != 200 {
@@ -236,7 +244,7 @@ func TestShareWrongPasswordLockoutOverHTTP(t *testing.T) {
 			t.Fatalf("attempt %d: %d", i, w.Code)
 		}
 	}
-	if w := e.do("GET", "/sd/"+s.ID+"?pwd=pw", nil); w.Code != http.StatusTooManyRequests {
+	if w := e.do("GET", "/sd/"+s.ID+"?pwd=pw", nil); w.Code != shareCodeTooMany {
 		t.Fatalf("locked: %d", w.Code)
 	}
 }
@@ -304,4 +312,124 @@ func TestShareCreateAndUpdateFields(t *testing.T) {
 	if r := e.row(id); r.ConsumedAt != nil || r.LimitReached() {
 		t.Fatalf("lifting the limit left the share consumed: %+v", r)
 	}
+}
+
+// shareReply is the envelope of the JSON API.
+type shareReply struct {
+	Code int `json:"code"`
+	Data struct {
+		AllowPreview  *bool `json:"allow_preview"`
+		AllowDownload *bool `json:"allow_download"`
+	} `json:"data"`
+}
+
+func (e *shareEnv) api(path string, body map[string]any) shareReply {
+	e.t.Helper()
+	w := e.do("POST", path, body)
+	var r shareReply
+	if err := json.Unmarshal(w.Body.Bytes(), &r); err != nil {
+		e.t.Fatalf("%s: %v: %s", path, err, w.Body.String())
+	}
+	return r
+}
+
+func TestShareResponsesCarryAllowFlags(t *testing.T) {
+	e := newShareEnv(t)
+	s := e.share2(func(d *model.SharingDB) { d.DenyPreview = true })
+	for _, path := range []string{"/api/fs/get", "/api/fs/list"} {
+		r := e.api(path, map[string]any{"path": "/@s/" + s.ID})
+		if r.Code != 200 || r.Data.AllowPreview == nil || r.Data.AllowDownload == nil || *r.Data.AllowPreview || !*r.Data.AllowDownload {
+			t.Fatalf("%s: %+v", path, r)
+		}
+	}
+	o := e.share2(nil)
+	r := e.api("/api/fs/get", map[string]any{"path": "/@s/" + o.ID})
+	if r.Data.AllowPreview == nil || !*r.Data.AllowPreview || !*r.Data.AllowDownload {
+		t.Fatalf("open share: %+v", r)
+	}
+}
+
+// 403 means "password required or wrong" and nothing else; every other
+// refusal has its own code.
+func TestShareErrorCodesAreDistinct(t *testing.T) {
+	e := newShareEnv(t)
+	pw := e.share2(func(d *model.SharingDB) { d.SetPassword("pw") })
+	gone := e.share2(func(d *model.SharingDB) { d.Disabled = true })
+	used := e.share2(func(d *model.SharingDB) { d.BurnAfterRead = true })
+	if w := e.do("GET", "/sd/"+used.ID+"/a.txt", nil); w.Code != 200 {
+		t.Fatalf("consuming download: %d", w.Code)
+	}
+	noDl := e.share2(func(d *model.SharingDB) { d.DenyDownload = true })
+	noPv := e.share2(func(d *model.SharingDB) { d.DenyPreview = true })
+	locked := e.share2(func(d *model.SharingDB) { d.SetPassword("pw") })
+
+	for _, path := range []string{"/api/fs/get", "/api/fs/list"} {
+		for name, c := range map[string]struct {
+			id, pwd string
+			want    int
+		}{
+			"missing share":  {"nope-nope", "", shareCodeNotFound},
+			"no password":    {pw.ID, "", shareCodeNeedPwd},
+			"wrong password": {pw.ID, "bad", shareCodeNeedPwd},
+			"disabled":       {gone.ID, "", shareCodeGone},
+		} {
+			if r := e.api(path, map[string]any{"path": "/@s/" + c.id, "password": c.pwd}); r.Code != c.want {
+				t.Errorf("%s %s: code %d, want %d", path, name, r.Code, c.want)
+			}
+		}
+		// browsing is allowed even where content is not
+		for _, id := range []string{noDl.ID, noPv.ID} {
+			if r := e.api(path, map[string]any{"path": "/@s/" + id}); r.Code != 200 {
+				t.Errorf("%s browsing a restricted share: code %d", path, r.Code)
+			}
+		}
+	}
+	for i := 0; i < model.DefaultMaxAuthRetries; i++ {
+		e.api("/api/fs/get", map[string]any{"path": "/@s/" + locked.ID, "password": "bad"})
+	}
+	if r := e.api("/api/fs/get", map[string]any{"path": "/@s/" + locked.ID, "password": "pw"}); r.Code != shareCodeTooMany {
+		t.Errorf("locked out: code %d, want %d", r.Code, shareCodeTooMany)
+	}
+
+	// the direct link: the same codes as the HTTP status
+	for name, c := range map[string]struct {
+		url  string
+		want int
+	}{
+		"missing":         {"/sd/nope-nope/a.txt", shareCodeNotFound},
+		"no password":     {"/sd/" + pw.ID + "/a.txt", shareCodeNeedPwd},
+		"disabled":        {"/sd/" + gone.ID + "/a.txt", shareCodeGone},
+		"download denied": {"/sd/" + noDl.ID + "/a.txt", shareCodeNotAllowed},
+		"preview denied":  {"/sd/" + noPv.ID + "/a.txt?preview=1", shareCodeNotAllowed},
+		"locked out":      {"/sd/" + locked.ID + "/a.txt?pwd=pw", shareCodeTooMany},
+	} {
+		if w := e.do("GET", c.url, nil); w.Code != c.want {
+			t.Errorf("/sd %s: status %d, want %d", name, w.Code, c.want)
+		}
+	}
+	// a different visitor finds the burned share gone (the first one keeps its slot)
+	other := func(method, target string, body []byte) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, bytes.NewReader(body))
+		req.RemoteAddr = "7.7.7.7:1"
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		e.engine.ServeHTTP(w, req)
+		return w
+	}
+	if w := other("GET", "/sd/"+used.ID+"/a.txt", nil); w.Code != shareCodeGone {
+		t.Errorf("/sd used up: status %d, want %d", w.Code, shareCodeGone)
+	}
+	for _, path := range []string{"/api/fs/get", "/api/fs/list"} {
+		w := other("POST", path, []byte(`{"path":"/@s/`+used.ID+`"}`))
+		var r shareReply
+		if err := json.Unmarshal(w.Body.Bytes(), &r); err != nil || r.Code != shareCodeGone {
+			t.Errorf("%s used up: %s, want code %d", path, w.Body.String(), shareCodeGone)
+		}
+	}
+}
+
+func (e *shareEnv) share2(mod func(*model.SharingDB)) *model.Sharing {
+	e.t.Helper()
+	e.fake.AddFile("/b.txt", "second")
+	return e.shareFiles([]string{"/s/a.txt", "/s/b.txt"}, mod)
 }
