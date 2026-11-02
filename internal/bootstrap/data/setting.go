@@ -107,6 +107,7 @@ func InitialSettings() []model.SettingItem {
 		//{Key: conf.ApiUrl, Value: "", Type: conf.TypeString, Group: model.SITE},
 		//{Key: conf.BasePath, Value: "", Type: conf.TypeString, Group: model.SITE},
 		{Key: conf.SiteTitle, Value: "OpenList", Type: conf.TypeString, Group: model.SITE},
+		{Key: conf.FrontendRememberSort, Value: "false", Type: conf.TypeBool, Group: model.SITE, Help: "Persist frontend list sorting in the browser. When disabled, backend/driver order is used until the user sorts manually in the current session."},
 		{Key: conf.Announcement, Value: "Welcome to the OpenList project!\nFor the latest updates, to contribute code, or to submit suggestions and issues, please visit our [project repository](https://github.com/OpenListTeam/OpenList).", Type: conf.TypeText, Group: model.SITE},
 		{Key: "pagination_type", Value: "all", Type: conf.TypeSelect, Options: "all,pagination,load_more,auto_load_more", Group: model.SITE},
 		{Key: "default_page_size", Value: "30", Type: conf.TypeNumber, Group: model.SITE},
@@ -145,6 +146,7 @@ func InitialSettings() []model.SettingItem {
 		"EPUB.js":"https://res.oplist.org/epub.js/viewer.html?url=$e_url"
 	}
 }`, Type: conf.TypeText, Group: model.PREVIEW},
+		{Key: "preview_settings", Value: `{}`, Type: conf.TypeText, Group: model.PREVIEW, Help: "Per-extension preview management, a JSON object read by the web UI."},
 		//		{Key: conf.OfficeViewers, Value: `{
 		//	"Microsoft":"https://view.officeapps.live.com/op/view.aspx?src=$url",
 		//	"Google":"https://docs.google.com/gview?url=$url&embedded=true",

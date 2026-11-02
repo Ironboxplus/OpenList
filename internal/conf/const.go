@@ -13,6 +13,8 @@ const (
 	VERSION      = "version"
 	SiteTitle    = "site_title"
 	Announcement = "announcement"
+	// FrontendRememberSort: the web UI keeps the list sort order in the browser.
+	FrontendRememberSort = "frontend_remember_sort"
 	AllowIndexed = "allow_indexed"
 	AllowMounted = "allow_mounted"
 	RobotsTxt    = "robots_txt"

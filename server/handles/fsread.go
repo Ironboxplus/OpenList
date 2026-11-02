@@ -35,6 +35,10 @@ type DirReq struct {
 }
 
 type ObjResp struct {
+	// VirtualPath is the object's path as the requesting user addresses it in
+	// the other APIs (fs/copy, share, ...): the requested path joined with the
+	// name, independent of the driver's own notion of "path". AList e36c68e4.
+	VirtualPath  string                     `json:"virtual_path,omitempty"`
 	Name         string                     `json:"name"`
 	Size         int64                      `json:"size"`
 	IsDir        bool                       `json:"is_dir"`
@@ -140,7 +144,7 @@ func FsList(c *gin.Context, req *ListReq, user *model.User) {
 		}
 	}
 	common.SuccessResp(c, FsListResp{
-		Content:            toObjsResp(objs, reqPath, isEncrypt(meta, reqPath)),
+		Content:            toObjsResp(objs, reqPath, utils.FixAndCleanPath(req.Path), isEncrypt(meta, reqPath)),
 		Total:              int64(total),
 		Readme:             getReadme(meta, reqPath),
 		Header:             getHeader(meta, reqPath),
@@ -257,7 +261,7 @@ func pagination(objs []model.Obj, req *model.PageReq) (int, []model.Obj) {
 	return total, objs[start:end]
 }
 
-func toObjsResp(objs []model.Obj, parent string, encrypt bool) []ObjResp {
+func toObjsResp(objs []model.Obj, parent, virtualParent string, encrypt bool) []ObjResp {
 	var resp []ObjResp
 	for _, obj := range objs {
 		thumb, _ := model.GetThumb(obj)
@@ -268,6 +272,7 @@ func toObjsResp(objs []model.Obj, parent string, encrypt bool) []ObjResp {
 			hashInfo = make(map[*utils.HashType]string)
 		}
 		resp = append(resp, ObjResp{
+			VirtualPath:  utils.FixAndCleanPath(stdpath.Join(virtualParent, obj.GetName())),
 			Name:         obj.GetName(),
 			Size:         obj.GetSize(),
 			IsDir:        obj.IsDir(),
@@ -402,6 +407,7 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 	extra, _ := model.GetExtra(obj)
 	common.SuccessResp(c, FsGetResp{
 		ObjResp: ObjResp{
+			VirtualPath:  utils.FixAndCleanPath(req.Path),
 			Name:         obj.GetName(),
 			Size:         obj.GetSize(),
 			IsDir:        obj.IsDir(),
@@ -419,7 +425,7 @@ func FsGet(c *gin.Context, req *FsGetReq, user *model.User) {
 		Readme:   getReadme(meta, reqPath),
 		Header:   getHeader(meta, reqPath),
 		Provider: provider,
-		Related:  toObjsResp(related, parentPath, isEncrypt(parentMeta, parentPath)),
+		Related:  toObjsResp(related, parentPath, stdpath.Dir(utils.FixAndCleanPath(req.Path)), isEncrypt(parentMeta, parentPath)),
 	})
 }
 
