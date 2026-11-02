@@ -113,13 +113,13 @@ type downloader struct {
 
 	nextChunk int //next chunk id
 	bufMap    map[int]*buffer.PipeBuffer
-	written   int64 //total bytes of file downloaded from remote
+	written   atomic.Int64 //total bytes of file downloaded from remote
 
 	concurrency int //剩余的并发数，递减。到0时停止并发
 	pos         int64
 	maxPos      int64
 	delayMu     sync.Mutex
-	readingID   int64 // 正在被读取的id
+	readingID   atomic.Int64 // 正在被读取的id
 
 	hc *hcache.HybridCache
 }
@@ -206,7 +206,8 @@ func (d *downloader) download() (io.ReadCloser, error) {
 	if err != nil {
 		d.cancel(err)
 		d.cfg.ConcurrencyLimit.Release()
-		return nil, d.interrupt()
+		_ = d.interrupt()
+		return nil, err
 	}
 
 	d.mu.Lock()
@@ -268,10 +269,6 @@ func (d *downloader) sendChunkTask(newConcurrency bool) (err error) {
 	if err != nil {
 		return err // 分片算法错误或者下载中断
 	}
-	if newConcurrency {
-		go d.downloadPart()
-		d.concurrency--
-	}
 	ch := chunk{
 		start: d.pos,
 		size:  finalSize,
@@ -286,6 +283,11 @@ func (d *downloader) sendChunkTask(newConcurrency bool) (err error) {
 	case <-d.ctx.Done():
 		return context.Cause(d.ctx)
 	case d.chunkCh <- ch:
+		if newConcurrency {
+			// The worker owns the acquired slot only after its chunk is queued.
+			go d.downloadPart()
+			d.concurrency--
+		}
 		return nil
 	}
 }
@@ -294,7 +296,7 @@ func (d *downloader) sendChunkTask(newConcurrency bool) (err error) {
 func (d *downloader) interrupt() error {
 	err := context.Cause(d.ctx)
 	if err == nil {
-		if atomic.LoadInt64(&d.written) != d.params.Range.Length {
+		if d.written.Load() != d.params.Range.Length {
 			err = fmt.Errorf("interrupted")
 		}
 	} else if errors.Is(err, context.Canceled) {
@@ -333,7 +335,7 @@ func (d *downloader) popBuf(id int) *buffer.PipeBuffer {
 }
 
 func (d *downloader) finishBuf(nextId int, prev *buffer.PipeBuffer) (next *buffer.PipeBuffer) {
-	atomic.StoreInt64(&d.readingID, int64(nextId))
+	d.readingID.Store(int64(nextId))
 
 	d.mu.Lock()
 	shouldSendTask := d.bufMap[d.nextChunk] == nil
@@ -479,7 +481,7 @@ func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int
 			}
 		}
 		d.mu.Unlock()
-		if int64(ch.id) != atomic.LoadInt64(&d.readingID) { //正在被读取的优先重试
+		if int64(ch.id) != d.readingID.Load() { //正在被读取的优先重试
 			d.delayMu.Lock()
 			defer d.delayMu.Unlock()
 			if !d.delay(time.Millisecond * time.Duration(rand.Uint32N(300)+200)) {
@@ -556,7 +558,7 @@ func (d *downloader) checkTotalBytes(resp *http.Response) error {
 }
 
 func (d *downloader) incrWritten(n int64) {
-	atomic.AddInt64(&d.written, n)
+	d.written.Add(n)
 }
 
 // Chunk represents a single chunk of data to write by the worker routine.

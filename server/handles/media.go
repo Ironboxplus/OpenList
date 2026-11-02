@@ -1,918 +1,1101 @@
 package handles
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
-	"io"
-	"net/http"
-	"net/url"
-	"os"
-	pathpkg "path"
-	"path/filepath"
-	"reflect"
-	"slices"
-	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/OpenListTeam/OpenList/v4/cmd/flags"
+	stdpath "path"
+
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
-	"github.com/OpenListTeam/OpenList/v4/internal/media/apply"
+	"github.com/OpenListTeam/OpenList/v4/internal/fs"
+	"github.com/OpenListTeam/OpenList/v4/internal/media"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/scraper"
-	"github.com/OpenListTeam/OpenList/v4/internal/media/store"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
-	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
-	"github.com/OpenListTeam/OpenList/v4/internal/sign"
-	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
-	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
 )
 
-// ---- wiring (overridable in tests) ----
+// scrapeConcurrency 刮削并发度（默认 5）
+// 走 setting 读取，未配置时使用 5；远端 API 调用密集型任务，并发 5 在限流与吞吐间较平衡。
+const defaultScrapeConcurrency = 5
 
-// mediaAssetDir is where asset files live: <data>/media/assets.
-var mediaAssetDir = func() string { return filepath.Join(flags.DataDir, "media", "assets") }
+// ==================== 配置管理 ====================
 
-// mediaConfigHook lets tests point the providers at local servers.
-var mediaConfigHook func(*scraper.Config)
-
-// mediaAllowPrivateDownloads lets tests download from loopback.
-var mediaAllowPrivateDownloads = false
-
-func mediaStore() *store.Store { return store.New(mediaAssetDir()) }
-
-func mediaEnabled() bool { return setting.GetBool(conf.MediaEnabled) }
-
-func mediaScraperSet() (*scraper.Set, error) {
-	cfg := scraper.Config{
-		TMDBToken:    strings.TrimSpace(setting.GetStr(conf.MediaTMDBToken)),
-		OMDbKeys:     scraper.SplitKeys(setting.GetStr(conf.MediaOMDbKeys)),
-		DoubanAPIKey: strings.TrimSpace(setting.GetStr(conf.MediaDoubanAPIKey)),
-		Language:     setting.GetStr(conf.MediaLanguage, "zh-CN"),
-		Proxy:        strings.TrimSpace(setting.GetStr(conf.MediaHTTPProxy)),
-		Timeout:      time.Duration(setting.GetInt(conf.MediaScraperTimeout, 15)) * time.Second,
+// ListMediaConfigs 获取所有媒体库配置
+func ListMediaConfigs(c *gin.Context) {
+	types := []model.MediaType{
+		model.MediaTypeVideo,
+		model.MediaTypeMusic,
+		model.MediaTypeImage,
+		model.MediaTypeBook,
 	}
-	if mediaConfigHook != nil {
-		mediaConfigHook(&cfg)
-	}
-	return scraper.NewSet(cfg)
-}
-
-func mediaDownloader() (apply.Downloader, error) {
-	return apply.NewDownloader(apply.DownloadOpts{
-		Proxy:        strings.TrimSpace(setting.GetStr(conf.MediaHTTPProxy)),
-		Timeout:      time.Duration(setting.GetInt(conf.MediaScraperTimeout, 15)) * time.Second,
-		AllowPrivate: mediaAllowPrivateDownloads,
-	})
-}
-
-// mediaErr answers a failed provider call. A server that can't reach the
-// provider says so as class "network", which the UI turns into "use the CLI
-// on a PC".
-func mediaErr(c *gin.Context, err error) {
-	switch {
-	case errors.Is(err, apply.ErrLocked) || errors.Is(err, store.ErrLocked):
-		common.ErrorStrResp(c, "this item is locked; unlock it or force the change", 409)
-		return
-	}
-	if errors.Is(err, apply.ErrLibrary) {
-		common.ErrorStrResp(c, err.Error(), 400)
-		return
-	}
-	class := scraper.ClassOf(err)
-	switch class {
-	case scraper.ClassNetwork:
-		common.ErrorWithDataResp(c, fmt.Errorf("network: %s", err.Error()), 502, gin.H{"class": class}, true)
-	case scraper.ClassAuth, scraper.ClassRate, scraper.ClassNotConfig:
-		common.ErrorWithDataResp(c, fmt.Errorf("%s: %s", class, err.Error()), 502, gin.H{"class": class}, true)
-	case scraper.ClassNotFound:
-		common.ErrorWithDataResp(c, err, 404, gin.H{"class": class})
-	default:
-		common.ErrorWithDataResp(c, err, 500, gin.H{"class": class}, true)
-	}
-}
-
-// ---- DTOs ----
-
-// MediaItemResp is the detail view of an item.
-type MediaItemResp struct {
-	Path          string                 `json:"path"`
-	Kind          string                 `json:"kind"`
-	Title         string                 `json:"title"`
-	OriginalTitle string                 `json:"original_title"`
-	Year          int                    `json:"year"`
-	ExternalIDs   map[string]string      `json:"external_ids"`
-	Ratings       map[string]any         `json:"ratings"`
-	Genres        []string               `json:"genres"`
-	Overview      string                 `json:"overview"`
-	PosterURL     string                 `json:"poster_url"`
-	BackdropURL   string                 `json:"backdrop_url"`
-	ChildPosters  *[]string              `json:"child_posters,omitempty"` // collections: up to 4 posters of what is inside
-	Source        string                 `json:"source"`
-	Confidence    float32                `json:"confidence"`
-	Locked        bool                   `json:"locked"`
-	Candidates    []model.MediaCandidate `json:"candidates"`
-	ScrapedAt     *time.Time             `json:"scraped_at"`
-	UpdatedAt     time.Time              `json:"updated_at"`
-}
-
-// MediaListResp is the compact view used for children: no overview, no
-// candidates, no episodes.
-type MediaListResp struct {
-	Path      string         `json:"path"`
-	Kind      string         `json:"kind"`
-	Title     string         `json:"title"`
-	Year      int            `json:"year"`
-	Ratings   map[string]any `json:"ratings"`
-	PosterURL string         `json:"poster_url"`
-	// ChildPosters is set for collections only: up to 4 signed thumb URLs of
-	// the posters of the items below, by year then title.
-	ChildPosters *[]string `json:"child_posters,omitempty"`
-}
-
-// MediaAdminListResp adds the review fields the admin list needs.
-type MediaAdminListResp struct {
-	MediaListResp
-	Source         string  `json:"source"`
-	Confidence     float32 `json:"confidence"`
-	Locked         bool    `json:"locked"`
-	CandidateCount int     `json:"candidate_count"`
-}
-
-// MediaEpisodeResp is one episode of the item.
-type MediaEpisodeResp struct {
-	FileName string `json:"file_name"`
-	Season   int    `json:"season"`
-	Episode  int    `json:"episode"`
-	Title    string `json:"title"`
-	Overview string `json:"overview"`
-}
-
-// MediaFsResp is the answer of /api/fs/media.
-type MediaFsResp struct {
-	Item     *MediaItemResp     `json:"item"`
-	Children []MediaListResp    `json:"children"`
-	Episodes []MediaEpisodeResp `json:"episodes"`
-}
-
-func emptyMediaFsResp() MediaFsResp {
-	return MediaFsResp{Children: []MediaListResp{}, Episodes: []MediaEpisodeResp{}}
-}
-
-// assetURL is the signed URL of an asset: <img> can't send Authorization, so
-// the signature rides in the query string.
-func assetURL(id uint, thumb bool) string {
-	if id == 0 {
-		return ""
-	}
-	v := "orig"
-	if thumb {
-		v = "thumb"
-	}
-	prefix := ""
-	if conf.URL != nil {
-		prefix = strings.TrimRight(conf.URL.Path, "/")
-	}
-	s := sign.Sign(assetSignData(id))
-	return fmt.Sprintf("%s/api/media/asset/%d?v=%s&sign=%s", prefix, id, v, url.QueryEscape(s))
-}
-
-func assetSignData(id uint) string { return "/media/asset/" + strconv.FormatUint(uint64(id), 10) }
-
-func unmarshalOr[T any](s string, def T) T {
-	if s == "" {
-		return def
-	}
-	var v T
-	if err := json.Unmarshal([]byte(s), &v); err != nil {
-		return def
-	}
-	if rv := reflect.ValueOf(v); (rv.Kind() == reflect.Map || rv.Kind() == reflect.Slice) && rv.IsNil() {
-		return def
-	}
-	return v
-}
-
-func toListResp(it *model.MediaItem, rel func(string) string) MediaListResp {
-	return MediaListResp{
-		Path: rel(it.Path), Kind: it.Kind, Title: it.Title, Year: it.Year,
-		Ratings:   unmarshalOr(it.Ratings, map[string]any{}),
-		PosterURL: assetURL(it.PosterID, true),
-	}
-}
-
-func toItemResp(it *model.MediaItem, rel func(string) string, withCandidates bool) *MediaItemResp {
-	r := &MediaItemResp{
-		Path: rel(it.Path), Kind: it.Kind, Title: it.Title, OriginalTitle: it.OriginalTitle, Year: it.Year,
-		ExternalIDs: unmarshalOr(it.ExternalIDs, map[string]string{}),
-		Ratings:     unmarshalOr(it.Ratings, map[string]any{}),
-		Genres:      unmarshalOr(it.Genres, []string{}),
-		Overview:    it.Overview,
-		PosterURL:   assetURL(it.PosterID, false), BackdropURL: assetURL(it.BackdropID, false),
-		Source: it.Source, Confidence: it.Confidence, Locked: it.Locked,
-		Candidates: []model.MediaCandidate{},
-		ScrapedAt:  it.ScrapedAt, UpdatedAt: it.UpdatedAt,
-	}
-	if withCandidates {
-		r.Candidates = unmarshalOr(it.Candidates, []model.MediaCandidate{})
-	}
-	return r
-}
-
-func identityPath(p string) string { return p }
-
-// userRelPath turns a stored absolute path into one relative to the user's
-// base path, the way fs paths look to that user.
-func userRelPath(user *model.User) func(string) string {
-	base := utils.FixAndCleanPath(user.BasePath)
-	if base == "/" {
-		return identityPath
-	}
-	return func(p string) string {
-		if p == base {
-			return "/"
-		}
-		return strings.TrimPrefix(p, base)
-	}
-}
-
-// ---- read API ----
-
-// FsMedia answers /api/fs/media: the media item at a path, the items directly
-// below it, and its episode map. It reads only the database. Anything the
-// caller may not list (no access, hidden, wrong password, media off) comes
-// back empty rather than as an error, so it says nothing about the path.
-func FsMedia(c *gin.Context) {
-	var req struct {
-		Path     string `json:"path" form:"path"`
-		Password string `json:"password" form:"password"`
-	}
-	if err := c.ShouldBind(&req); err != nil {
-		common.ErrorResp(c, err, 400)
-		return
-	}
-	user := c.Request.Context().Value(conf.UserKey).(*model.User)
-	if user.IsGuest() && user.Disabled {
-		common.ErrorStrResp(c, "Guest user is disabled, login please", 401)
-		return
-	}
-	empty := emptyMediaFsResp()
-	if strings.HasPrefix(req.Path, "/@s") || !mediaEnabled() {
-		common.SuccessResp(c, empty)
-		return
-	}
-	reqPath, err := user.JoinPath(req.Path)
-	if err != nil {
-		common.SuccessResp(c, empty)
-		return
-	}
-	meta, err := op.GetNearestMeta(reqPath)
-	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
-		common.ErrorResp(c, err, 500, true)
-		return
-	}
-	if !common.CanAccess(user, meta, reqPath, req.Password) {
-		common.SuccessResp(c, empty)
-		return
-	}
-	rel := userRelPath(user)
-	resp := empty
-
-	item, err := db.GetMediaItemByPath(reqPath)
-	if err != nil {
-		common.ErrorResp(c, err, 500, true)
-		return
-	}
-	if item != nil {
-		resp.Item = toItemResp(item, rel, user.IsAdmin())
-		eps, err := db.GetMediaEpisodes(item.ID)
+	cfgs := make([]*model.MediaConfig, 0, len(types))
+	for _, t := range types {
+		cfg, err := db.GetMediaConfig(t)
 		if err != nil {
-			common.ErrorResp(c, err, 500, true)
+			common.ErrorResp(c, err, 500)
 			return
 		}
-		for _, e := range eps {
-			resp.Episodes = append(resp.Episodes, MediaEpisodeResp{FileName: e.FileName, Season: e.Season, Episode: e.Episode, Title: e.Title, Overview: e.Overview})
-		}
+		cfgs = append(cfgs, cfg)
 	}
-	kids, err := db.ListMediaChildren(reqPath)
-	if err != nil {
-		common.ErrorResp(c, err, 500, true)
-		return
-	}
-	posters, err := collectionPosters(user, reqPath, item, kids)
-	if err != nil {
-		common.ErrorResp(c, err, 500, true)
-		return
-	}
-	if resp.Item != nil && item.Kind == model.MediaKindCollection {
-		resp.Item.ChildPosters = posters[""]
-	}
-	for i := range kids {
-		k := &kids[i]
-		if !mediaItemVisible(user, k, meta, req.Password) {
-			continue
-		}
-		lr := toListResp(k, rel)
-		if k.Kind == model.MediaKindCollection {
-			lr.ChildPosters = posters[k.Path]
-		}
-		resp.Children = append(resp.Children, lr)
-	}
-	common.SuccessResp(c, resp)
+	common.SuccessResp(c, cfgs)
 }
 
-// mediaItemVisible is the one rule for whether a user may see an item in a
-// media listing: the hide patterns and password of the directory it sits in
-// (parentMeta, the nearest meta of that directory), and the read restriction
-// of its own nearest meta.
-func mediaItemVisible(user *model.User, item *model.MediaItem, parentMeta *model.Meta, password string) bool {
-	if !common.CanAccess(user, parentMeta, item.Path, password) {
-		return false
-	}
-	cm, err := op.GetNearestMeta(item.Path)
-	if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
-		return false
-	}
-	return common.CanRead(user, cm, item.Path)
+// SaveMediaConfigReq 保存配置请求
+type SaveMediaConfigReq struct {
+	MediaType     model.MediaType `json:"media_type" binding:"required"`
+	Enabled       bool            `json:"enabled"`
+	ScraperConfig *string         `json:"scraper_config"`
 }
 
-// collectionPosters finds up to 4 poster URLs for the collection at reqPath
-// (key "") and for each collection among kids (key: its path). One query reads
-// every poster below reqPath; the rest is grouping. An item the user may not
-// read is skipped, so a poster never shows what the listing would hide.
-func collectionPosters(user *model.User, reqPath string, item *model.MediaItem, kids []model.MediaItem) (map[string]*[]string, error) {
-	out := map[string]*[]string{}
-	var owners []string // the collections that want a mosaic
-	if item != nil && item.Kind == model.MediaKindCollection {
-		owners = append(owners, "")
-	}
-	for i := range kids {
-		if kids[i].Kind == model.MediaKindCollection {
-			owners = append(owners, kids[i].Path)
-		}
-	}
-	if len(owners) == 0 {
-		return out, nil
-	}
-	rows, err := db.ListMediaPostersUnder(reqPath)
-	if err != nil {
-		return nil, err
-	}
-	sort.SliceStable(rows, func(i, j int) bool {
-		yi, yj := rows[i].Year, rows[j].Year
-		if (yi == 0) != (yj == 0) {
-			return yj == 0 // unknown years last
-		}
-		if yi != yj {
-			return yi < yj
-		}
-		if rows[i].Title != rows[j].Title {
-			return rows[i].Title < rows[j].Title
-		}
-		return rows[i].Path < rows[j].Path
-	})
-	readable := map[string]bool{}
-	canRead := func(p string) bool {
-		if v, ok := readable[p]; ok {
-			return v
-		}
-		cm, err := op.GetNearestMeta(p)
-		ok := (err == nil || errors.Is(errors.Cause(err), errs.MetaNotFound)) && common.CanRead(user, cm, p)
-		readable[p] = ok
-		return ok
-	}
-	for _, owner := range owners {
-		urls := []string{}
-		for i := range rows {
-			if len(urls) == 4 {
-				break
-			}
-			if owner != "" && !strings.HasPrefix(rows[i].Path, owner+"/") {
-				continue
-			}
-			if !canRead(rows[i].Path) {
-				continue
-			}
-			urls = append(urls, assetURL(rows[i].PosterID, true))
-		}
-		out[owner] = &urls
-	}
-	return out, nil
-}
-
-// libraryKinds are what the library lists when no kind is asked for; "ignore"
-// is never listed, and "library" is only a root that opens as a poster wall.
-var libraryKinds = []string{model.MediaKindMovie, model.MediaKindTV, model.MediaKindAnime, model.MediaKindCollection}
-
-// MediaLibrary answers /api/media/library: the scraped items under the user's
-// base path that the user may see, filtered before paging. Media off gives an
-// empty list, like /api/fs/media.
-func MediaLibrary(c *gin.Context) {
-	user := c.Request.Context().Value(conf.UserKey).(*model.User)
-	kinds := libraryKinds
-	if k := c.Query("kind"); k != "" {
-		if !slices.Contains(libraryKinds, k) {
-			common.ErrorStrResp(c, "unsupported kind", 400)
-			return
-		}
-		kinds = []string{k}
-	}
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	per, _ := strconv.Atoi(c.DefaultQuery("per_page", "100"))
-	out := []MediaListResp{}
-	if !mediaEnabled() {
-		common.SuccessResp(c, gin.H{"content": out, "total": 0})
-		return
-	}
-	parentMetas := map[string]*model.Meta{}
-	var metaErr error
-	parentMeta := func(dir string) *model.Meta {
-		if m, ok := parentMetas[dir]; ok {
-			return m
-		}
-		m, err := op.GetNearestMeta(dir)
-		if err != nil && !errors.Is(errors.Cause(err), errs.MetaNotFound) {
-			metaErr, m = err, nil
-		}
-		parentMetas[dir] = m
-		return m
-	}
-	items, total, err := db.ListMediaItemsFiltered(
-		db.MediaListFilter{Prefix: utils.FixAndCleanPath(user.BasePath), Kinds: kinds, Page: page, PerPage: per},
-		func(it *model.MediaItem) bool {
-			return mediaItemVisible(user, it, parentMeta(pathpkg.Dir(it.Path)), "")
-		})
-	if err == nil {
-		err = metaErr
-	}
-	if err != nil {
-		common.ErrorResp(c, err, 500, true)
-		return
-	}
-	rel := userRelPath(user)
-	for i := range items {
-		out = append(out, toListResp(&items[i], rel))
-	}
-	common.SuccessResp(c, gin.H{"content": out, "total": total})
-}
-
-// assetFail answers with a real HTTP status: an <img> only sees the status,
-// not the envelope code.
-func assetFail(c *gin.Context, status int, msg string) {
-	c.AbortWithStatusJSON(status, common.Resp[any]{Code: status, Message: msg})
-}
-
-// MediaAsset serves an image. The signature is checked over
-// "/media/asset/<id>", because an <img> tag can't carry a token.
-func MediaAsset(c *gin.Context) {
-	id64, err := strconv.ParseUint(c.Param("id"), 10, 32)
-	if err != nil || id64 == 0 {
-		assetFail(c, http.StatusBadRequest, "bad asset id")
-		return
-	}
-	id := uint(id64)
-	if err := sign.Verify(assetSignData(id), c.Query("sign")); err != nil {
-		assetFail(c, http.StatusForbidden, "invalid or expired sign")
-		return
-	}
-	a, err := db.GetMediaAsset(id)
-	if err != nil {
-		assetFail(c, http.StatusInternalServerError, "database error")
-		return
-	}
-	if a == nil {
-		assetFail(c, http.StatusNotFound, "asset not found")
-		return
-	}
-	thumb := c.DefaultQuery("v", "orig") == "thumb"
-	st := mediaStore()
-	f, err := os.Open(st.AssetFile(a, thumb))
-	if err != nil && thumb {
-		f, err = os.Open(st.AssetFile(a, false)) // thumbnail missing: fall back to the original
-		thumb = false
-	}
-	if err != nil {
-		assetFail(c, http.StatusNotFound, "asset file missing")
-		return
-	}
-	defer f.Close()
-	etag := `"` + a.SHA256 + `"`
-	mime := a.Mime
-	if thumb {
-		etag = `"` + a.SHA256 + `-thumb"`
-		mime = "image/jpeg"
-	}
-	h := c.Writer.Header()
-	h.Set("Cache-Control", "public, max-age=31536000, immutable")
-	h.Set("ETag", etag)
-	h.Set("Content-Type", mime)
-	http.ServeContent(c.Writer, c.Request, "", a.CreatedAt, f)
-}
-
-// ---- admin API ----
-
-// MediaSet upserts an item; only the fields in the request are written.
-func MediaSet(c *gin.Context) {
-	var req model.MediaSetReq
+// SaveMediaConfig 保存媒体库配置
+func SaveMediaConfig(c *gin.Context) {
+	var req SaveMediaConfigReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		common.ErrorResp(c, err, 400)
 		return
 	}
-	for _, idp := range []*uint{req.PosterID, req.BackdropID} {
-		if idp != nil && *idp != 0 {
-			if a, err := db.GetMediaAsset(*idp); err != nil || a == nil {
-				common.ErrorStrResp(c, fmt.Sprintf("asset %d does not exist", *idp), 400)
+	// 读取已有配置，避免用零值覆盖 last_scan_at / last_scrape_at
+	cfg, err := db.GetMediaConfig(req.MediaType)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	cfg.Enabled = req.Enabled
+	if req.ScraperConfig != nil {
+		cfg.ScraperConfig = *req.ScraperConfig
+	}
+	if err := db.SaveMediaConfig(cfg); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c)
+}
+
+// ==================== 扫描路径管理 ====================
+
+// ListMediaScanPaths 获取指定媒体类型的扫描路径列表
+func ListMediaScanPaths(c *gin.Context) {
+	mediaType := model.MediaType(c.Query("media_type"))
+	paths, err := db.ListMediaScanPaths(mediaType)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c, paths)
+}
+
+// CreateMediaScanPathReq 创建扫描路径请求
+type CreateMediaScanPathReq struct {
+	MediaType    model.MediaType `json:"media_type" binding:"required"`
+	Name         string          `json:"name"`
+	Path         string          `json:"path" binding:"required"`
+	PathMerge    bool            `json:"path_merge"`
+	TypeTag      string          `json:"type_tag"`
+	ContentTags  string          `json:"content_tags"`
+	EnableScrape bool            `json:"enable_scrape"`
+}
+
+// CreateMediaScanPath 创建扫描路径
+func CreateMediaScanPath(c *gin.Context) {
+	var req CreateMediaScanPathReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	if req.Path == "" {
+		req.Path = "/"
+	}
+	name := req.Name
+	if name == "" {
+		name = req.Path
+	}
+	sp := &model.MediaScanPath{
+		MediaType:    req.MediaType,
+		Name:         name,
+		Path:         req.Path,
+		PathMerge:    req.PathMerge,
+		TypeTag:      req.TypeTag,
+		ContentTags:  req.ContentTags,
+		EnableScrape: req.EnableScrape,
+	}
+	if err := db.CreateMediaScanPath(sp); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c, sp)
+}
+
+// UpdateMediaScanPathReq 更新扫描路径请求
+type UpdateMediaScanPathReq struct {
+	ID           uint   `json:"id" binding:"required"`
+	Name         string `json:"name"`
+	Path         string `json:"path"`
+	PathMerge    bool   `json:"path_merge"`
+	TypeTag      string `json:"type_tag"`
+	ContentTags  string `json:"content_tags"`
+	EnableScrape bool   `json:"enable_scrape"`
+}
+
+// UpdateMediaScanPath 更新扫描路径
+func UpdateMediaScanPath(c *gin.Context) {
+	var req UpdateMediaScanPathReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	sp, err := db.GetMediaScanPath(req.ID)
+	if err != nil {
+		common.ErrorResp(c, err, 404)
+		return
+	}
+	sp.Name = req.Name
+	sp.Path = req.Path
+	sp.PathMerge = req.PathMerge
+	sp.TypeTag = req.TypeTag
+	sp.ContentTags = req.ContentTags
+	sp.EnableScrape = req.EnableScrape
+	if err := db.UpdateMediaScanPath(sp); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c)
+}
+
+// DeleteMediaScanPath 删除扫描路径
+func DeleteMediaScanPath(c *gin.Context) {
+	idStr := c.Query("id")
+	id, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil {
+		common.ErrorStrResp(c, "无效的ID", 400)
+		return
+	}
+	if err := db.DeleteMediaScanPath(uint(id)); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c)
+}
+
+// ClearMediaScanPathDB 清空指定扫描路径的媒体数据
+func ClearMediaScanPathDB(c *gin.Context) {
+	idStr := c.Query("id")
+	id, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil {
+		common.ErrorStrResp(c, "无效的ID", 400)
+		return
+	}
+	if err := db.ClearMediaItemsByScanPath(uint(id)); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c)
+}
+
+// ==================== 媒体条目管理（后台） ====================
+
+// clampMediaPage 限制分页参数，避免 page_size 过大或为负导致整表扫描 / 响应体爆炸
+func clampMediaPage(page, pageSize, defaultSize, maxSize int) (int, int) {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = defaultSize
+	}
+	if pageSize > maxSize {
+		pageSize = maxSize
+	}
+	return page, pageSize
+}
+
+// ListMediaItemsAdmin 后台分页查询媒体条目
+func ListMediaItemsAdmin(c *gin.Context) {
+	mediaType := model.MediaType(c.Query("media_type"))
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "20"))
+	page, pageSize = clampMediaPage(page, pageSize, 20, 500)
+	keyword := c.Query("keyword")
+	orderBy := c.DefaultQuery("order_by", "name")
+	orderDir := c.DefaultQuery("order_dir", "asc")
+	scanPathIDStr := c.Query("scan_path_id")
+	var scanPathID uint
+	if scanPathIDStr != "" {
+		if id, err := strconv.ParseUint(scanPathIDStr, 10, 64); err == nil {
+			scanPathID = uint(id)
+		}
+	}
+
+	q := db.MediaItemQuery{
+		MediaType:  mediaType,
+		ScanPathID: scanPathID,
+		Keyword:    keyword,
+		OrderBy:    orderBy,
+		OrderDir:   orderDir,
+		Page:       page,
+		PageSize:   pageSize,
+	}
+	items, total, err := db.ListMediaItems(q)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c, common.PageResp{Content: items, Total: total})
+}
+
+// UpdateMediaItemReq 更新媒体条目请求
+type UpdateMediaItemReq struct {
+	ID          uint    `json:"id" binding:"required"`
+	ScrapedName string  `json:"scraped_name"`
+	Description string  `json:"description"`
+	Cover       string  `json:"cover"`
+	ReleaseDate string  `json:"release_date"`
+	Rating      float32 `json:"rating"`
+	Genre       string  `json:"genre"`
+	Authors     string  `json:"authors"`
+	Plot        string  `json:"plot"`
+	Reviews     string  `json:"reviews"`
+	AlbumName   string  `json:"album_name"`
+	AlbumArtist string  `json:"album_artist"`
+	Publisher   string  `json:"publisher"`
+	ISBN        string  `json:"isbn"`
+	Hidden      bool    `json:"hidden"`
+}
+
+// UpdateMediaItemAdmin 后台更新媒体条目
+func UpdateMediaItemAdmin(c *gin.Context) {
+	var req UpdateMediaItemReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	item, err := db.GetMediaItemByID(req.ID)
+	if err != nil {
+		common.ErrorResp(c, err, 404)
+		return
+	}
+	item.ScrapedName = req.ScrapedName
+	item.Description = req.Description
+	item.Cover = req.Cover
+	item.ReleaseDate = req.ReleaseDate
+	item.Rating = req.Rating
+	item.Genre = req.Genre
+	item.Authors = req.Authors
+	item.Plot = req.Plot
+	item.Reviews = req.Reviews
+	item.AlbumName = req.AlbumName
+	item.AlbumArtist = req.AlbumArtist
+	item.Publisher = req.Publisher
+	item.ISBN = req.ISBN
+	item.Hidden = req.Hidden
+
+	if err := db.UpdateMediaItem(item); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c)
+}
+
+// DeleteMediaItemAdmin 后台删除媒体条目
+func DeleteMediaItemAdmin(c *gin.Context) {
+	idStr := c.Query("id")
+	id, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil {
+		common.ErrorStrResp(c, "无效的ID", 400)
+		return
+	}
+	if err := db.DeleteMediaItem(uint(id)); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c)
+}
+
+// ClearMediaDB 清空指定类型媒体数据库
+func ClearMediaDB(c *gin.Context) {
+	mediaType := model.MediaType(c.Query("media_type"))
+	if mediaType == "" {
+		common.ErrorStrResp(c, "media_type 不能为空", 400)
+		return
+	}
+	if err := db.ClearMediaItems(mediaType); err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c)
+}
+
+// ClearMediaScrape 清空刮削数据（保留扫描记录，但清空所有刮削结果字段）
+// 参数：media_type 可选，留空表示所有类型；item_id 暂不支持（统一为类型/全部）
+func ClearMediaScrape(c *gin.Context) {
+	mediaType := model.MediaType(c.Query("media_type"))
+	affected, err := db.ClearMediaScrapedData(mediaType)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	// 同步清掉对应媒体配置中的最近刮削时间
+	if mediaType != "" {
+		if cfg, e := db.GetMediaConfig(mediaType); e == nil && cfg != nil {
+			cfg.LastScrapeAt = nil
+			_ = db.SaveMediaConfig(cfg)
+		}
+	} else {
+		if cfgs, e := db.GetAllMediaConfigs(); e == nil {
+			for i := range cfgs {
+				cfgs[i].LastScrapeAt = nil
+				_ = db.SaveMediaConfig(&cfgs[i])
+			}
+		}
+	}
+	common.SuccessResp(c, gin.H{"affected": affected})
+}
+
+// DeleteInvalidMedia 删除已失效的媒体条目（即对应文件 / 文件夹在存储中已不存在）
+// 参数：media_type 可选，留空表示扫描所有类型
+// 返回：检测总数、被删除条目数
+func DeleteInvalidMedia(c *gin.Context) {
+	mediaType := model.MediaType(c.Query("media_type"))
+
+	items, err := db.ListAllValidMediaItemsForCheck(mediaType)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	var invalidIDs []uint
+	var skipped int
+	for i := range items {
+		it := &items[i]
+		// 拼接文件 / 文件夹的完整 VFS 路径
+		// - 文件夹模式 (is_folder=true): folder_path 即文件夹自身（扫描根 + 文件夹名 视情况而定）；这里直接使用 folder_path/file_name
+		// - 普通文件: folder_path 是所在目录，file_name 是文件名
+		fullPath := stdpath.Join(it.FolderPath, it.FileName)
+		if fullPath == "" || fullPath == "/" {
+			continue
+		}
+		if _, gerr := fs.Get(ctx, fullPath, &fs.GetArgs{NoLog: true}); gerr != nil {
+			// 只有「确认不存在」才算失效条目；驱动故障、超时、鉴权失败等可能是临时问题，
+			// 一律跳过（保留记录），否则一次网络抖动就会把有效的媒体记录硬删除。
+			if errs.IsObjectNotFound(gerr) {
+				invalidIDs = append(invalidIDs, it.ID)
+				continue
+			}
+			skipped++
+			log.Warnf("跳过无法确认状态的媒体条目 %s（%s）: %v", fullPath, it.FileName, gerr)
+		}
+	}
+
+	if len(invalidIDs) > 0 {
+		if err := db.DeleteMediaItemsByIDs(invalidIDs); err != nil {
+			common.ErrorResp(c, err, 500)
+			return
+		}
+	}
+	log.Infof("删除已失效媒体条目：检测 %d 条，删除 %d 条，跳过 %d 条 (media_type=%q)", len(items), len(invalidIDs), skipped, mediaType)
+	common.SuccessResp(c, gin.H{
+		"checked": len(items),
+		"deleted": len(invalidIDs),
+		"skipped": skipped,
+	})
+}
+
+// ==================== 扫描与刮削 ====================
+
+// ScanMediaReq 扫描请求
+type ScanMediaReq struct {
+	MediaType  model.MediaType `json:"media_type" binding:"required"`
+	ScanPathID uint            `json:"scan_path_id"` // 0 表示扫描全部路径
+}
+
+// StartMediaScan 开始扫描
+func StartMediaScan(c *gin.Context) {
+	var req ScanMediaReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	cfg, err := db.GetMediaConfig(req.MediaType)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	if !cfg.Enabled {
+		common.ErrorStrResp(c, "该媒体库未启用", 400)
+		return
+	}
+
+	if req.ScanPathID > 0 {
+		// 扫描单个路径
+		sp, err := db.GetMediaScanPath(req.ScanPathID)
+		if err != nil {
+			common.ErrorResp(c, err, 404)
+			return
+		}
+		media.ScanMediaPath(sp)
+	} else {
+		// 扫描全部路径
+		media.ScanMedia(cfg)
+	}
+	common.SuccessResp(c)
+}
+
+// GetMediaScanProgress 获取扫描进度
+func GetMediaScanProgress(c *gin.Context) {
+	mediaType := model.MediaType(c.Query("media_type"))
+	if mediaType == "" {
+		common.ErrorStrResp(c, "media_type 不能为空", 400)
+		return
+	}
+	progress := media.GetProgress(mediaType)
+	common.SuccessResp(c, progress)
+}
+
+// MediaScrapeStatsResp 刮削统计响应
+// 包含 TMDB 视频刮削的累计指标，用于运维观测与命中率评估
+type MediaScrapeStatsResp struct {
+	TMDB scraper.TMDBStats `json:"tmdb"`
+}
+
+// GetMediaScrapeStats 获取刮削统计（进程级累计值，重启清零）
+// 返回字段：
+//   - total_scraped         : 累计触发刮削次数
+//   - hit_count             : 命中（含强命中）次数
+//   - low_confidence_count  : 仅低置信度兜底命中次数
+//   - no_match_count        : 完全未命中次数
+//   - total_attempts        : 累计 TMDB 搜索请求次数
+//   - total_search_millis   : 累计搜索耗时（毫秒）
+func GetMediaScrapeStats(c *gin.Context) {
+	common.SuccessResp(c, MediaScrapeStatsResp{
+		TMDB: scraper.GetTMDBStats(),
+	})
+}
+
+// ScrapeMediaReq 刮削请求
+type ScrapeMediaReq struct {
+	MediaType model.MediaType `json:"media_type" binding:"required"`
+	ItemID    uint            `json:"item_id"` // 0 表示刮削全部未刮削的
+}
+
+// StartMediaScrape 开始刮削
+func StartMediaScrape(c *gin.Context) {
+	var req ScrapeMediaReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+
+	cfg, err := db.GetMediaConfig(req.MediaType)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+
+	// 从系统设置中读取刮削配置
+	tmdbKey := setting.GetStr(conf.MediaTMDBKey)
+	tmdbAPIURL := setting.GetStr(conf.MediaTMDBAPIURL, "https://api.themoviedb.org")
+	discogsToken := setting.GetStr(conf.MediaDiscogsToken)
+	discogsAPIURL := setting.GetStr(conf.MediaDiscogsAPIURL, "https://api.discogs.com")
+	thumbnailMode := setting.GetStr(conf.MediaThumbnailMode, "runtime")
+	thumbnailPath := setting.GetStr(conf.MediaThumbnailPath, "/imgs")
+	storeThumbnail := setting.GetBool(conf.MediaStoreThumbnail)
+	bookSource := strings.ToLower(setting.GetStr(conf.MediaBookSource, "douban"))
+	googleBooksKey := setting.GetStr(conf.MediaGoogleBooksKey)
+	downloadCover := setting.GetBool(conf.MediaDownloadCover)
+
+	// 该媒体类型如果单独配置过缩略图，覆盖全局设置
+	if cfg.ScraperConfig != "" {
+		var sc struct {
+			StoreThumbnail string `json:"store_thumbnail"`
+			ThumbnailMode  string `json:"thumbnail_mode"`
+			ThumbnailPath  string `json:"thumbnail_path"`
+		}
+		if json.Unmarshal([]byte(cfg.ScraperConfig), &sc) == nil {
+			if sc.ThumbnailMode != "" {
+				thumbnailMode = sc.ThumbnailMode
+			}
+			if sc.ThumbnailPath != "" {
+				thumbnailPath = sc.ThumbnailPath
+			}
+			if sc.StoreThumbnail != "" {
+				storeThumbnail = sc.StoreThumbnail == "true"
+			}
+		}
+	}
+
+	log.Infof("[media] scrape %s: thumbnail mode=%s, path=%s, runtime dir=%s",
+		req.MediaType, thumbnailMode, thumbnailPath, scraper.RuntimeThumbRoot(thumbnailPath))
+
+	var preloadedItems []model.MediaItem
+	if req.ItemID > 0 {
+		item, e := db.GetMediaItemByID(req.ItemID)
+		if e != nil {
+			common.ErrorResp(c, e, 404)
+			return
+		}
+		preloadedItems = []model.MediaItem{*item}
+	}
+
+	go func() {
+		var items []model.MediaItem
+		var err error
+
+		if req.ItemID > 0 {
+			items = preloadedItems
+		} else {
+			// limit 传 -1，GORM 不会拼接 LIMIT 子句，从而一次性取出全部未刮削条目
+			items, err = db.GetUnscrappedItems(req.MediaType, -1)
+			if err != nil {
+				log.Errorf("获取未刮削条目失败: %v", err)
 				return
 			}
 		}
-	}
-	it, err := mediaStore().Set(req, store.SetOptions{})
-	if err != nil {
-		common.ErrorResp(c, err, 400)
-		return
-	}
-	common.SuccessResp(c, toItemResp(it, identityPath, true))
-}
 
-// MediaDelete removes one item, or with recursive a whole subtree.
-func MediaDelete(c *gin.Context) {
-	var req struct {
-		Path      string `json:"path"`
-		Prefix    string `json:"prefix"`
-		Recursive bool   `json:"recursive"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		common.ErrorResp(c, err, 400)
-		return
-	}
-	var n int64
-	var err error
-	switch {
-	case req.Recursive && strings.TrimSpace(req.Prefix) != "":
-		if store.NormalizePath(req.Prefix) == "/" {
-			common.ErrorStrResp(c, "refusing to delete every media item; give a narrower prefix", 400)
-			return
+		// 读取并发度（默认5），并启动 worker pool
+		concurrency := setting.GetInt(conf.MediaScrapeConcurrency, defaultScrapeConcurrency)
+		if concurrency <= 0 {
+			concurrency = defaultScrapeConcurrency
 		}
-		n, err = mediaStore().DeletePrefix(req.Prefix)
-	case strings.TrimSpace(req.Path) != "":
-		n, err = mediaStore().Delete(req.Path)
-	default:
-		common.ErrorStrResp(c, "give a path, or a prefix with recursive=true", 400)
-		return
-	}
-	if err != nil {
-		common.ErrorResp(c, err, 500, true)
-		return
-	}
-	common.SuccessResp(c, gin.H{"deleted": n})
+		if concurrency > len(items) && len(items) > 0 {
+			concurrency = len(items)
+		}
+
+		var wg sync.WaitGroup
+		jobs := make(chan int, len(items))
+		// 落库串行化：所有 worker 把刮削成功的 item 推到 saveCh，由单协程负责落库，
+		// 这样既能并发抓 API、又避免多 goroutine 同时写 sqlite/mysql 引发锁竞争。
+		saveCh := make(chan *model.MediaItem, concurrency*2)
+		var saveWg sync.WaitGroup
+
+		// 单写入协程：刮一个写一个
+		saveWg.Add(1)
+		go func() {
+			defer saveWg.Done()
+			for it := range saveCh {
+				if err := db.UpdateMediaItem(it); err != nil {
+					log.Warnf("保存刮削结果失败 [id=%d, %s/%s]: %v", it.ID, it.FolderPath, it.FileName, err)
+				}
+			}
+		}()
+
+		worker := func() {
+			defer wg.Done()
+			for idx := range jobs {
+				item := &items[idx]
+				var scrapeErr error
+
+				switch req.MediaType {
+				case model.MediaTypeVideo:
+					s := scraper.NewTMDBScraper(tmdbKey, tmdbAPIURL)
+					scrapeErr = s.ScrapeVideo(item)
+				case model.MediaTypeMusic:
+					// 音乐：刮削前先用文件本身的 ID3/Vorbis tag + .lrc 做本地兜底，
+					// 仅填空字段；这样用户清空刮削后重新刮削也能恢复封面/歌词等。
+					localCtx, localCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					media.FillMusicFromLocal(localCtx, item)
+					localCancel()
+
+					s := scraper.NewDiscogsScraper(discogsToken, discogsAPIURL)
+					scrapeErr = s.ScrapeMusic(item)
+				case model.MediaTypeBook:
+					var bookErr error
+					switch bookSource {
+					case "google":
+						bookErr = scraper.NewGoogleBooksScraper(
+							googleBooksKey,
+							thumbnailMode,
+							thumbnailPath,
+						).ScrapeBook(item)
+					case "openlibrary":
+						bookErr = scraper.NewOpenLibraryScraper(
+							thumbnailMode,
+							thumbnailPath,
+						).ScrapeBook(item)
+					default:
+						bookErr = scraper.NewDoubanScraperWithConfig(
+							thumbnailMode,
+							thumbnailPath,
+						).ScrapeBook(item)
+					}
+					if bookErr != nil {
+						log.Debugf("书籍刮削失败 [%s/%s]: %v，将尝试本地提取封面", item.FolderPath, item.FileName, bookErr)
+					}
+
+					if item.Cover == "" {
+						bookCtx, bookCancel := context.WithTimeout(context.Background(), 60*time.Second)
+						bookFilePath := item.FolderPath + "/" + item.FileName
+						bookReader := media.FetchFileReader(bookCtx, bookFilePath)
+						if bookReader != nil {
+							localScraper := scraper.NewBookLocalScraperWithConfig(
+								thumbnailMode,
+								thumbnailPath,
+							)
+							if localCover := localScraper.ExtractLocalCover(item.FileName, bookFilePath, bookReader); localCover != "" {
+								item.Cover = localCover
+							}
+							_ = bookReader.Close()
+						}
+						bookCancel()
+					}
+
+					if bookErr != nil && item.Cover == "" {
+						scrapeErr = bookErr
+					}
+				case model.MediaTypeImage:
+					imgCtx, imgCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					imgFilePath := item.FolderPath + "/" + item.FileName
+					imgReader := media.FetchFileReader(imgCtx, imgFilePath)
+					s := scraper.NewImageScraperWithConfig(
+						storeThumbnail,
+						thumbnailMode,
+						thumbnailPath,
+					)
+					scrapeErr = s.ScrapeImage(item, imgReader)
+					if imgReader != nil {
+						_ = imgReader.Close()
+					}
+					imgCancel()
+				}
+
+				// 远程封面按需下载到本地存储（或 base64），避免直接保存图片链接
+				if downloadCover && strings.HasPrefix(item.Cover, "http") {
+					rawPath := strings.TrimSuffix(item.FolderPath, "/") + "/" + item.FileName
+					if cover := scraper.DownloadCoverToStorage(
+						context.Background(),
+						item.Cover,
+						rawPath,
+						thumbnailMode,
+						thumbnailPath,
+					); cover != "" {
+						item.Cover = cover
+					}
+				}
+
+				if scrapeErr != nil {
+					log.Warnf("刮削失败 [%s] %s: %v", req.MediaType, item.FolderPath, scrapeErr)
+					// 即使远端刮削失败，只要本地兜底已经写入了任意有效字段，
+					// 也保存一次（不标记 ScrapedAt，便于下次还能重试），
+					// 避免 cover/lyrics 等被丢弃。
+					if hasAnyScrapedField(item) {
+						saveCh <- item
+					}
+					continue
+				}
+				now := time.Now()
+				item.ScrapedAt = &now
+				saveCh <- item
+			}
+		}
+
+		for i := 0; i < concurrency; i++ {
+			wg.Add(1)
+			go worker()
+		}
+
+		for i := range items {
+			jobs <- i
+		}
+		close(jobs)
+		wg.Wait()
+		close(saveCh)
+		saveWg.Wait()
+
+		log.Infof("刮削完成 [%s]，共处理 %d 条（并发=%d）", req.MediaType, len(items), concurrency)
+	}()
+
+	_ = cfg
+	common.SuccessResp(c)
 }
 
-// MediaAdminList pages through items for review.
-func MediaAdminList(c *gin.Context) {
+// hasAnyScrapedField 判断 item 是否已经有任意一个有意义的刮削字段被填充
+// 用于：远端刮削失败但本地兜底已经写入了内容时，仍然落库保留这些信息
+func hasAnyScrapedField(item *model.MediaItem) bool {
+	if item == nil {
+		return false
+	}
+	return item.Cover != "" ||
+		item.Lyrics != "" ||
+		item.Description != "" ||
+		item.Plot != "" ||
+		item.Genre != "" ||
+		item.Authors != "" ||
+		item.AlbumArtist != "" ||
+		item.ReleaseDate != "" ||
+		item.Rating > 0 ||
+		item.Publisher != "" ||
+		item.ISBN != "" ||
+		item.ExternalID != ""
+}
+
+// ==================== 公开API（前端媒体库浏览） ====================
+
+// PublicListMedia 公开媒体列表（前端浏览用）
+func PublicListMedia(c *gin.Context) {
+	mediaType := model.MediaType(c.Query("media_type"))
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	per, _ := strconv.Atoi(c.DefaultQuery("per_page", "100"))
-	f := db.MediaListFilter{
-		Prefix: c.Query("prefix"), Kind: c.Query("kind"),
-		Pending: c.Query("pending") == "true" || c.Query("pending") == "1",
-		Page:    page, PerPage: per,
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "40"))
+	page, pageSize = clampMediaPage(page, pageSize, 40, 200)
+	orderBy := c.DefaultQuery("order_by", "name")
+	orderDir := c.DefaultQuery("order_dir", "asc")
+	folderPath := c.Query("folder_path")
+	keyword := c.Query("keyword")
+	typeTag := c.Query("type_tag")
+	contentTag := c.Query("content_tag")
+	scanPathIDStr := c.Query("scan_path_id")
+	var scanPathID uint
+	if scanPathIDStr != "" {
+		if id, err := strconv.ParseUint(scanPathIDStr, 10, 64); err == nil {
+			scanPathID = uint(id)
+		}
 	}
-	if f.Prefix != "" {
-		f.Prefix = store.NormalizePath(f.Prefix)
+
+	hidden := false
+	user := mediaUser(c)
+	q := db.MediaItemQuery{
+		MediaType:  mediaType,
+		ScanPathID: scanPathID,
+		FolderPath: folderPath,
+		TypeTag:    typeTag,
+		ContentTag: contentTag,
+		PathPrefix: userPathPrefix(user),
+		Hidden:     &hidden,
+		Keyword:    keyword,
+		OrderBy:    orderBy,
+		OrderDir:   orderDir,
+		Page:       page,
+		PageSize:   pageSize,
 	}
-	items, total, err := db.ListMediaItems(f)
+	items, total, err := db.ListMediaItems(q)
 	if err != nil {
-		common.ErrorResp(c, err, 500, true)
+		common.ErrorResp(c, err, 500)
 		return
 	}
-	out := make([]MediaAdminListResp, 0, len(items))
+	// 元信息(meta) 级别的读权限无法下推到 SQL，这里对当前页做二次过滤
+	filtered := make([]model.MediaItem, 0, len(items))
 	for i := range items {
-		it := &items[i]
-		out = append(out, MediaAdminListResp{
-			MediaListResp: toListResp(it, identityPath),
-			Source:        it.Source, Confidence: it.Confidence, Locked: it.Locked,
-			CandidateCount: len(unmarshalOr(it.Candidates, []model.MediaCandidate{})),
-		})
+		if CanUserAccessItem(user, &items[i]) {
+			filtered = append(filtered, items[i])
+		}
 	}
-	common.SuccessResp(c, gin.H{"content": out, "total": total})
+	common.SuccessResp(c, common.PageResp{Content: filtered, Total: total})
 }
 
-// MediaAssetUpload stores an image: a multipart "file", or a JSON {url} the
-// server downloads (through media_http_proxy). Same bytes, same asset.
-func MediaAssetUpload(c *gin.Context) {
-	st := mediaStore()
-	var data []byte
-	var src string
-	if strings.HasPrefix(c.ContentType(), "multipart/") {
-		fh, err := c.FormFile("file")
+// PublicGetMedia 公开获取媒体详情
+func PublicGetMedia(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil {
+		common.ErrorStrResp(c, "无效的ID", 400)
+		return
+	}
+	item, err := db.GetMediaItemByID(uint(id))
+	if err != nil {
+		common.ErrorResp(c, err, 404)
+		return
+	}
+	if item.Hidden || !CanUserAccessItem(mediaUser(c), item) {
+		common.ErrorStrResp(c, "资源不存在", 404)
+		return
+	}
+	common.SuccessResp(c, item)
+}
+
+// PublicListAlbums 公开专辑列表（音乐）
+func PublicListAlbums(c *gin.Context) {
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "40"))
+	page, pageSize = clampMediaPage(page, pageSize, 40, 200)
+	keyword := c.Query("keyword")
+	scanPathIDStr := c.Query("scan_path_id")
+	var scanPathID uint
+	if scanPathIDStr != "" {
+		if id, err := strconv.ParseUint(scanPathIDStr, 10, 64); err == nil {
+			scanPathID = uint(id)
+		}
+	}
+
+	hidden := false
+	q := db.MediaItemQuery{
+		MediaType:  model.MediaTypeMusic,
+		ScanPathID: scanPathID,
+		PathPrefix: userPathPrefix(mediaUser(c)),
+		Hidden:     &hidden,
+		Keyword:    keyword,
+		Page:       page,
+		PageSize:   pageSize,
+	}
+	albums, total, err := db.ListAlbums(q)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c, common.PageResp{Content: albums, Total: total})
+}
+
+// PublicGetAlbum 公开获取专辑详情及曲目
+func PublicGetAlbum(c *gin.Context) {
+	albumName := c.Query("album_name")
+	albumArtist := c.Query("album_artist")
+	if albumName == "" && albumArtist == "" {
+		common.ErrorStrResp(c, "album_name 和 album_artist 不能同时为空", 400)
+		return
+	}
+	tracks, err := db.GetAlbumTracks(albumName, albumArtist)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	user := mediaUser(c)
+	filtered := make([]model.MediaItem, 0, len(tracks))
+	for i := range tracks {
+		if CanUserAccessItem(user, &tracks[i]) {
+			filtered = append(filtered, tracks[i])
+		}
+	}
+	common.SuccessResp(c, filtered)
+}
+
+// PublicListFolders 公开文件夹列表（目录浏览模式）
+func PublicListFolders(c *gin.Context) {
+	mediaType := model.MediaType(c.Query("media_type"))
+	if mediaType == "" {
+		common.ErrorStrResp(c, "media_type 不能为空", 400)
+		return
+	}
+	paths, err := db.ListFolderPaths(mediaType)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	user := mediaUser(c)
+	filtered := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if CanUserAccessPath(user, p) {
+			filtered = append(filtered, p)
+		}
+	}
+	common.SuccessResp(c, filtered)
+}
+
+// PublicListScanPaths 公开获取扫描路径列表（前端筛选用）
+func PublicListScanPaths(c *gin.Context) {
+	mediaType := model.MediaType(c.Query("media_type"))
+	paths, err := db.ListMediaScanPaths(mediaType)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	user := mediaUser(c)
+	filtered := make([]model.MediaScanPath, 0, len(paths))
+	for _, p := range paths {
+		if CanUserAccessPath(user, p.Path) {
+			filtered = append(filtered, p)
+		}
+	}
+	common.SuccessResp(c, filtered)
+}
+
+// ==================== 导入 / 导出 ====================
+
+// MediaExportData 导出数据结构
+// 包含版本号便于后续兼容性升级；导出粒度由 scope 字段说明：
+//   - "all"        ：所有类型的全部数据
+//   - "media_type" ：单个媒体类型（video/music/image/book）的全部数据
+//   - "scan_path"  ：单个扫描路径下的数据（仅 1 个路径 + 该路径下的条目）
+type MediaExportData struct {
+	Version   int                   `json:"version"`
+	ExportAt  time.Time             `json:"export_at"`
+	Scope     string                `json:"scope"`
+	MediaType model.MediaType       `json:"media_type,omitempty"`
+	ScanPaths []model.MediaScanPath `json:"scan_paths"`
+	Items     []model.MediaItem     `json:"items"`
+}
+
+const mediaExportVersion = 1
+
+// ExportMediaDB 导出媒体数据
+// query: media_type（可选，为空表示全部类型）, scan_path_id（可选，单路径导出）
+// 返回 JSON 文件下载流
+func ExportMediaDB(c *gin.Context) {
+	mediaType := model.MediaType(c.Query("media_type"))
+	scanPathIDStr := c.Query("scan_path_id")
+
+	export := MediaExportData{
+		Version:  mediaExportVersion,
+		ExportAt: time.Now(),
+	}
+
+	if scanPathIDStr != "" {
+		// 按扫描路径导出
+		id, err := strconv.ParseUint(scanPathIDStr, 10, 64)
 		if err != nil {
-			common.ErrorStrResp(c, "multipart field \"file\" is required", 400)
+			common.ErrorStrResp(c, "无效的 scan_path_id", 400)
 			return
 		}
-		f, err := fh.Open()
+		sp, err := db.GetMediaScanPath(uint(id))
+		if err != nil {
+			common.ErrorResp(c, err, 404)
+			return
+		}
+		items, err := db.ListMediaItemsByScanPath(uint(id))
+		if err != nil {
+			common.ErrorResp(c, err, 500)
+			return
+		}
+		export.Scope = "scan_path"
+		export.MediaType = sp.MediaType
+		export.ScanPaths = []model.MediaScanPath{*sp}
+		export.Items = items
+	} else if mediaType != "" {
+		// 按媒体类型导出
+		paths, err := db.ListMediaScanPaths(mediaType)
+		if err != nil {
+			common.ErrorResp(c, err, 500)
+			return
+		}
+		items, err := db.ListAllMediaItems(mediaType)
+		if err != nil {
+			common.ErrorResp(c, err, 500)
+			return
+		}
+		export.Scope = "media_type"
+		export.MediaType = mediaType
+		export.ScanPaths = paths
+		export.Items = items
+	} else {
+		// 全部导出
+		paths, err := db.ListAllMediaScanPaths()
+		if err != nil {
+			common.ErrorResp(c, err, 500)
+			return
+		}
+		items, err := db.ListAllMediaItems("")
+		if err != nil {
+			common.ErrorResp(c, err, 500)
+			return
+		}
+		export.Scope = "all"
+		export.ScanPaths = paths
+		export.Items = items
+	}
+
+	// 直接以 JSON 流下载
+	filename := buildExportFilename(export)
+	c.Header("Content-Disposition", `attachment; filename="`+filename+`"`)
+	c.Header("Content-Type", "application/json; charset=utf-8")
+	if err := json.NewEncoder(c.Writer).Encode(export); err != nil {
+		log.Errorf("导出媒体数据失败: %v", err)
+	}
+}
+
+// buildExportFilename 根据导出范围生成下载文件名
+func buildExportFilename(d MediaExportData) string {
+	ts := d.ExportAt.Format("20060102_150405")
+	switch d.Scope {
+	case "scan_path":
+		spName := ""
+		if len(d.ScanPaths) > 0 {
+			spName = d.ScanPaths[0].Name
+			if spName == "" {
+				spName = d.ScanPaths[0].Path
+			}
+		}
+		// 去掉路径中的斜杠等字符，避免文件名非法
+		safe := strings.NewReplacer("/", "_", "\\", "_", ":", "_", "?", "_", "*", "_", "\"", "_", "<", "_", ">", "_", "|", "_").Replace(spName)
+		return "media_export_" + string(d.MediaType) + "_" + safe + "_" + ts + ".json"
+	case "media_type":
+		return "media_export_" + string(d.MediaType) + "_" + ts + ".json"
+	default:
+		return "media_export_all_" + ts + ".json"
+	}
+}
+
+// ImportMediaDB 导入媒体数据
+// 支持两种调用方式：
+//  1. multipart/form-data：file 字段携带导出生成的 JSON 文件
+//  2. application/json：直接 POST 整个 MediaExportData 结构
+//
+// 可选 query 参数 scan_path_id：当导入"scan_path"范围数据时，
+// 把所有条目重定向到该扫描路径ID（覆盖文件中原有的 scan_path_id）。
+func ImportMediaDB(c *gin.Context) {
+	var data MediaExportData
+
+	contentType := c.GetHeader("Content-Type")
+	if strings.HasPrefix(contentType, "multipart/form-data") {
+		fileHeader, err := c.FormFile("file")
+		if err != nil {
+			common.ErrorStrResp(c, "缺少 file 文件参数", 400)
+			return
+		}
+		f, err := fileHeader.Open()
 		if err != nil {
 			common.ErrorResp(c, err, 400)
 			return
 		}
 		defer f.Close()
-		data, err = io.ReadAll(io.LimitReader(f, apply.MaxImageBytes+1))
-		if err != nil {
+		if err := json.NewDecoder(f).Decode(&data); err != nil {
+			common.ErrorStrResp(c, "导入文件解析失败: "+err.Error(), 400)
+			return
+		}
+	} else {
+		if err := c.ShouldBindJSON(&data); err != nil {
 			common.ErrorResp(c, err, 400)
 			return
 		}
-		src = c.Query("source_url")
-	} else {
-		var req struct {
-			URL string `json:"url"`
-		}
-		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.URL) == "" {
-			common.ErrorStrResp(c, "send a multipart file or {\"url\": ...}", 400)
-			return
-		}
-		dl, err := mediaDownloader()
-		if err != nil {
-			common.ErrorResp(c, err, 500, true)
-			return
-		}
-		data, err = dl(c.Request.Context(), req.URL)
-		if err != nil {
-			mediaErr(c, err)
-			return
-		}
-		src = req.URL
 	}
-	a, err := st.AddAsset(data, src)
+
+	if data.Version <= 0 || data.Version > mediaExportVersion {
+		common.ErrorStrResp(c, "不支持的导入文件版本", 400)
+		return
+	}
+
+	// 1) 先导入扫描路径，建立 oldID -> newID 的映射
+	idMap, spCreated, spUpdated, err := db.ImportMediaScanPaths(data.ScanPaths)
 	if err != nil {
-		common.ErrorResp(c, err, 400)
+		common.ErrorResp(c, err, 500)
 		return
 	}
-	common.SuccessResp(c, gin.H{"id": a.ID, "w": a.Width, "h": a.Height})
-}
 
-// MediaScrape scrapes one path on the server. With an id it fetches that
-// item; without, it identifies and searches. A locked item is left alone.
-func MediaScrape(c *gin.Context) {
-	var req struct {
-		Path     string `json:"path"`
-		Provider string `json:"provider"`
-		ID       string `json:"id"`
-		Lock     bool   `json:"lock"`
-		Force    bool   `json:"force"`
+	// 2) 再导入条目，根据 idMap 把 scan_path_id 重定向到新ID
+	// 修正每个条目的 scan_path_id：
+	//   - 如果 query 指定了 scan_path_id，全部覆盖为该值（按扫描路径重定向导入）
+	//   - 否则按 idMap 自动重定向；找不到映射的保留原值（通常发生在该路径未一并导入时）
+	scanPathIDStr := c.Query("scan_path_id")
+	var override *uint
+	if scanPathIDStr != "" {
+		if id, err := strconv.ParseUint(scanPathIDStr, 10, 64); err == nil {
+			v := uint(id)
+			override = &v
+		}
 	}
-	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Path) == "" {
-		common.ErrorStrResp(c, "path is required", 400)
-		return
+	if override == nil {
+		for i := range data.Items {
+			if newID, ok := idMap[data.Items[i].ScanPathID]; ok {
+				data.Items[i].ScanPathID = newID
+			}
+		}
 	}
-	if !mediaEnabled() {
-		common.ErrorStrResp(c, "media scraping is disabled (media_enabled)", 400)
-		return
-	}
-	set, err := mediaScraperSet()
+
+	itemCreated, itemUpdated, err := db.ImportMediaItems(data.Items, override)
 	if err != nil {
-		common.ErrorResp(c, err, 500, true)
-		return
-	}
-	dl, err := mediaDownloader()
-	if err != nil {
-		common.ErrorResp(c, err, 500, true)
-		return
-	}
-	o := &apply.Orchestrator{
-		Lister: apply.LocalLister{}, Writer: apply.LocalWriter{Store: mediaStore()},
-		Providers: set, Download: dl,
-	}
-	res, err := o.ScrapeOne(c.Request.Context(), req.Path, apply.ScrapeOpts{Provider: req.Provider, ID: req.ID, Lock: req.Lock, Force: req.Force})
-	if err != nil {
-		mediaErr(c, err)
-		return
-	}
-	common.SuccessResp(c, res)
-}
-
-// MediaSearch searches one provider for the manual-pick UI.
-func MediaSearch(c *gin.Context) {
-	q := strings.TrimSpace(c.Query("q"))
-	if q == "" {
-		common.ErrorStrResp(c, "q is required", 400)
-		return
-	}
-	year, _ := strconv.Atoi(c.Query("year"))
-	set, err := mediaScraperSet()
-	if err != nil {
-		common.ErrorResp(c, err, 500, true)
-		return
-	}
-	cs, err := set.Search(c.Request.Context(), c.DefaultQuery("provider", "tmdb"), scraper.SearchQuery{Q: q, Kind: c.Query("kind"), Year: year})
-	if err != nil {
-		mediaErr(c, err)
-		return
-	}
-	if cs == nil {
-		cs = []scraper.Candidate{}
-	}
-	common.SuccessResp(c, cs)
-}
-
-// ---- export / import ----
-
-type mediaExportAsset struct {
-	SHA256    string `json:"sha256"`
-	Mime      string `json:"mime"`
-	Width     int    `json:"width"`
-	Height    int    `json:"height"`
-	SourceURL string `json:"source_url"`
-}
-
-type mediaExportItem struct {
-	Path          string                 `json:"path"`
-	Kind          string                 `json:"kind"`
-	Title         string                 `json:"title"`
-	OriginalTitle string                 `json:"original_title"`
-	Year          int                    `json:"year"`
-	ExternalIDs   map[string]string      `json:"external_ids"`
-	Ratings       map[string]any         `json:"ratings"`
-	Genres        []string               `json:"genres"`
-	Overview      string                 `json:"overview"`
-	PosterSHA     string                 `json:"poster_sha,omitempty"`
-	BackdropSHA   string                 `json:"backdrop_sha,omitempty"`
-	Source        string                 `json:"source"`
-	Confidence    float32                `json:"confidence"`
-	Locked        bool                   `json:"locked"`
-	Candidates    []model.MediaCandidate `json:"candidates"`
-	Episodes      []model.MediaEpisodeIn `json:"episodes"`
-}
-
-type mediaExportDoc struct {
-	Version    int                `json:"version"`
-	ExportedAt time.Time          `json:"exported_at"`
-	Items      []mediaExportItem  `json:"items"`
-	Assets     []mediaExportAsset `json:"assets"`
-}
-
-// MediaExport writes every item (optionally under ?prefix=) as one JSON
-// document. Images are referenced by SHA-256, not embedded.
-func MediaExport(c *gin.Context) {
-	prefix := c.Query("prefix")
-	if prefix != "" {
-		prefix = store.NormalizePath(prefix)
-	}
-	items, err := db.AllMediaItems(prefix)
-	if err != nil {
-		common.ErrorResp(c, err, 500, true)
-		return
-	}
-	var ids []uint
-	for _, it := range items {
-		ids = append(ids, it.PosterID, it.BackdropID)
-	}
-	assets, err := db.GetMediaAssets(nonZero(ids))
-	if err != nil {
-		common.ErrorResp(c, err, 500, true)
-		return
-	}
-	shaByID := map[uint]string{}
-	doc := mediaExportDoc{Version: 1, ExportedAt: time.Now().UTC(), Items: []mediaExportItem{}, Assets: []mediaExportAsset{}}
-	for _, a := range assets {
-		shaByID[a.ID] = a.SHA256
-		doc.Assets = append(doc.Assets, mediaExportAsset{SHA256: a.SHA256, Mime: a.Mime, Width: a.Width, Height: a.Height, SourceURL: a.SourceURL})
-	}
-	for _, it := range items {
-		eps, err := db.GetMediaEpisodes(it.ID)
-		if err != nil {
-			common.ErrorResp(c, err, 500, true)
-			return
-		}
-		e := mediaExportItem{
-			Path: it.Path, Kind: it.Kind, Title: it.Title, OriginalTitle: it.OriginalTitle, Year: it.Year,
-			ExternalIDs: unmarshalOr(it.ExternalIDs, map[string]string{}), Ratings: unmarshalOr(it.Ratings, map[string]any{}),
-			Genres: unmarshalOr(it.Genres, []string{}), Overview: it.Overview,
-			PosterSHA: shaByID[it.PosterID], BackdropSHA: shaByID[it.BackdropID],
-			Source: it.Source, Confidence: it.Confidence, Locked: it.Locked,
-			Candidates: unmarshalOr(it.Candidates, []model.MediaCandidate{}), Episodes: []model.MediaEpisodeIn{},
-		}
-		for _, ep := range eps {
-			e.Episodes = append(e.Episodes, model.MediaEpisodeIn{FileName: ep.FileName, Season: ep.Season, Episode: ep.Episode, Title: ep.Title, Overview: ep.Overview})
-		}
-		doc.Items = append(doc.Items, e)
-	}
-	c.Header("Content-Disposition", `attachment; filename="openlist-media.json"`)
-	c.JSON(http.StatusOK, doc)
-}
-
-func nonZero(ids []uint) []uint {
-	seen := map[uint]bool{}
-	var out []uint
-	for _, id := range ids {
-		if id != 0 && !seen[id] {
-			seen[id] = true
-			out = append(out, id)
-		}
-	}
-	return out
-}
-
-// MediaImport loads an export. Assets it lacks are downloaded again from their
-// recorded source URL; a locked item is kept unless ?overwrite_locked=true.
-func MediaImport(c *gin.Context) {
-	var doc mediaExportDoc
-	if err := c.ShouldBindJSON(&doc); err != nil {
-		common.ErrorResp(c, err, 400)
-		return
-	}
-	if doc.Version != 1 {
-		common.ErrorStrResp(c, fmt.Sprintf("unsupported export version %d", doc.Version), 400)
-		return
-	}
-	overwriteLocked := c.Query("overwrite_locked") == "true"
-	st := mediaStore()
-	dl, err := mediaDownloader()
-	if err != nil {
-		common.ErrorResp(c, err, 500, true)
+		common.ErrorResp(c, err, 500)
 		return
 	}
 
-	idBySHA := map[string]uint{}
-	var downloaded, missing int
-	for _, a := range doc.Assets {
-		if have, err := db.GetMediaAssetBySHA(a.SHA256); err == nil && have != nil {
-			idBySHA[a.SHA256] = have.ID
-			continue
-		}
-		if a.SourceURL == "" {
-			missing++
-			continue
-		}
-		data, err := dl(c.Request.Context(), a.SourceURL)
-		if err != nil {
-			missing++
-			continue
-		}
-		na, err := st.AddAsset(data, a.SourceURL)
-		if err != nil {
-			missing++
-			continue
-		}
-		idBySHA[a.SHA256] = na.ID
-		downloaded++
-	}
-
-	var imported, skipped int
-	for _, it := range doc.Items {
-		kind, title, overview, src := it.Kind, it.Title, it.Overview, it.Source
-		if src == "" {
-			src = model.MediaSourceManual
-		}
-		year, conf, locked, orig := it.Year, it.Confidence, it.Locked, it.OriginalTitle
-		poster, backdrop := idBySHA[it.PosterSHA], idBySHA[it.BackdropSHA]
-		req := model.MediaSetReq{
-			Path: it.Path, Kind: &kind, Title: &title, OriginalTitle: &orig, Year: &year,
-			ExternalIDs: nonNilMap(it.ExternalIDs), Ratings: nonNilAny(it.Ratings), Genres: nonNilSlice(it.Genres),
-			Overview: &overview, PosterID: &poster, BackdropID: &backdrop,
-			Locked: &locked, Source: &src, Confidence: &conf,
-			Candidates: nonNilCands(it.Candidates), Episodes: it.Episodes,
-		}
-		if req.Episodes == nil {
-			req.Episodes = []model.MediaEpisodeIn{}
-		}
-		_, err := st.Set(req, store.SetOptions{RespectLock: !overwriteLocked})
-		switch {
-		case errors.Is(err, store.ErrLocked):
-			skipped++
-		case err != nil:
-			common.ErrorStrResp(c, fmt.Sprintf("%s: %v", it.Path, err), 400)
-			return
-		default:
-			imported++
-		}
-	}
-	common.SuccessResp(c, gin.H{"imported": imported, "skipped_locked": skipped, "assets_downloaded": downloaded, "assets_missing": missing})
-}
-
-func nonNilMap(m map[string]string) map[string]string {
-	if m == nil {
-		return map[string]string{}
-	}
-	return m
-}
-func nonNilAny(m map[string]any) map[string]any {
-	if m == nil {
-		return map[string]any{}
-	}
-	return m
-}
-func nonNilSlice(s []string) []string {
-	if s == nil {
-		return []string{}
-	}
-	return s
-}
-func nonNilCands(s []model.MediaCandidate) []model.MediaCandidate {
-	if s == nil {
-		return []model.MediaCandidate{}
-	}
-	return s
+	common.SuccessResp(c, gin.H{
+		"scan_paths_created": spCreated,
+		"scan_paths_updated": spUpdated,
+		"items_created":      itemCreated,
+		"items_updated":      itemUpdated,
+	})
 }

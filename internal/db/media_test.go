@@ -24,14 +24,14 @@ func TestListMediaItemsFilteredPagesAfterFilteringAcrossBatches(t *testing.T) {
 
 	// 10 items; the even ones are rejected, so 5 remain, spread over 4 batches
 	for i := 0; i < 10; i++ {
-		it := &model.MediaItem{Path: fmt.Sprintf("/m/%02d", i), Kind: model.MediaKindMovie, Title: "t"}
-		if err := SaveMediaItem(it, nil); err != nil {
+		it := &model.MediaWork{Path: fmt.Sprintf("/m/%02d", i), Kind: model.MediaKindMovie, Title: "t"}
+		if err := SaveMediaWork(it, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
-	odd := func(it *model.MediaItem) bool { return it.Path[len(it.Path)-1]%2 == 1 }
+	odd := func(it *model.MediaWork) bool { return it.Path[len(it.Path)-1]%2 == 1 }
 	page := func(n int) ([]string, int64) {
-		items, total, err := ListMediaItemsFiltered(MediaListFilter{Prefix: "/m", Kinds: []string{model.MediaKindMovie}, Page: n, PerPage: 2}, odd)
+		items, total, err := ListMediaWorksFiltered(MediaWorkListFilter{Prefix: "/m", Kinds: []string{model.MediaKindMovie}, Page: n, PerPage: 2}, odd)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -67,7 +67,7 @@ func (f *fakeOP) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		reply(200, "success", map[string]any{"content": ents, "total": len(ents)})
-	case "/api/admin/media/list":
+	case "/api/admin/media/works/list":
 		prefix := r.URL.Query().Get("prefix")
 		var out []map[string]any
 		for p, it := range f.items {
@@ -76,7 +76,7 @@ func (f *fakeOP) serve(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		reply(200, "success", map[string]any{"content": out, "total": len(out)})
-	case "/api/admin/media/set":
+	case "/api/admin/media/works/set":
 		var req mm.MediaSetReq
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		f.sets = append(f.sets, req)
@@ -85,7 +85,7 @@ func (f *fakeOP) serve(w http.ResponseWriter, r *http.Request) {
 			f.locked[req.Path] = *req.Locked
 		}
 		reply(200, "success", nil)
-	case "/api/admin/media/asset":
+	case "/api/admin/media/works/asset":
 		f.uploads++
 		file, _, err := r.FormFile("file")
 		if err != nil {
@@ -100,14 +100,14 @@ func (f *fakeOP) serve(w http.ResponseWriter, r *http.Request) {
 			f.assets[key] = id
 		}
 		reply(200, "success", map[string]any{"id": id, "w": 10, "h": 10})
-	case "/api/admin/media/search":
+	case "/api/admin/media/works/search":
 		q := r.URL.Query().Get("q")
 		if q == "盗梦空间" {
 			reply(200, "success", []scraper.Candidate{{Provider: "tmdb", ID: "movie/27205", Title: "盗梦空间", Year: 2010, Score: 0.92}})
 			return
 		}
 		reply(200, "success", []scraper.Candidate{{Provider: "tmdb", ID: "tv/1", Title: "Something", Year: 2001, Score: 0.31}, {Provider: "tmdb", ID: "tv/2", Title: "Other", Year: 2002, Score: 0.3}})
-	case "/api/admin/media/delete":
+	case "/api/admin/media/works/delete":
 		var req struct{ Path string }
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		delete(f.items, req.Path)
@@ -122,7 +122,7 @@ func (f *fakeOP) serve(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		f.gets = append(f.gets, req.Path)
 		reply(200, "success", map[string]any{"raw_url": f.rawURL})
-	case "/api/admin/media/scrape":
+	case "/api/admin/media/works/scrape":
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		f.scrapes = append(f.scrapes, body)
@@ -332,7 +332,7 @@ func TestTokenFile(t *testing.T) {
 	var out struct {
 		Total int `json:"total"`
 	}
-	if err := c.Call("GET", "/api/admin/media/list", nil, &out); err != nil {
+	if err := c.Call("GET", "/api/admin/media/works/list", nil, &out); err != nil {
 		t.Fatalf("the token from the file was not used: %v", err)
 	}
 	_ = os.WriteFile(p, []byte("  \n"), 0o600)

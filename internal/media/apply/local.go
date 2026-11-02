@@ -37,7 +37,7 @@ func (LocalLister) List(ctx context.Context, p string) ([]identify.Entry, error)
 type LocalWriter struct{ Store *store.Store }
 
 func (w LocalWriter) Existing(_ context.Context, prefix string) (map[string]Existing, error) {
-	items, err := db.AllMediaItems(prefix)
+	items, err := db.AllMediaWorks(prefix)
 	if err != nil {
 		return nil, err
 	}

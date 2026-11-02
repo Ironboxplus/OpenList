@@ -67,7 +67,7 @@ func GetMediaStats() (MediaStats, error) {
 		N    int64
 	}
 	var rows []kc
-	err := db.Model(&model.MediaItem{}).Select("kind, COUNT(*) AS n").
+	err := db.Model(&model.MediaWork{}).Select("kind, COUNT(*) AS n").
 		Where("kind IN ?", []string{model.MediaKindMovie, model.MediaKindTV, model.MediaKindAnime, model.MediaKindCollection}).
 		Group("kind").Scan(&rows).Error
 	if err != nil {
@@ -85,10 +85,10 @@ func GetMediaStats() (MediaStats, error) {
 			out.Collection = r.N
 		}
 	}
-	if err := db.Model(&model.MediaEpisode{}).Count(&out.Episodes).Error; err != nil {
+	if err := db.Model(&model.MediaWorkEpisode{}).Count(&out.Episodes).Error; err != nil {
 		return out, errors.WithStack(err)
 	}
-	err = db.Model(&model.MediaItem{}).
+	err = db.Model(&model.MediaWork{}).
 		Where("kind NOT IN ?", []string{model.MediaKindIgnore, model.MediaKindLibrary}).
 		Where("scraped_at IS NULL").Count(&out.Unscraped).Error
 	return out, errors.WithStack(err)

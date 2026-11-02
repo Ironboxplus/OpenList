@@ -37,7 +37,7 @@ var formatMime = map[string]string{
 }
 
 // AssetFile is where an asset's original (thumb=false) or thumbnail lives.
-func (s *Store) AssetFile(a *model.MediaAsset, thumb bool) string {
+func (s *Store) AssetFile(a *model.MediaWorkAsset, thumb bool) string {
 	dir := filepath.Join(s.AssetDir, a.SHA256[:2])
 	if thumb {
 		return filepath.Join(dir, a.SHA256+".thumb.jpg")
@@ -52,7 +52,7 @@ func (s *Store) AssetFile(a *model.MediaAsset, thumb bool) string {
 // AddAsset stores an image, deduplicated by its SHA-256. The bytes go to disk
 // (original plus a 342px thumbnail), never into the database. srcURL is only
 // recorded.
-func (s *Store) AddAsset(data []byte, srcURL string) (*model.MediaAsset, error) {
+func (s *Store) AddAsset(data []byte, srcURL string) (*model.MediaWorkAsset, error) {
 	limit := s.MaxAssetBytes
 	if limit <= 0 {
 		limit = defaultMaxAsset
@@ -62,7 +62,7 @@ func (s *Store) AddAsset(data []byte, srcURL string) (*model.MediaAsset, error) 
 	}
 	sum := sha256.Sum256(data)
 	sha := hex.EncodeToString(sum[:])
-	if a, err := db.GetMediaAssetBySHA(sha); err != nil || a != nil {
+	if a, err := db.GetMediaWorkAssetBySHA(sha); err != nil || a != nil {
 		return a, err
 	}
 	cfg, format, err := image.DecodeConfig(bytes.NewReader(data))
@@ -73,7 +73,7 @@ func (s *Store) AddAsset(data []byte, srcURL string) (*model.MediaAsset, error) 
 	if mime == "" {
 		return nil, fmt.Errorf("unsupported image format %q", format)
 	}
-	a := &model.MediaAsset{SHA256: sha, Mime: mime, Width: cfg.Width, Height: cfg.Height, SourceURL: srcURL}
+	a := &model.MediaWorkAsset{SHA256: sha, Mime: mime, Width: cfg.Width, Height: cfg.Height, SourceURL: srcURL}
 	if err := writeFileAtomic(s.AssetFile(a, false), data); err != nil {
 		return nil, err
 	}
@@ -84,9 +84,9 @@ func (s *Store) AddAsset(data []byte, srcURL string) (*model.MediaAsset, error) 
 	if err := writeFileAtomic(s.AssetFile(a, true), thumb); err != nil {
 		return nil, err
 	}
-	if err := db.CreateMediaAsset(a); err != nil {
+	if err := db.CreateMediaWorkAsset(a); err != nil {
 		// A concurrent upload of the same bytes won the unique index.
-		if existing, e2 := db.GetMediaAssetBySHA(sha); e2 == nil && existing != nil {
+		if existing, e2 := db.GetMediaWorkAssetBySHA(sha); e2 == nil && existing != nil {
 			return existing, nil
 		}
 		return nil, err

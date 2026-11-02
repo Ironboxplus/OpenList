@@ -1,4 +1,4 @@
-package template
+package ilanzou
 
 import (
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
@@ -35,7 +35,7 @@ func init() {
 				NoOverwriteUpload: true,
 			},
 			conf: Conf{
-				base:       "https://api.ilanzou.com",
+				base:       "https://apis.ilanzou.com",
 				secret:     []byte("lanZouY-disk-app"),
 				bucket:     "wpanstore-lanzou",
 				unproved:   "unproved",

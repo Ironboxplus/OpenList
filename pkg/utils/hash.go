@@ -140,7 +140,7 @@ func fromTypes(types []*HashType) map[*HashType]hash.Hash {
 // single multiwriter, where one write will update all
 // the hashers.
 func toMultiWriter(h map[*HashType]hash.Hash) io.Writer {
-	// Convert to to slice
+	// Convert to slice
 	var w = make([]io.Writer, 0, len(h))
 	for _, v := range h {
 		w = append(w, v)
@@ -193,7 +193,7 @@ func (m *MultiHasher) Size() int64 {
 
 // A HashInfo contains hash string for one or more hashType
 type HashInfo struct {
-	h map[*HashType]string `json:"hashInfo"`
+	h map[*HashType]string
 }
 
 func NewHashInfoByMap(h map[*HashType]string) HashInfo {

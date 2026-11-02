@@ -14,7 +14,7 @@
 
 ---
 
-- English | [中文](./README_cn.md) | [日本語](./README_ja.md) | [Dutch](./README_nl.md)
+- English | [中文](./README/README_cn.md) | [日本語](./README/README_ja.md) | [Dutch](./README/README_nl.md) | [한국어](./README/README_ko.md) | [Deutsch](./README/README_de.md) | [Русский](./README/README_ru.md) | [Français](./README/README_fr.md) | [Español](./README/README_es.md) | [العربية](./README/README_ar.md)
 
 - [Contributing](./CONTRIBUTING.md)
 - [CODE OF CONDUCT](./CODE_OF_CONDUCT.md)
@@ -67,7 +67,7 @@ Thank you for your support and understanding of the OpenList project.
   - [x] [MediaFire](https://www.mediafire.com)
   - [x] [Mediatrack](https://www.mediatrack.cn)
   - [x] [ProtonDrive](https://proton.me/drive)
-  - [x] [139yun](https://yun.139.com) (Personal, Family, Group)
+  - [x] [139yun](https://yun.139.com) (Personal, Family, Group, Share)
   - [x] [YandexDisk](https://disk.yandex.com)
   - [x] [BaiduNetdisk](http://pan.baidu.com)
   - [x] [Terabox](https://www.terabox.com/main)
@@ -95,6 +95,7 @@ Thank you for your support and understanding of the OpenList project.
   - [x] [OpenList](https://github.com/OpenListTeam/OpenList)
   - [x] [Teldrive](https://github.com/tgdrive/teldrive)
   - [x] [Weiyun](https://www.weiyun.com)
+  - [x] [DingTalk Docs](https://alidocs.dingtalk.com/)
 - [x] Easy to deploy and out-of-the-box
 - [x] File preview (PDF, markdown, code, plain text, ...)
 - [x] Image preview in gallery mode

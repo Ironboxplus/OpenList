@@ -125,19 +125,19 @@ func TestEpisodesReplacedOnlyWhenGiven(t *testing.T) {
 		t.Fatal(err)
 	}
 	it, _ := s.Get("/tv/x")
-	if eps, _ := db.GetMediaEpisodes(it.ID); len(eps) != 2 {
+	if eps, _ := db.GetMediaWorkEpisodes(it.ID); len(eps) != 2 {
 		t.Fatalf("episodes = %d", len(eps))
 	}
 	if _, err := s.Set(model.MediaSetReq{Path: "/tv/x", Title: str("t")}, SetOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if eps, _ := db.GetMediaEpisodes(it.ID); len(eps) != 2 {
+	if eps, _ := db.GetMediaWorkEpisodes(it.ID); len(eps) != 2 {
 		t.Fatalf("episodes lost by a set without episodes: %d", len(eps))
 	}
 	if _, err := s.Set(model.MediaSetReq{Path: "/tv/x", Episodes: []model.MediaEpisodeIn{{FileName: "S01E03.mkv", Season: 1, Episode: 3}}}, SetOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if eps, _ := db.GetMediaEpisodes(it.ID); len(eps) != 1 || eps[0].Episode != 3 {
+	if eps, _ := db.GetMediaWorkEpisodes(it.ID); len(eps) != 1 || eps[0].Episode != 3 {
 		t.Fatalf("episodes not replaced: %+v", eps)
 	}
 }
@@ -149,7 +149,7 @@ func TestChildrenAreDirectOnlyAndLikeIsEscaped(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	kids, err := db.ListMediaChildren("/lib")
+	kids, err := db.ListMediaWorkChildren("/lib")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,7 +162,7 @@ func TestChildrenAreDirectOnlyAndLikeIsEscaped(t *testing.T) {
 		t.Fatalf("children = %v, want %v", got, want)
 	}
 	// a LIKE wildcard in the parent path must not match siblings
-	kids, _ = db.ListMediaChildren("/l_b")
+	kids, _ = db.ListMediaWorkChildren("/l_b")
 	if len(kids) != 0 {
 		t.Fatalf("'_' acted as a wildcard: %v", kids)
 	}
@@ -187,7 +187,7 @@ func TestPendingFilter(t *testing.T) {
 	mk("/p/highcand", 0.9, false, []model.MediaCandidate{{Provider: "tmdb", ID: "tv/1"}})
 	mk("/p/lowlocked", 0.1, true, nil)
 	mk("/p/emptycand", 0.9, false, []model.MediaCandidate{})
-	items, total, err := db.ListMediaItems(db.MediaListFilter{Prefix: "/p", Pending: true})
+	items, total, err := db.ListMediaWorks(db.MediaWorkListFilter{Prefix: "/p", Pending: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +243,7 @@ func TestLibraryKindIsAccepted(t *testing.T) {
 	if err != nil || it.Kind != "library" {
 		t.Fatalf("library rejected: %v", err)
 	}
-	if items, total, err := db.ListMediaItems(db.MediaListFilter{Kind: "library", Page: 1, PerPage: 10}); err != nil || total != 1 || items[0].Path != "/lib" {
+	if items, total, err := db.ListMediaWorks(db.MediaWorkListFilter{Kind: "library", Page: 1, PerPage: 10}); err != nil || total != 1 || items[0].Path != "/lib" {
 		t.Fatalf("list by kind: %v %d", err, total)
 	}
 }

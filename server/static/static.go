@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,8 +24,8 @@ import (
 
 type ManifestIcon struct {
 	Src   string `json:"src"`
-	Sizes string `json:"sizes"`
-	Type  string `json:"type"`
+	Sizes string `json:"sizes,omitempty"`
+	Type  string `json:"type,omitempty"`
 }
 
 type Manifest struct {
@@ -121,9 +122,9 @@ func initIndex(siteConfig SiteConfig) {
 		manifestPath = siteConfig.BasePath + "/manifest.json"
 	}
 	replaceMap := map[string]string{
-		"cdn: undefined":                    fmt.Sprintf("cdn: '%s'", siteConfig.Cdn),
-		"base_path: undefined":              fmt.Sprintf("base_path: '%s'", siteConfig.BasePath),
-		`href="/manifest.json"`:             fmt.Sprintf(`href="%s"`, manifestPath),
+		"cdn: undefined":        fmt.Sprintf("cdn: '%s'", siteConfig.Cdn),
+		"base_path: undefined":  fmt.Sprintf("base_path: '%s'", siteConfig.BasePath),
+		`href="/manifest.json"`: fmt.Sprintf(`href="%s"`, manifestPath),
 	}
 	conf.RawIndexHtml = replaceStrings(conf.RawIndexHtml, replaceMap)
 	UpdateIndex()
@@ -164,6 +165,19 @@ func ReloadStatic() {
 	initIndex(siteConfig)
 }
 
+func manifestIcon(src string) ManifestIcon {
+	icon := ManifestIcon{Src: src, Sizes: "any"}
+	u, err := url.Parse(src)
+	if err != nil {
+		return icon
+	}
+	mimeType := utils.GetMimeType(u.Path)
+	if strings.HasPrefix(mimeType, "image/") {
+		icon.Type = mimeType
+	}
+	return icon
+}
+
 func ManifestJSON(c *gin.Context) {
 	// Get site configuration to ensure consistent base path handling
 	siteConfig := getSiteConfig()
@@ -189,13 +203,7 @@ func ManifestJSON(c *gin.Context) {
 		Scope:    scope,
 		StartURL: startURL,
 		Name:     siteTitle,
-		Icons: []ManifestIcon{
-			{
-				Src:   logoUrl,
-				Sizes: "512x512",
-				Type:  "image/png",
-			},
-		},
+		Icons:    []ManifestIcon{manifestIcon(logoUrl)},
 	}
 
 	c.Header("Content-Type", "application/json")

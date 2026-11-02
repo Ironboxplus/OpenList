@@ -17,9 +17,9 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/sharing"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
-	"github.com/OpenListTeam/go-cache"
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
+	log "github.com/sirupsen/logrus"
 )
 
 // shareLink is the one builder of share links: <apiURL>/<route>/<sid>/<path>,
@@ -41,13 +41,13 @@ func SharingGet(c *gin.Context, req *FsGetReq) {
 		return
 	}
 	s, obj, err := sharing.Get(c.Request.Context(), sid, path, model.SharingListArgs{
-		Refresh: false,
-		Pwd:     req.Password,
+		Refresh:  false,
+		Pwd:      req.Password,
+		ClientIP: c.ClientIP(),
 	})
 	if dealError(c, err) {
 		return
 	}
-	_ = countAccess(c.ClientIP(), s)
 	url := ""
 	if !obj.IsDir() {
 		url = shareLink(common.GetApiUrl(c), "sd", sid, path, s.Pwd)
@@ -63,7 +63,7 @@ func SharingGet(c *gin.Context, req *FsGetReq) {
 			HashInfoStr: obj.GetHash().String(),
 			HashInfo:    obj.GetHash().Export(),
 			Sign:        "",
-			Type:        utils.GetFileType(obj.GetName()),
+			Type:        utils.GetObjType(obj.GetName(), obj.IsDir()),
 			Thumb:       thumb,
 		},
 		RawURL:   url,
@@ -98,13 +98,13 @@ func SharingList(c *gin.Context, req *ListReq) {
 		return
 	}
 	s, objs, err := sharing.List(c.Request.Context(), sid, path, model.SharingListArgs{
-		Refresh: req.Refresh,
-		Pwd:     req.Password,
+		Refresh:  req.Refresh,
+		Pwd:      req.Password,
+		ClientIP: c.ClientIP(),
 	})
 	if dealError(c, err) {
 		return
 	}
-	_ = countAccess(c.ClientIP(), s)
 	total, objs := pagination(objs, &req.PageReq)
 	common.SuccessResp(c, FsListResp{
 		Content: utils.MustSliceConvert(objs, func(obj model.Obj) ObjResp {
@@ -152,12 +152,12 @@ func SharingArchiveMeta(c *gin.Context, req *ArchiveMetaReq) {
 			ArchiveArgs: archiveArgs,
 			Refresh:     req.Refresh,
 		},
-		Pwd: req.Password,
+		Pwd:      req.Password,
+		ClientIP: c.ClientIP(),
 	})
 	if dealError(c, err) {
 		return
 	}
-	_ = countAccess(c.ClientIP(), s)
 	url := shareLink(common.GetApiUrl(c), "sad", sid, path, s.Pwd)
 	common.SuccessResp(c, ArchiveMetaResp{
 		Comment:     ret.GetComment(),
@@ -189,17 +189,17 @@ func SharingArchiveList(c *gin.Context, req *ArchiveListReq) {
 		},
 		InnerPath: utils.FixAndCleanPath(req.InnerPath),
 	}
-	s, objs, err := sharing.ArchiveList(c.Request.Context(), sid, path, model.SharingArchiveListArgs{
+	_, objs, err := sharing.ArchiveList(c.Request.Context(), sid, path, model.SharingArchiveListArgs{
 		ArchiveListArgs: model.ArchiveListArgs{
 			ArchiveInnerArgs: innerArgs,
 			Refresh:          req.Refresh,
 		},
-		Pwd: req.Password,
+		Pwd:      req.Password,
+		ClientIP: c.ClientIP(),
 	})
 	if dealError(c, err) {
 		return
 	}
-	_ = countAccess(c.ClientIP(), s)
 	total, objs := pagination(objs, &req.PageReq)
 	ret, _ := utils.SliceConvert(objs, func(src model.Obj) (ObjResp, error) {
 		return toObjsRespWithoutSignAndThumb(src), nil
@@ -217,12 +217,10 @@ func SharingDown(c *gin.Context) {
 	pwd := c.Query("pwd")
 	s, err := op.GetSharingById(sid)
 	if err == nil {
-		if !s.Valid() {
-			err = errs.InvalidSharing
-		} else if !s.Verify(pwd) {
-			err = errs.WrongShareCode
-		} else if len(s.Files) != 1 && path == "/" {
+		if len(s.Files) != 1 && path == "/" {
 			err = errors.New("cannot get sharing root link")
+		} else {
+			err = op.AccessSharing(c.ClientIP(), pwd, s)
 		}
 	}
 	if dealErrorPage(c, err) {
@@ -234,14 +232,15 @@ func SharingDown(c *gin.Context) {
 		return
 	}
 	storage, actualPath, err := op.GetStorageAndActualPath(unwrapPath)
-	if dealErrorPage(c, err) {
+	if err != nil {
+		log.Errorf("failed get sharing storage: %+v", err)
+		common.ErrorPage(c, errors.New("failed get sharing link"), 500)
 		return
 	}
 	if setting.GetBool(conf.ShareForceProxy) || common.ShouldProxy(storage, stdpath.Base(actualPath)) {
 		if _, ok := c.GetQuery("d"); !ok {
 			if url := common.GenerateDownProxyURL(storage.GetStorage(), unwrapPath); url != "" {
 				c.Redirect(302, url)
-				_ = countAccess(c.ClientIP(), s)
 				return
 			}
 		}
@@ -250,10 +249,10 @@ func SharingDown(c *gin.Context) {
 			Type:   c.Query("type"),
 		})
 		if err != nil {
-			common.ErrorPage(c, errors.WithMessage(err, "failed get sharing link"), 500)
+			log.Errorf("failed get sharing link: %+v", err)
+			common.ErrorPage(c, errors.New("failed get sharing link"), 500)
 			return
 		}
-		_ = countAccess(c.ClientIP(), s)
 		proxy(c, link, obj, storage.GetStorage().ProxyRange)
 	} else {
 		link, _, err := op.Link(c.Request.Context(), storage, actualPath, model.LinkArgs{
@@ -263,10 +262,10 @@ func SharingDown(c *gin.Context) {
 			Redirect: true,
 		})
 		if err != nil {
-			common.ErrorPage(c, errors.WithMessage(err, "failed get sharing link"), 500)
+			log.Errorf("failed get sharing link: %+v", err)
+			common.ErrorPage(c, errors.New("failed get sharing link"), 500)
 			return
 		}
-		_ = countAccess(c.ClientIP(), s)
 		redirect(c, link)
 	}
 }
@@ -284,12 +283,10 @@ func SharingArchiveExtract(c *gin.Context) {
 	archivePass := c.Query("pass")
 	s, err := op.GetSharingById(sid)
 	if err == nil {
-		if !s.Valid() {
-			err = errs.InvalidSharing
-		} else if !s.Verify(pwd) {
-			err = errs.WrongShareCode
-		} else if len(s.Files) != 1 && path == "/" {
+		if len(s.Files) != 1 && path == "/" {
 			err = errors.New("cannot extract sharing root")
+		} else {
+			err = op.AccessSharing(c.ClientIP(), pwd, s)
 		}
 	}
 	if dealErrorPage(c, err) {
@@ -632,20 +629,4 @@ func SetEnableSharing(disable bool) func(ctx *gin.Context) {
 			common.SuccessResp(c)
 		}
 	}
-}
-
-var (
-	AccessCache      = cache.NewMemCache[interface{}]()
-	AccessCountDelay = 30 * time.Minute
-)
-
-func countAccess(ip string, s *model.Sharing) error {
-	key := fmt.Sprintf("%s:%s", s.ID, ip)
-	_, ok := AccessCache.Get(key)
-	if !ok {
-		AccessCache.Set(key, struct{}{}, cache.WithEx[interface{}](AccessCountDelay))
-		s.Accessed += 1
-		return op.UpdateSharing(s, true)
-	}
-	return nil
 }

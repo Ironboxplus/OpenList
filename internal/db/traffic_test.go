@@ -52,7 +52,7 @@ func TestAddTrafficDailyUpserts(t *testing.T) {
 func TestMediaStatsCountsWorksOnly(t *testing.T) {
 	testDB(t)
 	scraped := time.Now()
-	items := []model.MediaItem{
+	items := []model.MediaWork{
 		{Path: "/a", Kind: model.MediaKindMovie, ScrapedAt: &scraped},
 		{Path: "/b", Kind: model.MediaKindMovie},
 		{Path: "/c", Kind: model.MediaKindTV, ScrapedAt: &scraped},
@@ -62,11 +62,11 @@ func TestMediaStatsCountsWorksOnly(t *testing.T) {
 		{Path: "/g", Kind: model.MediaKindLibrary},
 	}
 	for i := range items {
-		var eps []model.MediaEpisode
+		var eps []model.MediaWorkEpisode
 		if items[i].Kind == model.MediaKindTV {
-			eps = []model.MediaEpisode{{FileName: "1.mkv", Season: 1, Episode: 1}, {FileName: "2.mkv", Season: 1, Episode: 2}}
+			eps = []model.MediaWorkEpisode{{FileName: "1.mkv", Season: 1, Episode: 1}, {FileName: "2.mkv", Season: 1, Episode: 2}}
 		}
-		if err := SaveMediaItem(&items[i], eps); err != nil {
+		if err := SaveMediaWork(&items[i], eps); err != nil {
 			t.Fatal(err)
 		}
 	}

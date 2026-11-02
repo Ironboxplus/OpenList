@@ -38,13 +38,13 @@ type SetOptions struct {
 func NormalizePath(p string) string { return utils.FixAndCleanPath(strings.TrimSpace(p)) }
 
 // Get returns the item at path, or nil.
-func (s *Store) Get(path string) (*model.MediaItem, error) {
-	return db.GetMediaItemByPath(NormalizePath(path))
+func (s *Store) Get(path string) (*model.MediaWork, error) {
+	return db.GetMediaWorkByPath(NormalizePath(path))
 }
 
 // Set upserts the item at req.Path. Only the fields present in req are
 // written; everything else keeps its value. A new item needs a valid Kind.
-func (s *Store) Set(req model.MediaSetReq, opt SetOptions) (*model.MediaItem, error) {
+func (s *Store) Set(req model.MediaSetReq, opt SetOptions) (*model.MediaWork, error) {
 	if strings.TrimSpace(req.Path) == "" {
 		return nil, fmt.Errorf("path is required")
 	}
@@ -52,7 +52,7 @@ func (s *Store) Set(req model.MediaSetReq, opt SetOptions) (*model.MediaItem, er
 	if path == "/" {
 		return nil, fmt.Errorf("the root cannot be a media item")
 	}
-	it, err := db.GetMediaItemByPath(path)
+	it, err := db.GetMediaWorkByPath(path)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +63,7 @@ func (s *Store) Set(req model.MediaSetReq, opt SetOptions) (*model.MediaItem, er
 		if req.Kind == nil {
 			return nil, fmt.Errorf("kind is required for a new item")
 		}
-		it = &model.MediaItem{Path: path, Source: model.MediaSourceManual}
+		it = &model.MediaWork{Path: path, Source: model.MediaSourceManual}
 	}
 	if req.Kind != nil {
 		if !model.ValidMediaKind(*req.Kind) {
@@ -119,17 +119,17 @@ func (s *Store) Set(req model.MediaSetReq, opt SetOptions) (*model.MediaItem, er
 		now := time.Now()
 		it.ScrapedAt = &now
 	}
-	var eps []model.MediaEpisode
+	var eps []model.MediaWorkEpisode
 	if req.Episodes != nil {
-		eps = make([]model.MediaEpisode, 0, len(req.Episodes))
+		eps = make([]model.MediaWorkEpisode, 0, len(req.Episodes))
 		for _, e := range req.Episodes {
-			eps = append(eps, model.MediaEpisode{
+			eps = append(eps, model.MediaWorkEpisode{
 				FileName: e.FileName, Season: e.Season, Episode: e.Episode,
 				Title: e.Title, Overview: e.Overview, StillID: e.StillID,
 			})
 		}
 	}
-	if err := db.SaveMediaItem(it, eps); err != nil {
+	if err := db.SaveMediaWork(it, eps); err != nil {
 		return nil, err
 	}
 	return it, nil
@@ -137,12 +137,12 @@ func (s *Store) Set(req model.MediaSetReq, opt SetOptions) (*model.MediaItem, er
 
 // Delete removes the item at path; it reports how many items went.
 func (s *Store) Delete(path string) (int64, error) {
-	return db.DeleteMediaItemByPath(NormalizePath(path))
+	return db.DeleteMediaWorkByPath(NormalizePath(path))
 }
 
 // DeletePrefix removes the item at prefix and everything below it.
 func (s *Store) DeletePrefix(prefix string) (int64, error) {
-	return db.DeleteMediaItemsByPrefix(NormalizePath(prefix))
+	return db.DeleteMediaWorksByPrefix(NormalizePath(prefix))
 }
 
 func mustJSON(v any) string {

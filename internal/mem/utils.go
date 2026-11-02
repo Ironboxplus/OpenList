@@ -16,7 +16,7 @@ func MemoryGrowCheck(growSize uint64) error {
 	if conf.MinFreeMemory == 0 {
 		return ErrNotEnoughMemory
 	}
-	m, err, _ := singleflight.AnyGroup.Do("MemoryGrowCheck", func() (any, error) {
+	r, err, _ := singleflight.AnyGroup.Do("MemoryGrowCheck", func() (any, error) {
 		_, available, err := EffectiveMemory()
 		if err != nil {
 			return nil, err
@@ -24,18 +24,20 @@ func MemoryGrowCheck(growSize uint64) error {
 		if available < conf.MinFreeMemory {
 			return nil, ErrNotEnoughMemory
 		}
-		return &available, nil
+		var res atomic.Uint64
+		res.Store(available)
+		return &res, nil
 	})
 	if err != nil {
 		return err
 	}
-	avail := m.(*uint64)
+	res := r.(*atomic.Uint64)
 	for {
-		available := atomic.LoadUint64(avail)
+		available := res.Load()
 		if available < growSize || available-growSize < conf.MinFreeMemory {
 			return ErrNotEnoughMemory
 		}
-		if atomic.CompareAndSwapUint64(avail, available, available-growSize) {
+		if res.CompareAndSwap(available, available-growSize) {
 			return nil
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -108,6 +109,19 @@ func (d *Open115) singleUpload(ctx context.Context, tempF model.File, tokenResp 
 	return checkUploadCallback(bodyBytes)
 }
 
+// retryExpiredToken retries only the rejected OSS operation, preserving the upload ID.
+func retryExpiredToken(refresh func() error, operation func() error) error {
+	err := operation()
+	var serviceErr oss.ServiceError
+	if !errors.As(err, &serviceErr) || serviceErr.Code != "SecurityTokenExpired" {
+		return err
+	}
+	if err := refresh(); err != nil {
+		return err
+	}
+	return operation()
+}
+
 func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer, up driver.UpdateProgress, tokenResp *sdk.UploadGetTokenResp, initResp *sdk.UploadInitResp) error {
 	// 创建OSS客户端的辅助函数
 	createBucket := func(token *sdk.UploadGetTokenResp) (*oss.Bucket, error) {
@@ -123,7 +137,26 @@ func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer,
 		return err
 	}
 
-	imur, err := bucket.InitiateMultipartUpload(initResp.Object, oss.Sequential())
+	// refresh swaps in a new OSS token through the shared token cache (rate-limited via waitAPI)
+	refresh := func() error {
+		newToken, err := d.refreshUploadToken(ctx, tokenResp)
+		if err != nil {
+			return err
+		}
+		newBucket, err := createBucket(newToken)
+		if err != nil {
+			return err
+		}
+		tokenResp, bucket = newToken, newBucket
+		return nil
+	}
+
+	var imur oss.InitiateMultipartUploadResult
+	err = retryExpiredToken(refresh, func() error {
+		var err error
+		imur, err = bucket.InitiateMultipartUpload(initResp.Object, oss.Sequential(), oss.WithContext(ctx))
+		return err
+	})
 	if err != nil {
 		return err
 	}
@@ -152,28 +185,32 @@ func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer,
 			return err
 		}
 		err = retry.Do(func() error {
-			rd.Seek(0, io.SeekStart)
-			part, err := bucket.UploadPart(imur, driver.NewLimitedUploadStream(ctx, rd), partSize, int(i))
-			if err != nil {
-				if isPartAlreadyExistError(err) {
-					log.Infof("115 OSS part %d already exists, retrieving from ListUploadedParts", i)
-					lpr, listErr := bucket.ListUploadedParts(imur)
-					if listErr != nil {
-						return fmt.Errorf("part %d already exists but ListUploadedParts failed: %w", i, listErr)
-					}
-					for _, p := range lpr.UploadedParts {
-						if p.PartNumber == int(i) {
-							parts[i-1] = oss.UploadPart{PartNumber: p.PartNumber, ETag: p.ETag}
-							log.Infof("115 OSS part %d recovered: ETag=%s", i, p.ETag)
-							return nil
-						}
-					}
-					return fmt.Errorf("part %d reported as existing but not found in ListUploadedParts", i)
+			return retryExpiredToken(refresh, func() error {
+				if _, err := rd.Seek(0, io.SeekStart); err != nil {
+					return err
 				}
-				return err
-			}
-			parts[i-1] = part
-			return nil
+				part, err := bucket.UploadPart(imur, driver.NewLimitedUploadStream(ctx, rd), partSize, int(i), oss.WithContext(ctx))
+				if err != nil {
+					if isPartAlreadyExistError(err) {
+						log.Infof("115 OSS part %d already exists, retrieving from ListUploadedParts", i)
+						lpr, listErr := bucket.ListUploadedParts(imur, oss.WithContext(ctx))
+						if listErr != nil {
+							return fmt.Errorf("part %d already exists but ListUploadedParts failed: %w", i, listErr)
+						}
+						for _, p := range lpr.UploadedParts {
+							if p.PartNumber == int(i) {
+								parts[i-1] = oss.UploadPart{PartNumber: p.PartNumber, ETag: p.ETag}
+								log.Infof("115 OSS part %d recovered: ETag=%s", i, p.ETag)
+								return nil
+							}
+						}
+						return fmt.Errorf("part %d reported as existing but not found in ListUploadedParts", i)
+					}
+					return err
+				}
+				parts[i-1] = part
+				return nil
+			})
 		},
 			retry.Context(ctx),
 			retry.Attempts(3),
@@ -209,13 +246,17 @@ func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer,
 	}
 
 	var bodyBytes []byte
-	_, err = bucket.CompleteMultipartUpload(
-		imur,
-		parts,
-		oss.Callback(base64.StdEncoding.EncodeToString([]byte(initResp.Callback.Value.Callback))),
-		oss.CallbackVar(base64.StdEncoding.EncodeToString([]byte(initResp.Callback.Value.CallbackVar))),
-		oss.CallbackResult(&bodyBytes),
-	)
+	err = retryExpiredToken(refresh, func() error {
+		_, err := bucket.CompleteMultipartUpload(
+			imur,
+			parts,
+			oss.Callback(base64.StdEncoding.EncodeToString([]byte(initResp.Callback.Value.Callback))),
+			oss.CallbackVar(base64.StdEncoding.EncodeToString([]byte(initResp.Callback.Value.CallbackVar))),
+			oss.CallbackResult(&bodyBytes),
+			oss.WithContext(ctx),
+		)
+		return err
+	})
 	if err != nil {
 		return err
 	}

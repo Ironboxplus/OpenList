@@ -2,6 +2,7 @@ package op
 
 import (
 	"context"
+	"net/url"
 	stdpath "path"
 	"strconv"
 	"strings"
@@ -48,7 +49,11 @@ func list(ctx context.Context, storage driver.Driver, path string, args model.Li
 		}
 	}
 
-	objs, err, _ := listG.Do(key, func() ([]model.Obj, error) {
+	flightKey := key
+	if base, ok := ctx.Value(conf.ThumbnailBaseURLKey).(*url.URL); ok && storage.Config().NoCache {
+		flightKey += ":" + strconv.Quote(base.String())
+	}
+	objs, err, _ := listG.Do(flightKey, func() ([]model.Obj, error) {
 		dir, err := GetUnwrap(ctx, storage, path)
 		if err != nil {
 			return nil, errors.WithMessage(err, "failed get dir")
@@ -235,7 +240,10 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 	if mode == -1 {
 		mode = storage.(driver.LinkCacheModeResolver).ResolveLinkCacheMode(path)
 	}
-	typeKey := args.Type
+	typeKey := "proxy/" + args.Type
+	if args.Redirect {
+		typeKey = "redirect/" + args.Type
+	}
 	if mode&driver.LinkCacheIP != 0 {
 		typeKey += "/" + args.IP
 	}
@@ -244,8 +252,7 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 	}
 	key := Key(storage, path)
 	if ol, exists := Cache.linkCache.GetType(key, typeKey); exists {
-		if ol.link.Expiration != nil ||
-			ol.link.SyncClosers.AcquireReference() || !ol.link.RequireReference {
+		if ol.acquire() {
 			return ol.link, ol.obj, nil
 		}
 		// SyncClosers 已关闭（文件句柄已关闭），删除缓存条目，重新获取
@@ -287,11 +294,14 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 			}
 		}
 
-		ol := &objWithLink{link: link, obj: file}
-		if link.Expiration != nil {
-			Cache.linkCache.SetTypeWithTTL(key, typeKey, ol, *link.Expiration)
-		} else if link.RequireReference {
-			// 本地文件等需要引用计数的链接，缓存与文件句柄生命周期绑定
+		ol, err := admitLink(link, file)
+		if err != nil {
+			return nil, err
+		}
+		if ol.policy.expiration != nil {
+			Cache.linkCache.SetTypeWithTTL(key, typeKey, ol, *ol.policy.expiration)
+		} else if ol.policy.requireReference || link.SyncClosers.Length() > 0 {
+			// 链接持有需要释放的资源（文件句柄等），缓存与其生命周期绑定
 			Cache.linkCache.SetTypeWithExpirable(key, typeKey, ol, &link.SyncClosers)
 		} else {
 			// 不需要引用计数（如云盘链接无过期时间），使用默认 TTL，多客户端复用
@@ -304,7 +314,7 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 		if err != nil {
 			return nil, nil, err
 		}
-		if ol.link.SyncClosers.AcquireReference() || !ol.link.RequireReference {
+		if ol.acquire() {
 			return ol.link, ol.obj, nil
 		}
 	}
@@ -552,7 +562,7 @@ func Copy(ctx context.Context, storage driver.Driver, srcPath, dstDirPath string
 	srcPath = utils.FixAndCleanPath(srcPath)
 	dstDirPath = utils.FixAndCleanPath(dstDirPath)
 	if dstDirPath == stdpath.Dir(srcPath) {
-		return errors.New("copy in place")
+		return errors.WithStack(errs.NotImplement)
 	}
 	srcRawObj, err := Get(ctx, storage, srcPath, true)
 	if err != nil {
@@ -670,7 +680,7 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 			if err != nil {
 				return errors.WithMessagef(err, "while uploading, failed remove existing file which size = 0")
 			}
-		} else if storage.Config().NoOverwriteUpload {
+		} else if storage.Config().NoOverwriteUpload && ctx.Value(conf.SkipNoOverwriteKey) == nil {
 			// try to rename old obj
 			err = Rename(ctx, storage, dstPath, tempName)
 			if err != nil {

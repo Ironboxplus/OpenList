@@ -98,11 +98,10 @@ func (r *RefreshableRangeReader) getInnerReader() (model.RangeReaderIF, error) {
 		return r.innerReader, nil
 	}
 
-	// Create inner reader without Refresher to avoid recursion
-	linkCopy := *r.link
-	linkCopy.Refresher = nil
+	// Create inner reader without Refresher to avoid recursion (Clone does not carry it over)
+	linkCopy := r.link.Clone()
 
-	reader, err := GetRangeReaderFromLink(r.size, &linkCopy)
+	reader, err := GetRangeReaderFromLink(r.size, linkCopy)
 	if err != nil {
 		return nil, err
 	}

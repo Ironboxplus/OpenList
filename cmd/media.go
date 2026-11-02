@@ -283,7 +283,7 @@ func runMediaScrape(cmd *cobra.Command, args []string) error {
 	if o.Providers == nil {
 		// no keys here: let the server scrape
 		var res apply.ScrapeResult
-		err := c.Call("POST", "/api/admin/media/scrape", map[string]any{
+		err := c.Call("POST", "/api/admin/media/works/scrape", map[string]any{
 			"path": mediaFlags.path, "provider": mediaFlags.provider, "id": mediaFlags.id,
 			"lock": mediaFlags.lock, "force": mediaFlags.force,
 		}, &res)
@@ -387,7 +387,7 @@ func runMediaLs(cmd *cobra.Command, args []string) error {
 		if mediaFlags.pending {
 			q.Set("pending", "true")
 		}
-		if err := c.Call("GET", "/api/admin/media/list?"+q.Encode(), nil, &resp); err != nil {
+		if err := c.Call("GET", "/api/admin/media/works/list?"+q.Encode(), nil, &resp); err != nil {
 			return err
 		}
 		for _, it := range resp.Content {
@@ -461,7 +461,7 @@ func runLibraryRm(cmd *cobra.Command, args []string) error {
 	if ex[p].Kind != mdl.MediaKindLibrary {
 		return fmt.Errorf("%s is not a library", p)
 	}
-	if err := c.Call("POST", "/api/admin/media/delete", map[string]any{"path": p}, nil); err != nil {
+	if err := c.Call("POST", "/api/admin/media/works/delete", map[string]any{"path": p}, nil); err != nil {
 		return err
 	}
 	fmt.Fprintf(cmd.OutOrStdout(), "%s is no longer a library\n", p)
@@ -481,7 +481,7 @@ func runLibraryLs(cmd *cobra.Command, args []string) error {
 			Total int64 `json:"total"`
 		}
 		q := url.Values{"kind": {mdl.MediaKindLibrary}, "page": {strconv.Itoa(page)}, "per_page": {"500"}}
-		if err := c.Call("GET", "/api/admin/media/list?"+q.Encode(), nil, &resp); err != nil {
+		if err := c.Call("GET", "/api/admin/media/works/list?"+q.Encode(), nil, &resp); err != nil {
 			return err
 		}
 		for _, it := range resp.Content {

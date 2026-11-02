@@ -34,7 +34,7 @@ type Link struct {
 	Header      http.Header   `json:"header"` // needed header (for url)
 	RangeReader RangeReaderIF `json:"-"`      // recommended way if can't use URL
 
-	Expiration *time.Duration // local cache expire Duration
+	Expiration *time.Duration // local cache expiration; not transferred by Clone
 
 	//for accelerating request, use multi-thread downloading
 	Concurrency   int   `json:"concurrency"`
@@ -48,6 +48,20 @@ type Link struct {
 	utils.SyncClosers `json:"-"`
 	// 如果SyncClosers中的资源被关闭后Link将不可用，则此值应为 true
 	RequireReference bool `json:"-"`
+}
+
+// Clone transfers ownership of l without inheriting its cache expiration.
+func (l *Link) Clone() *Link {
+	return &Link{
+		URL:              l.URL,
+		Header:           l.Header,
+		RangeReader:      l.RangeReader,
+		Concurrency:      l.Concurrency,
+		PartSize:         l.PartSize,
+		ContentLength:    l.ContentLength,
+		SyncClosers:      utils.NewSyncClosers(l),
+		RequireReference: l.RequireReference,
+	}
 }
 
 type OtherArgs struct {
@@ -90,18 +104,21 @@ type ArchiveDecompressArgs struct {
 }
 
 type SharingListArgs struct {
-	Refresh bool
-	Pwd     string
+	Refresh  bool
+	Pwd      string
+	ClientIP string
 }
 
 type SharingArchiveMetaArgs struct {
 	ArchiveMetaArgs
-	Pwd string
+	Pwd      string
+	ClientIP string
 }
 
 type SharingArchiveListArgs struct {
 	ArchiveListArgs
-	Pwd string
+	Pwd      string
+	ClientIP string
 }
 
 type SharingLinkArgs struct {
@@ -111,22 +128,4 @@ type SharingLinkArgs struct {
 
 type RangeReaderIF interface {
 	RangeRead(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error)
-}
-
-type RangeReadCloserIF interface {
-	RangeReaderIF
-	utils.ClosersIF
-}
-
-var _ RangeReadCloserIF = (*RangeReadCloser)(nil)
-
-type RangeReadCloser struct {
-	RangeReader RangeReaderIF
-	utils.Closers
-}
-
-func (r *RangeReadCloser) RangeRead(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
-	rc, err := r.RangeReader.RangeRead(ctx, httpRange)
-	r.Add(rc)
-	return rc, err
 }

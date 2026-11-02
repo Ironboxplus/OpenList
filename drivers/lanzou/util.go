@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/drivers/base"
@@ -43,9 +42,9 @@ func (d *LanZou) get(url string, callback base.ReqCallback) ([]byte, error) {
 func (d *LanZou) post(url string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
 	data, err := d._post(url, callback, resp, false)
 	if err == ErrCookieExpiration && d.IsAccount() {
-		if atomic.CompareAndSwapInt32(&d.flag, 0, 1) {
+		if d.flag.CompareAndSwap(0, 1) {
 			_, err2 := d.Login()
-			atomic.SwapInt32(&d.flag, 0)
+			d.flag.Swap(0)
 			if err2 != nil {
 				err = errors.Join(err, err2)
 				d.Status = err.Error()
@@ -53,7 +52,7 @@ func (d *LanZou) post(url string, callback base.ReqCallback, resp interface{}) (
 				return data, err
 			}
 		}
-		for atomic.LoadInt32(&d.flag) != 0 {
+		for d.flag.Load() != 0 {
 			runtime.Gosched()
 		}
 		return d._post(url, callback, resp, false)
@@ -158,25 +157,43 @@ func (d *LanZou) request(url string, method string, callback base.ReqCallback, u
 }
 
 func (d *LanZou) Login() ([]*http.Cookie, error) {
-	resp, err := base.NewRestyClient().SetRedirectPolicy(resty.NoRedirectPolicy()).
-		R().SetFormData(map[string]string{
-		"task":         "3",
-		"uid":          d.Account,
-		"pwd":          d.Password,
-		"setSessionId": "",
-		"setSig":       "",
-		"setScene":     "",
-		"setTocen":     "",
-		"formhash":     "",
-	}).Post("https://up.woozooo.com/mlogin.php")
-	if err != nil {
-		return nil, err
+	var vs string
+	for retry := 0; retry < 3; retry++ {
+		req := base.NewRestyClient().SetRedirectPolicy(resty.NoRedirectPolicy()).R()
+
+		// 如果已计算出 acw_sc__v2，通过 cookie 携带
+		if vs != "" {
+			req.SetHeader("cookie", "acw_sc__v2="+vs)
+		}
+
+		resp, err := req.SetFormData(map[string]string{
+			"task":         "3",
+			"uid":          d.Account,
+			"pwd":          d.Password,
+			"setSessionId": "",
+			"setSig":       "",
+			"setScene":     "",
+			"setTocen":     "",
+			"formhash":     "",
+		}).Post("https://up.woozooo.com/mlogin.php")
+		if err != nil {
+			return nil, err
+		}
+		bodyStr := resp.String()
+		if strings.Contains(bodyStr, "acw_sc__v2") {
+			vs, err = CalcAcwScV2(bodyStr)
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if utils.Json.Get(resp.Body(), "zt").ToInt() != 1 {
+			return nil, fmt.Errorf("login err: %s", resp.Body())
+		}
+		d.Cookie = CookieToString(resp.Cookies())
+		return resp.Cookies(), nil
 	}
-	if utils.Json.Get(resp.Body(), "zt").ToInt() != 1 {
-		return nil, fmt.Errorf("login err: %s", resp.Body())
-	}
-	d.Cookie = CookieToString(resp.Cookies())
-	return resp.Cookies(), nil
+	return nil, errors.New("acw_sc__v2 validation error")
 }
 
 /*
@@ -296,7 +313,37 @@ var findSubFolderReg = regexp.MustCompile(`(?i)(?:folderlink|mbxfolder).+href="/
 var findDownPageParamReg = regexp.MustCompile(`<iframe.*?src="(.+?)"`)
 
 // 获取文件ID
-var findFileIDReg = regexp.MustCompile(`'/ajaxm\.php\?file=(\d+)'`)
+var findFileIDReg = regexp.MustCompile(`'/ajax(?:file|m)\.php\?file=(\d+)'`)
+
+// 2026-10 改版：文件页将下载参数移入 /fn? 内页，接口变为 apifile 绝对地址并携带签名
+var (
+	fnDomainReg   = regexp.MustCompile(`var\s+domain[12]\s*=\s*'([^']*(?:ajaxfile|ajaxm)\.php\?file=(\d+)[^']*)'`)
+	fnSignReg     = regexp.MustCompile(`var\s+wp_sign\s*=\s*'([^']*)'`)
+	fnAjaxDataReg = regexp.MustCompile(`var\s+ajaxdata\s*=\s*'([^']*)'`)
+)
+
+// parseFnPage 从改版后的 /fn? 内页提取下载接口地址与签名表单
+// 对应页面 JS：POST domain1 {'action':'downprocess','websignkey':ajaxdata,'signs':ajaxdata,'sign':wp_sign,'websign':'2','kd':kdns,'ves':1}
+func parseFnPage(pageData string) (string, map[string]string, error) {
+	matches := fnDomainReg.FindStringSubmatch(pageData)
+	if len(matches) < 3 {
+		return "", nil, fmt.Errorf("not find fn ajax url")
+	}
+	sign := fnSignReg.FindStringSubmatch(pageData)
+	ajaxdata := fnAjaxDataReg.FindStringSubmatch(pageData)
+	if len(sign) < 2 || len(ajaxdata) < 2 {
+		return "", nil, fmt.Errorf("not find fn sign")
+	}
+	return matches[1], map[string]string{
+		"action":     "downprocess",
+		"websignkey": ajaxdata[1],
+		"signs":      ajaxdata[1],
+		"sign":       sign[1],
+		"websign":    "2",
+		"kd":         "1",
+		"ves":        "1",
+	}, nil
+}
 
 // 获取分享链接主界面
 func (d *LanZou) getShareUrlHtml(shareID string) (string, error) {
@@ -395,15 +442,13 @@ func (d *LanZou) getFilesByShareUrl(shareID, pwd string, sharePageData string) (
 		}
 		param["p"] = pwd
 
-		fileIDs := findFileIDReg.FindStringSubmatch(sharePageData)
-		var fileID string
-		if len(fileIDs) > 1 {
-			fileID = fileIDs[1]
-		} else {
+		matches := findFileIDReg.FindStringSubmatch(sharePageData)
+		if len(matches) < 2 {
 			return nil, fmt.Errorf("not find file id")
 		}
+		ajaxUrl := d.ShareUrl + matches[0][1:len(matches[0])-1]
 		var resp FileShareInfoAndUrlResp[string]
-		_, err = d.post(d.ShareUrl+"/ajaxm.php?file="+fileID, func(req *resty.Request) { req.SetFormData(param) }, &resp)
+		_, err = d.post(ajaxUrl, func(req *resty.Request) { req.SetFormData(param) }, &resp)
 		if err != nil {
 			return nil, err
 		}
@@ -422,20 +467,23 @@ func (d *LanZou) getFilesByShareUrl(shareID, pwd string, sharePageData string) (
 			return nil, err
 		}
 		nextPageData := RemoveNotes(string(data))
-		param, err = htmlJsonToMap(nextPageData)
-		if err != nil {
-			return nil, err
-		}
 
-		fileIDs := findFileIDReg.FindStringSubmatch(nextPageData)
-		var fileID string
-		if len(fileIDs) > 1 {
-			fileID = fileIDs[1]
+		var resp FileShareInfoAndUrlResp[int]
+		matches := findFileIDReg.FindStringSubmatch(nextPageData)
+		if len(matches) >= 2 {
+			// 旧版结构：相对路径 /ajaxm.php?file=N
+			param, err = htmlJsonToMap(nextPageData)
+			if err != nil {
+				return nil, err
+			}
+			ajaxUrl := d.ShareUrl + matches[0][1:len(matches[0])-1]
+			_, err = d.post(ajaxUrl, func(req *resty.Request) { req.SetFormData(param) }, &resp)
+		} else if fnUrl, fnForm, ferr := parseFnPage(nextPageData); ferr == nil {
+			// 2026-10 改版结构：/fn? 内页携带 apifile 绝对地址与签名参数
+			_, err = d.post(fnUrl, func(req *resty.Request) { req.SetFormData(fnForm) }, &resp)
 		} else {
 			return nil, fmt.Errorf("not find file id")
 		}
-		var resp FileShareInfoAndUrlResp[int]
-		_, err = d.post(d.ShareUrl+"/ajaxm.php?file="+fileID, func(req *resty.Request) { req.SetFormData(param) }, &resp)
 		if err != nil {
 			return nil, err
 		}
@@ -573,14 +621,14 @@ func (d *LanZou) getFolderByShareUrl(pwd string, sharePageData string) ([]FileOr
 
 	files := make([]FileOrFolderByShareUrl, 0)
 	// vip获取文件夹
-	floders := findSubFolderReg.FindAllStringSubmatch(sharePageData, -1)
-	for _, floder := range floders {
-		if len(floder) == 3 {
+	folders := findSubFolderReg.FindAllStringSubmatch(sharePageData, -1)
+	for _, folder := range folders {
+		if len(folder) == 3 {
 			files = append(files, FileOrFolderByShareUrl{
 				// Pwd: pwd, // 子文件夹不加密
-				ID:       floder[1],
-				NameAll:  floder[2],
-				IsFloder: true,
+				ID:       folder[1],
+				NameAll:  folder[2],
+				IsFolder: true,
 			})
 		}
 	}

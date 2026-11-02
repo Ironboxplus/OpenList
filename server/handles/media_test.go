@@ -65,7 +65,7 @@ func newMediaEnv(t *testing.T) *mediaEnv {
 		switch items[i].Key {
 		case conf.Token:
 			items[i].Value = "test-admin-token"
-		case conf.MediaTMDBToken:
+		case conf.MediaTMDBKey:
 			items[i].Value = fakeTMDBSecret
 		case conf.MediaOMDbKeys:
 			items[i].Value = fakeOMDbSecret
@@ -190,7 +190,7 @@ func (m *mediaEnv) upload(data []byte) uint {
 	fw, _ := mw.CreateFormFile("file", "poster.png")
 	_, _ = fw.Write(data)
 	_ = mw.Close()
-	req := httptest.NewRequest("POST", "/api/admin/media/asset", &buf)
+	req := httptest.NewRequest("POST", "/api/admin/media/works/asset", &buf)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	req.Header.Set("X-User", "admin")
 	w := httptest.NewRecorder()
@@ -217,7 +217,7 @@ func TestPrivateMediaSettingsNeverPublic(t *testing.T) {
 	m := newMediaEnv(t)
 	w := m.do("GET", "/api/public/settings", "", nil)
 	body := w.Body.String()
-	for _, key := range []string{conf.MediaTMDBToken, conf.MediaOMDbKeys, conf.MediaDoubanAPIKey, conf.MediaHTTPProxy} {
+	for _, key := range []string{conf.MediaTMDBKey, conf.MediaOMDbKeys, conf.MediaDoubanAPIKey, conf.MediaHTTPProxy} {
 		if strings.Contains(body, key) {
 			t.Errorf("private setting %q is in /api/public/settings", key)
 		}
@@ -227,7 +227,7 @@ func TestPrivateMediaSettingsNeverPublic(t *testing.T) {
 			t.Errorf("a secret value (%q) is in /api/public/settings", secret)
 		}
 	}
-	for _, key := range []string{conf.MediaEnabled, conf.MediaLanguage, conf.MediaScraperTimeout} {
+	for _, key := range []string{conf.MediaEnabled, conf.MediaScraperTimeout} {
 		if !strings.Contains(body, key) {
 			t.Errorf("public setting %q missing from /api/public/settings", key)
 		}
@@ -240,8 +240,8 @@ func TestPrivateMediaSettingsNeverPublic(t *testing.T) {
 		}
 	}
 	want := map[string]int{
-		conf.MediaEnabled: model.PUBLIC, conf.MediaTMDBToken: model.PRIVATE, conf.MediaOMDbKeys: model.PRIVATE,
-		conf.MediaDoubanAPIKey: model.PRIVATE, conf.MediaLanguage: model.PUBLIC, conf.MediaHTTPProxy: model.PRIVATE,
+		conf.MediaEnabled: model.PUBLIC, conf.MediaTMDBKey: model.PRIVATE, conf.MediaOMDbKeys: model.PRIVATE,
+		conf.MediaDoubanAPIKey: model.PRIVATE, conf.MediaHTTPProxy: model.PRIVATE,
 		conf.MediaScraperTimeout: model.PUBLIC,
 	}
 	for k, f := range want {
@@ -255,9 +255,9 @@ func TestAdminMediaEndpointsRejectOtherUsers(t *testing.T) {
 	m := newMediaEnv(t)
 	for _, user := range []string{"alice", "bob", ""} {
 		for _, ep := range []struct{ method, path string }{
-			{"POST", "/api/admin/media/set"}, {"POST", "/api/admin/media/delete"}, {"GET", "/api/admin/media/list"},
-			{"POST", "/api/admin/media/asset"}, {"POST", "/api/admin/media/scrape"}, {"GET", "/api/admin/media/search?q=x"},
-			{"GET", "/api/admin/media/export"}, {"POST", "/api/admin/media/import"},
+			{"POST", "/api/admin/media/works/set"}, {"POST", "/api/admin/media/works/delete"}, {"GET", "/api/admin/media/works/list"},
+			{"POST", "/api/admin/media/works/asset"}, {"POST", "/api/admin/media/works/scrape"}, {"GET", "/api/admin/media/works/search?q=x"},
+			{"GET", "/api/admin/media/works/export"}, {"POST", "/api/admin/media/works/import"},
 		} {
 			env, _ := m.call(ep.method, ep.path, user, map[string]any{"path": "/x", "kind": "movie"})
 			if env.Code == 200 {
@@ -265,26 +265,26 @@ func TestAdminMediaEndpointsRejectOtherUsers(t *testing.T) {
 			}
 		}
 	}
-	if it, _ := db.GetMediaItemByPath("/x"); it != nil {
+	if it, _ := db.GetMediaWorkByPath("/x"); it != nil {
 		t.Fatal("a non-admin created an item")
 	}
 }
 
 func TestSetOverwritesOnlyGivenFields(t *testing.T) {
 	m := newMediaEnv(t)
-	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{
+	m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{
 		"path": "/lib/Show", "kind": "tv", "title": "Show", "year": 2001, "overview": "keep me",
 		"external_ids": map[string]string{"tmdb": "tv/1"}, "genres": []string{"a"},
 	})
-	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib/Show", "title": "Show 2", "locked": true})
-	got, _ := db.GetMediaItemByPath("/lib/Show")
+	m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": "/lib/Show", "title": "Show 2", "locked": true})
+	got, _ := db.GetMediaWorkByPath("/lib/Show")
 	if got.Title != "Show 2" || !got.Locked {
 		t.Fatalf("given fields: %+v", got)
 	}
 	if got.Kind != "tv" || got.Year != 2001 || got.Overview != "keep me" || got.ExternalIDs != `{"tmdb":"tv/1"}` || got.Genres != `["a"]` {
 		t.Fatalf("fields not in the request changed: %+v", got)
 	}
-	env, _ := m.call("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib/Show", "poster_id": 999})
+	env, _ := m.call("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": "/lib/Show", "poster_id": 999})
 	if env.Code == 200 {
 		t.Fatal("a poster_id that is not an asset was accepted")
 	}
@@ -294,15 +294,15 @@ func TestFsMediaListDTOHasNoHeavyFields(t *testing.T) {
 	m := newMediaEnv(t)
 	poster := m.upload(testPNG(t, 400, 600, color.RGBA{9, 9, 200, 255}))
 	for _, p := range []string{"/lib/A", "/lib/B"} {
-		m.ok("POST", "/api/admin/media/set", "admin", map[string]any{
+		m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{
 			"path": p, "kind": "movie", "title": "T " + p, "year": 2000, "overview": "LONG OVERVIEW " + p,
 			"ratings": map[string]any{"tmdb": 8.1}, "poster_id": poster,
 			"candidates": []map[string]any{{"provider": "tmdb", "id": "movie/1", "title": "c", "year": 2000, "score": 0.5}},
 		})
 	}
-	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib", "kind": "collection", "title": "Lib", "overview": "collection text",
+	m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": "/lib", "kind": "collection", "title": "Lib", "overview": "collection text",
 		"episodes": []map[string]any{{"file_name": "x.mkv", "season": 1, "episode": 1, "title": "ep"}}})
-	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib/A/deep", "kind": "movie", "title": "deeper"})
+	m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": "/lib/A/deep", "kind": "movie", "title": "deeper"})
 
 	raw := m.ok("POST", "/api/fs/media", "alice", map[string]any{"path": "/lib"})
 	var generic struct {
@@ -355,7 +355,7 @@ func TestFsMediaListDTOHasNoHeavyFields(t *testing.T) {
 func TestFsMediaRespectsPermissionsAndSwitch(t *testing.T) {
 	m := newMediaEnv(t)
 	for _, p := range []string{"/secret", "/secret/Movie", "/open/Movie", "/open/.hidden"} {
-		m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": p, "kind": "movie", "title": "T" + p})
+		m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": p, "kind": "movie", "title": "T" + p})
 	}
 	if err := op.CreateMeta(&model.Meta{Path: "/secret", Password: "pw", PSub: true}); err != nil {
 		t.Fatal(err)
@@ -406,7 +406,7 @@ func TestFsMediaRespectsPermissionsAndSwitch(t *testing.T) {
 		t.Fatalf("path escape leaked: %s", env.Data)
 	}
 	// guest disabled -> the same 401 the listing gives is not required here; media off -> empty
-	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib/X", "kind": "movie", "title": "x"})
+	m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": "/lib/X", "kind": "movie", "title": "x"})
 	_ = op.SaveSettingItem(&model.SettingItem{Key: conf.MediaEnabled, Value: "false", Type: conf.TypeBool, Group: model.MEDIA})
 	env, _ = m.call("POST", "/api/fs/media", "admin", map[string]any{"path": "/lib"})
 	if item, kids := count(env.Data); item || kids != 0 {
@@ -418,7 +418,7 @@ func TestAssetSignatureAndCaching(t *testing.T) {
 	m := newMediaEnv(t)
 	pngData := testPNG(t, 700, 1000, color.RGBA{200, 0, 0, 255})
 	id := m.upload(pngData)
-	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib/P", "kind": "movie", "poster_id": id})
+	m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": "/lib/P", "kind": "movie", "poster_id": id})
 
 	raw := m.ok("POST", "/api/fs/media", "alice", map[string]any{"path": "/lib/P"})
 	var r struct {
@@ -501,12 +501,12 @@ func TestAssetDedupBySHAOverHTTP(t *testing.T) {
 	}))
 	defer img.Close()
 	var out struct{ ID uint }
-	raw := m.ok("POST", "/api/admin/media/asset", "admin", map[string]any{"url": img.URL + "/p.png"})
+	raw := m.ok("POST", "/api/admin/media/works/asset", "admin", map[string]any{"url": img.URL + "/p.png"})
 	_ = json.Unmarshal(raw, &out)
 	if out.ID != id1 {
 		t.Fatalf("download of the same image got asset %d, want %d", out.ID, id1)
 	}
-	if env, _ := m.call("POST", "/api/admin/media/asset", "admin", map[string]any{"url": "file:///etc/passwd"}); env.Code == 200 {
+	if env, _ := m.call("POST", "/api/admin/media/works/asset", "admin", map[string]any{"url": "file:///etc/passwd"}); env.Code == 200 {
 		t.Fatal("a file:// URL was accepted")
 	}
 }
@@ -514,7 +514,7 @@ func TestAssetDedupBySHAOverHTTP(t *testing.T) {
 func TestDeleteAndPendingList(t *testing.T) {
 	m := newMediaEnv(t)
 	set := func(p string, conf float64, locked bool) {
-		m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": p, "kind": "tv", "confidence": conf, "locked": locked})
+		m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": p, "kind": "tv", "confidence": conf, "locked": locked})
 	}
 	set("/d/a", 0.3, false)
 	set("/d/b", 0.9, false)
@@ -522,7 +522,7 @@ func TestDeleteAndPendingList(t *testing.T) {
 	set("/d/a/s1", 0.9, false)
 	set("/e/z", 0.1, false)
 
-	raw := m.ok("GET", "/api/admin/media/list?prefix=/d&pending=true", "admin", nil)
+	raw := m.ok("GET", "/api/admin/media/works/list?prefix=/d&pending=true", "admin", nil)
 	var l struct {
 		Content []struct {
 			Path string `json:"path"`
@@ -533,24 +533,24 @@ func TestDeleteAndPendingList(t *testing.T) {
 	if l.Total != 1 || len(l.Content) != 1 || l.Content[0].Path != "/d/a" {
 		t.Fatalf("pending under /d = %s", raw)
 	}
-	raw = m.ok("GET", "/api/admin/media/list?kind=tv&per_page=2&page=2", "admin", nil)
+	raw = m.ok("GET", "/api/admin/media/works/list?kind=tv&per_page=2&page=2", "admin", nil)
 	_ = json.Unmarshal(raw, &l)
 	if l.Total != 5 || len(l.Content) != 2 {
 		t.Fatalf("paging: %s", raw)
 	}
 
-	if env, _ := m.call("POST", "/api/admin/media/delete", "admin", map[string]any{"prefix": "/", "recursive": true}); env.Code == 200 {
+	if env, _ := m.call("POST", "/api/admin/media/works/delete", "admin", map[string]any{"prefix": "/", "recursive": true}); env.Code == 200 {
 		t.Fatal("deleting everything must be refused")
 	}
 	var del struct{ Deleted int }
-	_ = json.Unmarshal(m.ok("POST", "/api/admin/media/delete", "admin", map[string]any{"prefix": "/d", "recursive": true}), &del)
+	_ = json.Unmarshal(m.ok("POST", "/api/admin/media/works/delete", "admin", map[string]any{"prefix": "/d", "recursive": true}), &del)
 	if del.Deleted != 4 {
 		t.Fatalf("deleted %d, want 4", del.Deleted)
 	}
-	if it, _ := db.GetMediaItemByPath("/e/z"); it == nil {
+	if it, _ := db.GetMediaWorkByPath("/e/z"); it == nil {
 		t.Fatal("recursive delete went outside the prefix")
 	}
-	_ = json.Unmarshal(m.ok("POST", "/api/admin/media/delete", "admin", map[string]any{"path": "/e/z"}), &del)
+	_ = json.Unmarshal(m.ok("POST", "/api/admin/media/works/delete", "admin", map[string]any{"path": "/e/z"}), &del)
 	if del.Deleted != 1 {
 		t.Fatalf("single delete = %d", del.Deleted)
 	}
@@ -599,23 +599,23 @@ func fakeProviders(t *testing.T, m *mediaEnv) (hits *int) {
 func TestScrapeSkipsLockedItem(t *testing.T) {
 	m := newMediaEnv(t)
 	hits := fakeProviders(t, m)
-	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib/EVA", "kind": "tv", "title": "my own title", "locked": true})
+	m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": "/lib/EVA", "kind": "tv", "title": "my own title", "locked": true})
 
-	env, _ := m.call("POST", "/api/admin/media/scrape", "admin", map[string]any{"path": "/lib/EVA", "provider": "tmdb", "id": "tv/890"})
+	env, _ := m.call("POST", "/api/admin/media/works/scrape", "admin", map[string]any{"path": "/lib/EVA", "provider": "tmdb", "id": "tv/890"})
 	if env.Code != 409 {
 		t.Fatalf("scrape of a locked item: code %d %s", env.Code, env.Message)
 	}
 	if *hits != 0 {
 		t.Fatalf("the provider was queried %d times for a locked item", *hits)
 	}
-	got, _ := db.GetMediaItemByPath("/lib/EVA")
+	got, _ := db.GetMediaWorkByPath("/lib/EVA")
 	if got.Title != "my own title" {
 		t.Fatalf("locked title overwritten: %q", got.Title)
 	}
 	// once unlocked it is scraped: details, ids, ratings, poster stored as an asset, episodes unlisted (no storage here)
-	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib/EVA", "locked": false})
-	m.ok("POST", "/api/admin/media/scrape", "admin", map[string]any{"path": "/lib/EVA", "provider": "tmdb", "id": "tv/890"})
-	got, _ = db.GetMediaItemByPath("/lib/EVA")
+	m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": "/lib/EVA", "locked": false})
+	m.ok("POST", "/api/admin/media/works/scrape", "admin", map[string]any{"path": "/lib/EVA", "provider": "tmdb", "id": "tv/890"})
+	got, _ = db.GetMediaWorkByPath("/lib/EVA")
 	if got.Title == "my own title" || got.Title == "" || got.PosterID == 0 || got.BackdropID == 0 {
 		t.Fatalf("scrape did not fill the item: %+v", got)
 	}
@@ -626,9 +626,9 @@ func TestScrapeSkipsLockedItem(t *testing.T) {
 		t.Fatalf("an explicit pick is manual with confidence 1: %q %v", got.Source, got.Confidence)
 	}
 	// scrape with force overrides a lock
-	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib/EVA", "title": "mine again", "locked": true})
-	m.ok("POST", "/api/admin/media/scrape", "admin", map[string]any{"path": "/lib/EVA", "provider": "tmdb", "id": "tv/890", "force": true, "lock": true})
-	got, _ = db.GetMediaItemByPath("/lib/EVA")
+	m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": "/lib/EVA", "title": "mine again", "locked": true})
+	m.ok("POST", "/api/admin/media/works/scrape", "admin", map[string]any{"path": "/lib/EVA", "provider": "tmdb", "id": "tv/890", "force": true, "lock": true})
+	got, _ = db.GetMediaWorkByPath("/lib/EVA")
 	if got.Title == "mine again" || !got.Locked {
 		t.Fatalf("forced scrape: %+v", got)
 	}
@@ -647,9 +647,9 @@ func TestScrapeAndSearchClassifyNetworkFailure(t *testing.T) {
 		method, path string
 		body         any
 	}{
-		{"GET", "/api/admin/media/search?provider=tmdb&q=eva", nil},
-		{"GET", "/api/admin/media/search?provider=bgm&q=eva", nil},
-		{"POST", "/api/admin/media/scrape", map[string]any{"path": "/lib/EVA", "provider": "tmdb", "id": "tv/890"}},
+		{"GET", "/api/admin/media/works/search?provider=tmdb&q=eva", nil},
+		{"GET", "/api/admin/media/works/search?provider=bgm&q=eva", nil},
+		{"POST", "/api/admin/media/works/scrape", map[string]any{"path": "/lib/EVA", "provider": "tmdb", "id": "tv/890"}},
 	} {
 		env, _ := m.call(ep.method, ep.path, "admin", ep.body)
 		if env.Code != 502 || !strings.HasPrefix(env.Message, "network:") {
@@ -669,7 +669,7 @@ func TestScrapeAndSearchClassifyNetworkFailure(t *testing.T) {
 func TestSearchReturnsCandidates(t *testing.T) {
 	m := newMediaEnv(t)
 	fakeProviders(t, m)
-	raw := m.ok("GET", "/api/admin/media/search?provider=tmdb&kind=tv&q="+url.QueryEscape("新世纪福音战士")+"&year=1995", "admin", nil)
+	raw := m.ok("GET", "/api/admin/media/works/search?provider=tmdb&kind=tv&q="+url.QueryEscape("新世纪福音战士")+"&year=1995", "admin", nil)
 	var cs []scraper.Candidate
 	_ = json.Unmarshal(raw, &cs)
 	if len(cs) != 1 || cs[0].ID != "tv/890" || cs[0].Provider != "tmdb" {
@@ -689,13 +689,13 @@ func TestExportImportRoundTripRedownloadsAssets(t *testing.T) {
 
 	// a poster known by its source URL
 	var asset struct{ ID uint }
-	_ = json.Unmarshal(m.ok("POST", "/api/admin/media/asset", "admin", map[string]any{"url": img.URL + "/poster.png"}), &asset)
-	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{
+	_ = json.Unmarshal(m.ok("POST", "/api/admin/media/works/asset", "admin", map[string]any{"url": img.URL + "/poster.png"}), &asset)
+	m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{
 		"path": "/lib/Exp", "kind": "tv", "title": "Exp", "overview": "o", "poster_id": asset.ID, "locked": true,
 		"external_ids": map[string]string{"tmdb": "tv/1"}, "ratings": map[string]any{"tmdb": 7.5},
 		"episodes": []map[string]any{{"file_name": "S01E01.mkv", "season": 1, "episode": 1, "title": "one"}},
 	})
-	w := m.do("GET", "/api/admin/media/export", "admin", nil)
+	w := m.do("GET", "/api/admin/media/works/export", "admin", nil)
 	if w.Code != 200 {
 		t.Fatalf("export: %d", w.Code)
 	}
@@ -719,8 +719,8 @@ func TestExportImportRoundTripRedownloadsAssets(t *testing.T) {
 	}
 
 	// wipe the asset row and file, drop the item, then import
-	_, _ = db.DeleteMediaItemByPath("/lib/Exp")
-	if err := db.GetDb().Where("1 = 1").Delete(&model.MediaAsset{}).Error; err != nil {
+	_, _ = db.DeleteMediaWorkByPath("/lib/Exp")
+	if err := db.GetDb().Where("1 = 1").Delete(&model.MediaWorkAsset{}).Error; err != nil {
 		t.Fatal(err)
 	}
 	_ = os.RemoveAll(mediaAssetDir())
@@ -730,7 +730,7 @@ func TestExportImportRoundTripRedownloadsAssets(t *testing.T) {
 		Downloaded int `json:"assets_downloaded"`
 		Missing    int `json:"assets_missing"`
 	}
-	req := httptest.NewRequest("POST", "/api/admin/media/import", bytes.NewReader(doc))
+	req := httptest.NewRequest("POST", "/api/admin/media/works/import", bytes.NewReader(doc))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-User", "admin")
 	rec := httptest.NewRecorder()
@@ -744,20 +744,20 @@ func TestExportImportRoundTripRedownloadsAssets(t *testing.T) {
 	if res.Imported != 1 || res.Downloaded != 1 || res.Missing != 0 {
 		t.Fatalf("import result: %+v", res)
 	}
-	got, _ := db.GetMediaItemByPath("/lib/Exp")
+	got, _ := db.GetMediaWorkByPath("/lib/Exp")
 	if got == nil || got.PosterID == 0 || !got.Locked || got.Title != "Exp" || got.ExternalIDs != `{"tmdb":"tv/1"}` {
 		t.Fatalf("imported item: %+v", got)
 	}
-	if eps, _ := db.GetMediaEpisodes(got.ID); len(eps) != 1 {
+	if eps, _ := db.GetMediaWorkEpisodes(got.ID); len(eps) != 1 {
 		t.Fatalf("episodes after import: %d", len(eps))
 	}
 	// importing again leaves a locked item alone
-	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib/Exp", "title": "edited after"})
-	req = httptest.NewRequest("POST", "/api/admin/media/import", bytes.NewReader(doc))
+	m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": "/lib/Exp", "title": "edited after"})
+	req = httptest.NewRequest("POST", "/api/admin/media/works/import", bytes.NewReader(doc))
 	req.Header.Set("X-User", "admin")
 	rec = httptest.NewRecorder()
 	m.engine.ServeHTTP(rec, req)
-	got, _ = db.GetMediaItemByPath("/lib/Exp")
+	got, _ = db.GetMediaWorkByPath("/lib/Exp")
 	if got.Title != "edited after" {
 		t.Fatalf("import overwrote a locked item: %q", got.Title)
 	}
@@ -765,8 +765,8 @@ func TestExportImportRoundTripRedownloadsAssets(t *testing.T) {
 
 func TestLibraryRootOpensWithItsChildren(t *testing.T) {
 	m := newMediaEnv(t)
-	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib", "kind": "library", "title": "Lib", "locked": true, "source": "manual"})
-	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib/A", "kind": "movie", "title": "A"})
+	m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": "/lib", "kind": "library", "title": "Lib", "locked": true, "source": "manual"})
+	m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": "/lib/A", "kind": "movie", "title": "A"})
 	raw := m.ok("POST", "/api/fs/media", "alice", map[string]any{"path": "/lib"})
 	var got struct {
 		Item struct {
@@ -782,18 +782,18 @@ func TestLibraryRootOpensWithItsChildren(t *testing.T) {
 	if got.Item.Kind != "library" || len(got.Children) != 1 || got.Children[0].Path != "/lib/A" {
 		t.Fatalf("library response: %s", raw)
 	}
-	if !strings.Contains(string(m.ok("GET", "/api/admin/media/list?kind=library", "admin", nil)), "/lib") {
+	if !strings.Contains(string(m.ok("GET", "/api/admin/media/works/list?kind=library", "admin", nil)), "/lib") {
 		t.Fatal("admin list by kind=library lost the root")
 	}
 }
 
 func TestCollectionsGetAChildPosterMosaic(t *testing.T) {
 	m := newMediaEnv(t)
-	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib", "kind": "library", "title": "Lib"})
+	m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": "/lib", "kind": "library", "title": "Lib"})
 	for _, c := range []string{"/lib/C", "/lib/D"} {
-		m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": c, "kind": "collection", "title": c})
+		m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": c, "kind": "collection", "title": c})
 	}
-	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib/M", "kind": "movie", "title": "M"})
+	m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": "/lib/M", "kind": "movie", "title": "M"})
 	// five posters under C (one nested deeper), ids by year
 	type kid struct {
 		path  string
@@ -804,10 +804,10 @@ func TestCollectionsGetAChildPosterMosaic(t *testing.T) {
 	for _, k := range []kid{{"/lib/C/a", 2005, 10}, {"/lib/C/b", 1999, 40}, {"/lib/C/deep/c", 2010, 70}, {"/lib/C/d", 2001, 100}, {"/lib/C/e", 2003, 130}, {"/lib/C/f", 0, 160}} {
 		id := m.upload(testPNG(t, 40, 60, color.RGBA{k.color, 1, 2, 255}))
 		ids[k.year] = id
-		m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": k.path, "kind": "movie", "title": k.path, "year": k.year, "poster_id": id})
+		m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": k.path, "kind": "movie", "title": k.path, "year": k.year, "poster_id": id})
 	}
 	// an item without a poster adds nothing
-	m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": "/lib/C/nopic", "kind": "movie", "title": "x", "year": 1990})
+	m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": "/lib/C/nopic", "kind": "movie", "title": "x", "year": 1990})
 
 	assetOf := func(u string) uint {
 		var id uint
@@ -885,7 +885,7 @@ func (m *mediaEnv) library(query, user string) (paths []string, kinds []string, 
 func (m *mediaEnv) setItems(kind string, paths ...string) {
 	m.t.Helper()
 	for _, p := range paths {
-		m.ok("POST", "/api/admin/media/set", "admin", map[string]any{"path": p, "kind": kind, "title": "T" + p})
+		m.ok("POST", "/api/admin/media/works/set", "admin", map[string]any{"path": p, "kind": kind, "title": "T" + p})
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/plugin"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
+	"github.com/OpenListTeam/go-cache"
 	"github.com/gin-gonic/gin"
 	"github.com/pquerna/otp/totp"
 	"gorm.io/gorm"
@@ -49,21 +50,22 @@ func loginHash(c *gin.Context, req *LoginReq) {
 	ip := c.ClientIP()
 	count, ok := model.LoginCache.Get(ip)
 	if ok && count >= model.DefaultMaxAuthRetries {
+		// 被拒时不能再续期：自动重试的客户端（如凭据失效的 Subsonic/Web 轮询）
+		// 会每来一次就刷新锁定窗口，把自己永久锁死。锁定窗口只在计数时设定。
 		common.ErrorStrResp(c, model.TooManyAttempts, 429)
-		model.LoginCache.Expire(ip, model.DefaultLockDuration)
 		return
 	}
 	// check username
 	user, err := op.GetUserByName(req.Username)
 	if err != nil {
 		common.ErrorStrResp(c, model.InvalidUsernameOrPassword, 401)
-		model.LoginCache.Set(ip, count+1)
+		model.LoginCache.Set(ip, count+1, cache.WithEx[int](model.DefaultLockDuration))
 		return
 	}
 	// validate password hash
 	if err := user.ValidatePwdStaticHash(req.Password); err != nil {
 		common.ErrorStrResp(c, model.InvalidUsernameOrPassword, 401)
-		model.LoginCache.Set(ip, count+1)
+		model.LoginCache.Set(ip, count+1, cache.WithEx[int](model.DefaultLockDuration))
 		return
 	}
 	// check 2FA
@@ -71,7 +73,7 @@ func loginHash(c *gin.Context, req *LoginReq) {
 		if !totp.Validate(req.OtpCode, user.OtpSecret) {
 			// 402 - need opt
 			common.ErrorStrResp(c, model.Invalid2FACode, 402)
-			model.LoginCache.Set(ip, count+1)
+			model.LoginCache.Set(ip, count+1, cache.WithEx[int](model.DefaultLockDuration))
 			return
 		}
 	}
