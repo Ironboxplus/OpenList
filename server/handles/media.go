@@ -893,6 +893,31 @@ func PublicGetMedia(c *gin.Context) {
 		common.ErrorResp(c, err, 404)
 		return
 	}
+	respondMediaDetail(c, item)
+}
+
+// PublicGetMediaByPath 按路径获取媒体详情：path 相对用户 base_path（同 list?path=），
+// 返回和 item/:id 相同的内容、受相同的权限约束；路径上没有条目或无权访问都是同一个 404。
+func PublicGetMediaByPath(c *gin.Context) {
+	user := mediaUser(c)
+	var item *model.MediaItem
+	if p := c.Query("path"); p != "" && user != nil {
+		if joined, err := user.JoinPath(p); err == nil {
+			if item, err = db.GetVideoItemByPath(joined); err != nil {
+				common.ErrorResp(c, err, 500)
+				return
+			}
+		}
+	}
+	if item == nil {
+		common.ErrorStrResp(c, "资源不存在", 404)
+		return
+	}
+	respondMediaDetail(c, item)
+}
+
+// respondMediaDetail 写出条目详情；隐藏的或用户无权访问的条目答 404。
+func respondMediaDetail(c *gin.Context, item *model.MediaItem) {
 	if item.Hidden || !CanUserAccessItem(mediaUser(c), item) {
 		common.ErrorStrResp(c, "资源不存在", 404)
 		return

@@ -271,3 +271,67 @@ func TestDetailHasRatingsEpisodesAndAdminOnlyCandidates(t *testing.T) {
 		t.Fatalf("candidates in the list for a non-admin: %s", w.Body.String())
 	}
 }
+
+func TestByPath(t *testing.T) {
+	m := coverEnv(t)
+	it := &model.MediaItem{MediaType: model.MediaTypeVideo, FolderPath: "/lib", FileName: "Show", IsFolder: true, ScrapedName: "Show"}
+	it.VideoType = "tv"
+	it.Candidates = `[{"provider":"tmdb","id":"tv/1","title":"cand","score":0.5}]`
+	if err := db.SaveVideoItem(it, nil, []model.MediaEpisode{{FileName: "S01E01.mkv", Season: 1, Episode: 1, Title: "one"}}); err != nil {
+		t.Fatal(err)
+	}
+	saveWork(t, "/other/Away", "movie", "", 0, "")
+	saveWork(t, "/secret/Movie", "movie", "", 0, "")
+	if err := op.CreateMeta(&model.Meta{Path: "/secret", Password: "pw", PSub: true}); err != nil {
+		t.Fatal(err)
+	}
+	saveWork(t, "/lib/.gone", model.MediaKindIgnore, "", 0, "") // hidden item
+
+	notFound := func(path, user string) {
+		t.Helper()
+		env, w := m.call("GET", "/api/fs/media/by_path?path="+url.QueryEscape(path), user, nil)
+		if w.Code != 404 && env.Code != 404 {
+			t.Fatalf("%s as %s: HTTP %d code %d %s, want 404", path, user, w.Code, env.Code, w.Body.String())
+		}
+	}
+
+	// a hit gives what item/:id gives
+	var got struct {
+		Path        string `json:"path"`
+		EpisodeList []struct {
+			Title string `json:"title"`
+		} `json:"episode_list"`
+	}
+	raw := m.ok("GET", "/api/fs/media/by_path?path="+url.QueryEscape("/lib/Show"), "alice", nil)
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Path != "/lib/Show" || len(got.EpisodeList) != 1 || got.EpisodeList[0].Title != "one" {
+		t.Fatalf("hit: %s", raw)
+	}
+	byID := m.ok("GET", "/api/fs/media/item/"+strconv.Itoa(int(it.ID)), "alice", nil)
+	if string(raw) != string(byID) {
+		t.Fatalf("by_path differs from item/:id:\n%s\n%s", raw, byID)
+	}
+
+	// no candidates for a non-admin, they stay for an admin
+	if strings.Contains(string(raw), "provider") {
+		t.Fatalf("candidates visible to a non-admin: %s", raw)
+	}
+	if !strings.Contains(string(m.ok("GET", "/api/fs/media/by_path?path="+url.QueryEscape("/lib/Show"), "admin", nil)), "provider") {
+		t.Fatal("an admin does not get the candidates")
+	}
+
+	// the path is relative to the base path (bob's is /lib)
+	raw = m.ok("GET", "/api/fs/media/by_path?path=/Show", "bob", nil)
+	if err := json.Unmarshal(raw, &got); err != nil || got.Path != "/Show" {
+		t.Fatalf("relative hit: %v %s", err, raw)
+	}
+
+	notFound("/lib/Nope", "alice")     // miss
+	notFound("/other/Away", "bob")     // outside base_path (joins to /lib/other/Away)
+	notFound("/../other/Away", "bob")  // cannot climb out of base_path
+	notFound("/secret/Movie", "alice") // behind a password
+	notFound("/lib/.gone", "alice")    // hidden item
+	notFound("", "alice")              // no path
+}

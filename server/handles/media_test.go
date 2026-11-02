@@ -29,6 +29,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
 )
 
 // Fake credentials: the real ones never appear in a test.
@@ -52,7 +53,7 @@ func newMediaEnv(t *testing.T) *mediaEnv {
 	gin.SetMode(gin.TestMode)
 	conf.Conf = conf.DefaultConfig(t.TempDir())
 	name := fmt.Sprintf("file:media-handles-%d?mode=memory&cache=shared", time.Now().UnixNano())
-	d, err := gorm.Open(sqlite.Open(name), &gorm.Config{})
+	d, err := gorm.Open(sqlite.Open(name), &gorm.Config{NamingStrategy: schema.NamingStrategy{TablePrefix: "x_"}}) // as in production
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,6 +118,7 @@ func newMediaEnv(t *testing.T) *mediaEnv {
 	pub := api.Group("/fs/media")
 	pub.GET("/list", PublicListMedia)
 	pub.GET("/item/:id", PublicGetMedia)
+	pub.GET("/by_path", PublicGetMediaByPath)
 	pub.GET("/albums", PublicListAlbums)
 	pub.GET("/album", PublicGetAlbum)
 	return &mediaEnv{t: t, engine: e}

@@ -156,6 +156,7 @@ func Init(e *gin.Engine) {
 	mediaPublic := auth.Group("/fs/media", handles.RequireMediaEnabled)
 	mediaPublic.GET("/list", handles.PublicListMedia)
 	mediaPublic.GET("/item/:id", handles.PublicGetMedia)
+	mediaPublic.GET("/by_path", handles.PublicGetMediaByPath)
 	mediaPublic.GET("/albums", handles.PublicListAlbums)
 	mediaPublic.GET("/album", handles.PublicGetAlbum)
 	mediaPublic.GET("/folders", handles.PublicListFolders)
