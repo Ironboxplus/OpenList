@@ -25,6 +25,7 @@ import (
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/baidu_photo"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/baidu_share"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/baidu_youth"
+	_ "github.com/OpenListTeam/OpenList/v4/drivers/bitqiu"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/cfs"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/bunny_storage"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/chaoxing"
