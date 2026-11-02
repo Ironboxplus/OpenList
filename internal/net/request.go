@@ -498,10 +498,16 @@ func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int
 		if isCancelConcurrency {
 			d.concurrency--
 			d.mu.Unlock()
+			// Hand the chunk to a worker that is already established: once it is
+			// requeued it no longer counts as a new connection, otherwise every
+			// worker that picks it up would give up its slot in turn and the
+			// chunk would be left in the channel with nobody to take it.
+			requeue := *ch
+			requeue.newConcurrency = false
 			select {
 			case <-d.ctx.Done():
 				return 0, errCancelConcurrency
-			case d.chunkCh <- *ch:
+			case d.chunkCh <- requeue:
 				return 0, errCancelConcurrency
 			}
 		}

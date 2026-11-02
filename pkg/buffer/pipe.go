@@ -33,8 +33,8 @@ func NewPipeBuffer(ctx context.Context, block Block) *PipeBuffer {
 }
 
 func (br *PipeBuffer) Read(p []byte) (int, error) {
-	if err := br.ctx.Err(); err != nil {
-		return 0, err
+	if br.ctx.Err() != nil {
+		return 0, context.Cause(br.ctx)
 	}
 	if len(p) == 0 {
 		return 0, nil
@@ -55,7 +55,7 @@ func (br *PipeBuffer) Read(p []byte) (int, error) {
 			br.rw.Unlock()
 			select {
 			case <-br.ctx.Done():
-				return 0, br.ctx.Err()
+				return 0, context.Cause(br.ctx)
 			case _, ok := <-br.readSignal:
 				if !ok {
 					return 0, io.ErrClosedPipe
@@ -91,8 +91,8 @@ func (br *PipeBuffer) Read(p []byte) (int, error) {
 }
 
 func (br *PipeBuffer) Write(p []byte) (int, error) {
-	if err := br.ctx.Err(); err != nil {
-		return 0, err
+	if br.ctx.Err() != nil {
+		return 0, context.Cause(br.ctx)
 	}
 	if len(p) == 0 {
 		return 0, nil
