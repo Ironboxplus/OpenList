@@ -1,6 +1,7 @@
 package db
 
 import (
+	"sync"
 	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -181,8 +182,23 @@ func DeleteEmbyDevice(userID uint, deviceID string) error {
 	return tx.Delete(&model.EmbyDevice{}).Error
 }
 
+var (
+	embyTouched       sync.Map // device id -> time of the last write
+	embyTouchInterval = 60 * time.Second
+	embyNow           = time.Now
+)
+
+// TouchEmbyDevice records that the device was seen. An Emby client sends many
+// requests a second, so the row is written at most once per embyTouchInterval
+// per device (the same rule as login sessions: Nextcloud updateTokenActivity,
+// Jellyfin DateLastActivity).
 func TouchEmbyDevice(id uint) {
-	_ = db.Model(&model.EmbyDevice{}).Where("id = ?", id).Update("last_seen_at", time.Now()).Error
+	now := embyNow()
+	if last, ok := embyTouched.Load(id); ok && now.Sub(last.(time.Time)) < embyTouchInterval {
+		return
+	}
+	embyTouched.Store(id, now)
+	_ = db.Model(&model.EmbyDevice{}).Where("id = ?", id).Update("last_seen_at", now).Error
 }
 
 // ==================== MediaAnnotation ====================
