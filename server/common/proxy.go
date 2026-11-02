@@ -55,6 +55,11 @@ func Proxy(w http.ResponseWriter, r *http.Request, link *model.Link, file model.
 	defer res.Body.Close()
 
 	maps.Copy(w.Header(), res.Header)
+	// The upstream Content-Type is kept (a driver may proxy a thumbnail whose
+	// type differs from the file name), so the browser must not second-guess it.
+	// The disposition is always attachment: a storage that serves text/html or
+	// image/svg+xml can never render in our origin, whatever ?type= says.
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Disposition", utils.GenerateContentDisposition(file.GetName()))
 	w.WriteHeader(res.StatusCode)
 	if r.Method == http.MethodHead {
@@ -67,6 +72,7 @@ func Proxy(w http.ResponseWriter, r *http.Request, link *model.Link, file model.
 	})
 	return err
 }
+
 // ApplyProxyUserAgent overrides the User-Agent on the client request header used to
 // resolve and proxy a download when the storage configured a custom one. It mutates
 // the (request-scoped) request header BEFORE the link is resolved — deliberately not
@@ -92,6 +98,7 @@ func ApplyProxyUserAgent(r *http.Request, storage *model.Storage) {
 func attachHeader(w http.ResponseWriter, file model.Obj, link *model.Link) {
 	fileName := file.GetName()
 	w.Header().Set("Content-Disposition", utils.GenerateContentDisposition(fileName))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Type", utils.GetMimeType(fileName))
 	size := link.ContentLength
 	if size <= 0 {
