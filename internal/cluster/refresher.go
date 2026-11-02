@@ -632,6 +632,7 @@ func (m *Manager) absorbLeases(leases []*refresherLease) []*refresherLease {
 			continue
 		}
 		merged = append(merged, l)
+		m.enqueueGroup(l.GroupID)
 		if prev == nil || prev.lease.Holder != l.Holder || prev.lease.Epoch != l.Epoch || (prev.lease.TTLSec == 0) != (l.TTLSec == 0) {
 			changedHolder = true
 			if l.TTLSec > 0 {
@@ -672,6 +673,7 @@ func (m *Manager) absorbPolicies(ps []*groupPolicy) []*groupPolicy {
 		}
 		if m.state.mergePolicy(p) {
 			merged = append(merged, p)
+			m.enqueueGroup(p.GroupID)
 			utils.Log.Infof("[cluster] preferred refresher for group=%s set to %q by %s (v%d)", p.GroupID, shortNode(p.Preferred), shortNode(p.Origin), p.Version)
 		}
 	}

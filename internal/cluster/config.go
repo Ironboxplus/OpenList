@@ -1,12 +1,12 @@
 package cluster
 
 import (
-	"time"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Config is the operator-facing configuration of the credential-sharing cluster.
@@ -46,6 +46,10 @@ type Config struct {
 	// AnnounceIntervalSec is how often this node re-broadcasts its inventory +
 	// credential digests so peers converge after any lost message. 0 => default.
 	AnnounceIntervalSec int `json:"announce_interval_sec"`
+	// ResyncSec is the period of the full reconcile pass that re-checks every local
+	// member mount against the credential catalogue, so a missed event is only a
+	// delay. 0 => default.
+	ResyncSec int `json:"resync_sec,omitempty"`
 
 	// Refresher timing (all optional, 0 => default). They exist so operators and
 	// tests can trade failover speed against traffic; the defaults suit
@@ -67,6 +71,7 @@ type Config struct {
 
 const (
 	defaultAnnounceIntervalSec     = 45
+	defaultResyncSec               = 60
 	defaultLeaseTTLSec             = 60
 	defaultRefreshRequestWaitSec   = 30
 	defaultProactiveMinGapSec      = 30
@@ -193,4 +198,8 @@ func (cs *configStore) save(c Config) error {
 	}
 	cs.cfg = c
 	return nil
+}
+
+func (c Config) resyncInterval() time.Duration {
+	return time.Duration(pick(c.ResyncSec, defaultResyncSec)) * time.Second
 }
