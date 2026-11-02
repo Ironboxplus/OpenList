@@ -3,9 +3,8 @@ package quark
 import (
 	"time"
 
-	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
-
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
 
 type Resp struct {
@@ -17,6 +16,21 @@ type Resp struct {
 }
 
 var _ model.Obj = (*File)(nil)
+
+// providerError is the structured form of a rejected Quark API response. The
+// HTTP status is preserved alongside the provider envelope so callers can match
+// an exact response signature instead of parsing message text. Error returns the
+// provider message unchanged, so existing string-based callers are unaffected.
+type providerError struct {
+	HTTPStatus int
+	Status     int
+	Code       int
+	Message    string
+}
+
+func (e *providerError) Error() string {
+	return e.Message
+}
 
 type File struct {
 	Fid      string `json:"fid"`
