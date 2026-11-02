@@ -36,6 +36,7 @@ import (
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/crypt"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/cstcloud_capsule"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/ctfile"
+	_ "github.com/OpenListTeam/OpenList/v4/drivers/darkibox"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/degoo"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/doubao"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/doubao_new"
