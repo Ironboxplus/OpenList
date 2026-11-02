@@ -9,6 +9,25 @@ import (
 	"github.com/pkg/errors"
 )
 
+// waitState polls the task's state until it is want or two seconds pass, and
+// reports the last state seen. A fixed sleep before reading is a race against
+// the goroutine that runs the task.
+func waitState[K comparable](t *testing.T, task *Task[K], want, what string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		got := task.GetState()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Errorf("task status not %s: %s", what, got)
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestTask_Manager(t *testing.T) {
 	var next atomic.Uint64
 	tm := NewTaskManager(3, func(id *uint64) {
@@ -25,14 +44,8 @@ func TestTask_Manager(t *testing.T) {
 	if !ok {
 		t.Fatal("task not found")
 	}
-	time.Sleep(time.Millisecond * 100)
-	if task.state != RUNNING {
-		t.Errorf("task status not running: %s", task.state)
-	}
-	time.Sleep(time.Second)
-	if task.state != SUCCEEDED {
-		t.Errorf("task status not finished: %s", task.state)
-	}
+	waitState(t, task, RUNNING, "running")
+	waitState(t, task, SUCCEEDED, "finished")
 }
 
 func TestTask_Cancel(t *testing.T) {
@@ -56,12 +69,9 @@ func TestTask_Cancel(t *testing.T) {
 	if !ok {
 		t.Fatal("task not found")
 	}
-	time.Sleep(time.Microsecond * 50)
+	waitState(t, task, RUNNING, "running")
 	task.Cancel()
-	time.Sleep(time.Millisecond)
-	if task.state != CANCELED {
-		t.Errorf("task status not canceled: %s", task.state)
-	}
+	waitState(t, task, CANCELED, "canceled")
 }
 
 func TestTask_Retry(t *testing.T) {
