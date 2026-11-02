@@ -307,13 +307,15 @@ func ClearMediaScrapedData(mediaType model.MediaType) (int64, error) {
 	if mediaType != "" {
 		tx = tx.Where("media_type = ?", mediaType)
 	}
-	// 多源评分表随之清空
+	// 多源评分表、分集表随之清空
 	idQuery := db.Unscoped().Model(&model.MediaItem{}).Select("id").Where("locked = ?", false)
 	if mediaType != "" {
 		idQuery = idQuery.Where("media_type = ?", mediaType)
 	}
-	if err := db.Where("item_id IN (?)", idQuery).Delete(&model.MediaRating{}).Error; err != nil {
-		return 0, err
+	for _, m := range []any{&model.MediaRating{}, &model.MediaEpisode{}} {
+		if err := db.Where("item_id IN (?)", idQuery).Delete(m).Error; err != nil {
+			return 0, err
+		}
 	}
 	updates := map[string]interface{}{
 		"original_title": "",

@@ -174,3 +174,50 @@ func TestPrimaryRating(t *testing.T) {
 		t.Errorf("got %v", got)
 	}
 }
+
+func TestMediaEpisodesReplaceAndDelete(t *testing.T) {
+	newCurationDB(t)
+	if err := db.AutoMigrate(&model.MediaEpisode{}, &model.MediaRating{}, &model.MediaAnnotation{}); err != nil {
+		t.Fatal(err)
+	}
+	it := scanned("Show")
+	if err := CreateOrUpdateMediaItem(it); err != nil {
+		t.Fatal(err)
+	}
+	eps := []model.MediaEpisode{
+		{FileName: "S01E02.mkv", Season: 1, Episode: 2, Title: "two"},
+		{FileName: "S01E01.mkv", Season: 1, Episode: 1, Title: "one"},
+	}
+	if err := ReplaceMediaEpisodes(it.ID, eps); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReplaceMediaEpisodes(it.ID, eps[:1]); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ListMediaEpisodes(it.ID)
+	if err != nil || len(got) != 1 || got[0].Title != "two" {
+		t.Fatalf("episodes = %+v, %v", got, err)
+	}
+	if err := DeleteMediaItem(it.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := ListMediaEpisodes(it.ID); len(got) != 0 {
+		t.Errorf("deleting an item must delete its episodes")
+	}
+}
+
+func TestEpisodeInfosIndex(t *testing.T) {
+	one := []model.MediaEpisode{{FileName: "b", Season: 1, Episode: 2}, {FileName: "a", Season: 1, Episode: 1}}
+	got := model.EpisodeInfos(one)
+	if got[0].FileName != "a" || got[0].Index != 1 || got[1].Index != 2 {
+		t.Errorf("single season keeps the episode numbers: %+v", got)
+	}
+	two := []model.MediaEpisode{{FileName: "s2e1", Season: 2, Episode: 1}, {FileName: "s1e1", Season: 1, Episode: 1}, {FileName: "s1e2", Season: 1, Episode: 2}}
+	got = model.EpisodeInfos(two)
+	if got[0].FileName != "s1e1" || got[1].Index != 2 || got[2].FileName != "s2e1" || got[2].Index != 3 {
+		t.Errorf("several seasons are numbered by position: %+v", got)
+	}
+	if model.EpisodesJSON(nil) != "" {
+		t.Errorf("no episodes -> empty string")
+	}
+}
