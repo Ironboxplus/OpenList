@@ -110,6 +110,13 @@ func newMediaEnv(t *testing.T) *mediaEnv {
 	cu.POST("/image", CurateImage)
 	cu.POST("/scrape", CurateScrape)
 	cu.GET("/search", CurateSearch)
+	api.GET("/public/media/thumb", PublicMediaThumb)
+	api.GET("/public/media/proxy", PublicMediaProxy)
+	pub := api.Group("/fs/media")
+	pub.GET("/list", PublicListMedia)
+	pub.GET("/item/:id", PublicGetMedia)
+	pub.GET("/albums", PublicListAlbums)
+	pub.GET("/album", PublicGetAlbum)
 	return &mediaEnv{t: t, engine: e}
 }
 

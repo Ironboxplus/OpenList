@@ -62,13 +62,16 @@ func safeCoverURL(u *url.URL) error {
 }
 
 // PublicMediaProxy 代理外部封面图（TMDB/豆瓣/Discogs），解决客户端直连被墙的问题。
-// 用法：/api/public/media/proxy?url=https%3A%2F%2Fimage.tmdb.org%2F...
+// 用法：/api/public/media/proxy?url=https%3A%2F%2Fimage.tmdb.org%2F...&sign=...（cover_url 自带签名，缺失/错误/过期为 403）
 func PublicMediaProxy(c *gin.Context) {
 	if !MediaEnabled() {
 		c.Status(http.StatusNotFound)
 		return
 	}
 	raw := c.Query("url")
+	if !requireMediaSign(c, mediaProxySignPrefix, raw) {
+		return
+	}
 	if raw == "" {
 		c.Status(http.StatusBadRequest)
 		return
@@ -151,10 +154,13 @@ func thumbnailRoot() string {
 
 // PublicMediaThumb 读取本地缩略图目录中的文件。
 // 缩略图由刮削器写入本地磁盘（非 VFS），因此不能用 /d 读取。
-// 用法：/api/public/media/thumb?path=/imgs/xxx.jpg
+// 用法：/api/public/media/thumb?path=/imgs/xxx.jpg&sign=...（cover_url 自带签名，缺失/错误/过期为 403）
 func PublicMediaThumb(c *gin.Context) {
 	if !MediaEnabled() {
 		c.Status(http.StatusNotFound)
+		return
+	}
+	if !requireMediaSign(c, mediaThumbSignPrefix, stdpath.Clean("/"+c.Query("path"))) {
 		return
 	}
 	reqPath := strings.TrimPrefix(stdpath.Clean("/"+c.Query("path")), "/")

@@ -853,7 +853,7 @@ func PublicListMedia(c *gin.Context) {
 			filtered = append(filtered, items[i])
 		}
 	}
-	common.SuccessResp(c, common.PageResp{Content: filtered, Total: total})
+	common.SuccessResp(c, common.PageResp{Content: mediaItemViews(filtered), Total: total})
 }
 
 // PublicGetMedia 公开获取媒体详情
@@ -873,7 +873,7 @@ func PublicGetMedia(c *gin.Context) {
 		common.ErrorStrResp(c, "资源不存在", 404)
 		return
 	}
-	common.SuccessResp(c, item)
+	common.SuccessResp(c, mediaItemView(item))
 }
 
 // PublicListAlbums 公开专辑列表（音乐）
@@ -905,7 +905,7 @@ func PublicListAlbums(c *gin.Context) {
 		common.ErrorResp(c, err, 500)
 		return
 	}
-	common.SuccessResp(c, common.PageResp{Content: albums, Total: total})
+	common.SuccessResp(c, common.PageResp{Content: mediaAlbumViews(albums), Total: total})
 }
 
 // PublicGetAlbum 公开获取专辑详情及曲目
@@ -928,7 +928,7 @@ func PublicGetAlbum(c *gin.Context) {
 			filtered = append(filtered, tracks[i])
 		}
 	}
-	common.SuccessResp(c, filtered)
+	common.SuccessResp(c, mediaItemViews(filtered))
 }
 
 // PublicListFolders 公开文件夹列表（目录浏览模式）
