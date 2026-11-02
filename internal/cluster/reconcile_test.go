@@ -468,3 +468,85 @@ func TestReconcileEventStormCollapsesToLatestState(t *testing.T) {
 		t.Fatalf("%d probes were spent on superseded records, want the work to collapse to the latest", got)
 	}
 }
+
+// T7: the gap after a local rotation. The refresher's driver has saved a fresh
+// pair (the storage update hook fires) but the record for it is not catalogued
+// yet. The catalogue holds an older record that would probe clean. A reconcile
+// in that gap, woken by anything (here the resync), must not move the working
+// mount back onto the older record; a record that arrives after the fresh pair
+// is newer and is still adopted.
+func TestReconcileDoesNotRegressOntoOlderRecordWhileFreshPairIsUncatalogued(t *testing.T) {
+	reconcileDB(t)
+	m, err := Init(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.cfgStore.save(Config{Enabled: true, Key: "test-key", ApplyRemote: true}); err != nil {
+		t.Fatal(err)
+	}
+	var probes atomic.Int32
+	m.probeCredentialFn = func(context.Context, model.Storage, string) error {
+		probes.Add(1)
+		return nil
+	}
+	t.Cleanup(m.Stop)
+
+	peer, _ := newIdentity()
+	admin, _ := newIdentity()
+	mount := fmt.Sprintf("/rc-t7-%d", reconcileSeq.Add(1))
+	m.state.setGroups(admin, []group{{
+		ID: "g1",
+		Members: []member{
+			{NodeID: m.id.NodeID, MountPath: mount},
+			{NodeID: peer.NodeID, MountPath: "/peer"},
+		},
+	}}, 1)
+	id, err := op.CreateStorage(context.Background(), model.Storage{
+		Driver:    "ReconcileFake",
+		MountPath: mount,
+		Addition:  `{"access_token":"base","refresh_token":"r"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = op.DeleteStorageById(context.Background(), id) })
+	time.Sleep(300 * time.Millisecond) // let the registration wake settle
+
+	// The older record is catalogued without any event, then the rotation lands.
+	if !m.state.mergeCred(signedRecord(peer, "/peer", "old", 1)) {
+		t.Fatal("old record not merged")
+	}
+	row, ok := rowStatus(mount)
+	if !ok {
+		t.Fatal("no storage row")
+	}
+	row.Addition = `{"access_token":"fresh","refresh_token":"r2"}`
+	if err := op.UpdateStorage(context.Background(), row); err != nil {
+		t.Fatal(err)
+	}
+	probes.Store(0)
+
+	m.enqueueAll()
+	time.Sleep(1500 * time.Millisecond)
+	if n := probes.Load(); n != 0 {
+		s, _ := rowStatus(mount)
+		t.Fatalf("an older record was probed %d time(s) while the fresh pair was uncatalogued; addition=%q", n, s.Addition)
+	}
+	if s, _ := rowStatus(mount); !strings.Contains(s.Addition, `"fresh"`) {
+		t.Fatalf("fresh pair was replaced: %q", s.Addition)
+	}
+
+	// A record that reaches the catalogue after the fresh pair is newer.
+	if merged := m.absorbCreds([]*credRecord{signedRecord(peer, "/peer", "newer", 3)}); len(merged) != 1 {
+		t.Fatalf("newer record not merged: %v", merged)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if s, ok := rowStatus(mount); ok && strings.Contains(s.Addition, `"newer"`) {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	s, _ := rowStatus(mount)
+	t.Fatalf("a record newer than the fresh pair was not adopted: %q", s.Addition)
+}
