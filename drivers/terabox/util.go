@@ -156,6 +156,9 @@ func (d *Terabox) post_multipart(
 func (d *Terabox) getFiles(dir string) ([]File, error) {
 	page := 1
 	num := 100
+	if dir == "" {
+		dir = "/"
+	}
 	params := map[string]string{
 		"dir": dir,
 	}
