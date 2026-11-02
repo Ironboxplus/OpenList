@@ -14,7 +14,7 @@ const (
 )
 
 type Addition struct {
-	RemotePath           string `json:"remote_path" required:"true" help:"Primary AList mounted folder path used to store metadata and small files, e.g. /my-storage/chunks"`
+	RemotePath           string `json:"remote_path" required:"true" help:"Primary AList mounted folder path used to store metadata and small files, e.g. /my-storage/chunks. Chunks are written one at a time, also when the target is a 115 storage."`
 	RemotePaths          string `json:"remote_paths" type:"text" help:"Additional AList mounted folder paths, one per line. Chunk files will be distributed across remote_path and these extra paths."`
 	StoreChunksInPrimary bool   `json:"store_chunks_in_primary" type:"bool" default:"true" help:"When extra remote paths are configured, also store chunk files in remote_path"`
 	ChunkSize            int64  `json:"chunk_size" type:"number" required:"true" default:"2147483648" help:"Files larger than this will be split into chunks"`
@@ -33,7 +33,7 @@ var config = driver.Config{
 	NeedMs:            false,
 	DefaultRoot:       "/",
 	CheckStatus:       false,
-	Alert:             "",
+	Alert:             "info|Chunks are uploaded strictly one after another, in order, never in parallel (115 needs this: its multipart upload and account rate limit forbid concurrent writes). Splitting a file does not make the upload faster.",
 	NoOverwriteUpload: false,
 }
 

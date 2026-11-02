@@ -27,6 +27,10 @@ func (d *Chunker) Config() driver.Config {
 	return config
 }
 
+// GetRootPath makes the chunker's logical root "/" (the remote folders are
+// mapped below it); OpenList's op layer needs a root to create directories.
+func (d *Chunker) GetRootPath() string { return "/" }
+
 func (d *Chunker) GetAddition() driver.Additional {
 	return &d.Addition
 }
