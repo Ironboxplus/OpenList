@@ -103,6 +103,7 @@ import (
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/wps"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/wukong"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/yandex_disk"
+	_ "github.com/OpenListTeam/OpenList/v4/drivers/yunpan360"
 )
 
 // All do nothing,just for import
