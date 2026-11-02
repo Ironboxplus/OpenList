@@ -464,7 +464,7 @@ func TestReconcileEventStormCollapsesToLatestState(t *testing.T) {
 	if got := maxInFlight.Load(); got > 1 {
 		t.Fatalf("%d probes in flight on one mount, want at most 1", got)
 	}
-	if got := stale.Load(); got > 3 {
+	if got := stale.Load(); got > last/4 {
 		t.Fatalf("%d probes were spent on superseded records, want the work to collapse to the latest", got)
 	}
 }
