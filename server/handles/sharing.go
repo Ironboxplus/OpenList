@@ -23,15 +23,34 @@ import (
 )
 
 // shareLink is the one builder of share links: <apiURL>/<route>/<sid>/<path>,
-// plus ?pwd= when the share has a password. route is "sd" (download) or "sad"
+// plus ?auth=<token> when the share has a password (?pwd= for a row that has no
+// hash yet). route is "sd" (download) or "sad"
 // (archive download). The password is query-escaped; the server reads it with
 // c.Query("pwd"), which unescapes it, so any password round-trips.
-func shareLink(apiURL, route, sid, path, pwd string) string {
+func shareLink(apiURL, route string, s *model.SharingDB, sid, path string) string {
 	u := fmt.Sprintf("%s/%s%s", apiURL, route, utils.EncodePath("/"+stdpath.Join(sid, path), true))
-	if pwd != "" {
-		u += "?pwd=" + url.QueryEscape(pwd)
+	if k, v := op.SharingLinkQuery(s); k != "" {
+		u += "?" + k + "=" + url.QueryEscape(v)
 	}
 	return u
+}
+
+// previewParam marks a link generated for preview use (subtitles, thumbnails);
+// it follows shareLink, which may or may not have put a query on the URL.
+func previewParam(s *model.SharingDB) string {
+	if s.HasPassword() {
+		return "&preview=1"
+	}
+	return "?preview=1"
+}
+
+// shareToken is the access token a request presents: X-Share-Token, or ?auth=
+// on direct links.
+func shareToken(c *gin.Context) string {
+	if t := c.GetHeader("X-Share-Token"); t != "" {
+		return t
+	}
+	return c.Query("auth")
 }
 
 func SharingGet(c *gin.Context, req *FsGetReq) {
@@ -43,6 +62,7 @@ func SharingGet(c *gin.Context, req *FsGetReq) {
 	s, obj, err := sharing.Get(c.Request.Context(), sid, path, model.SharingListArgs{
 		Refresh:  false,
 		Pwd:      req.Password,
+		Token:    shareToken(c),
 		ClientIP: c.ClientIP(),
 	})
 	if dealError(c, err) {
@@ -50,7 +70,7 @@ func SharingGet(c *gin.Context, req *FsGetReq) {
 	}
 	url := ""
 	if !obj.IsDir() {
-		url = shareLink(common.GetApiUrl(c), "sd", sid, path, s.Pwd)
+		url = shareLink(common.GetApiUrl(c), "sd", s.SharingDB, sid, path)
 	}
 	thumb, _ := model.GetThumb(obj)
 	common.SuccessResp(c, FsGetResp{
@@ -100,6 +120,7 @@ func SharingList(c *gin.Context, req *ListReq) {
 	s, objs, err := sharing.List(c.Request.Context(), sid, path, model.SharingListArgs{
 		Refresh:  req.Refresh,
 		Pwd:      req.Password,
+		Token:    shareToken(c),
 		ClientIP: c.ClientIP(),
 	})
 	if dealError(c, err) {
@@ -153,12 +174,13 @@ func SharingArchiveMeta(c *gin.Context, req *ArchiveMetaReq) {
 			Refresh:     req.Refresh,
 		},
 		Pwd:      req.Password,
+		Token:    shareToken(c),
 		ClientIP: c.ClientIP(),
 	})
 	if dealError(c, err) {
 		return
 	}
-	url := shareLink(common.GetApiUrl(c), "sad", sid, path, s.Pwd)
+	url := shareLink(common.GetApiUrl(c), "sad", s.SharingDB, sid, path)
 	common.SuccessResp(c, ArchiveMetaResp{
 		Comment:     ret.GetComment(),
 		IsEncrypted: ret.IsEncrypted(),
@@ -195,6 +217,7 @@ func SharingArchiveList(c *gin.Context, req *ArchiveListReq) {
 			Refresh:          req.Refresh,
 		},
 		Pwd:      req.Password,
+		Token:    shareToken(c),
 		ClientIP: c.ClientIP(),
 	})
 	if dealError(c, err) {
@@ -214,13 +237,13 @@ func SharingDown(c *gin.Context) {
 	sid := c.Request.Context().Value(conf.SharingIDKey).(string)
 	path := c.Request.Context().Value(conf.PathKey).(string)
 	path = utils.FixAndCleanPath(path)
-	pwd := c.Query("pwd")
+	access := shareAccess(c)
 	s, err := op.GetSharingById(sid)
 	if err == nil {
 		if len(s.Files) != 1 && path == "/" {
 			err = errors.New("cannot get sharing root link")
 		} else {
-			err = op.AccessSharing(c.ClientIP(), pwd, s)
+			err = op.CheckSharingContent(access, s, true)
 		}
 	}
 	if dealErrorPage(c, err) {
@@ -253,6 +276,10 @@ func SharingDown(c *gin.Context) {
 			common.ErrorPage(c, errors.New("failed get sharing link"), 500)
 			return
 		}
+		if dealErrorPage(c, op.ChargeSharing(access, s)) {
+			link.Close()
+			return
+		}
 		proxy(c, link, obj, storage.GetStorage().ProxyRange)
 	} else {
 		link, _, err := op.Link(c.Request.Context(), storage, actualPath, model.LinkArgs{
@@ -264,6 +291,10 @@ func SharingDown(c *gin.Context) {
 		if err != nil {
 			log.Errorf("failed get sharing link: %+v", err)
 			common.ErrorPage(c, errors.New("failed get sharing link"), 500)
+			return
+		}
+		if dealErrorPage(c, op.ChargeSharing(access, s)) {
+			link.Close()
 			return
 		}
 		redirect(c, link)
@@ -278,7 +309,7 @@ func SharingArchiveExtract(c *gin.Context) {
 	sid := c.Request.Context().Value(conf.SharingIDKey).(string)
 	path := c.Request.Context().Value(conf.PathKey).(string)
 	path = utils.FixAndCleanPath(path)
-	pwd := c.Query("pwd")
+	access := shareAccess(c)
 	innerPath := utils.FixAndCleanPath(c.Query("inner"))
 	archivePass := c.Query("pass")
 	s, err := op.GetSharingById(sid)
@@ -286,7 +317,7 @@ func SharingArchiveExtract(c *gin.Context) {
 		if len(s.Files) != 1 && path == "/" {
 			err = errors.New("cannot extract sharing root")
 		} else {
-			err = op.AccessSharing(c.ClientIP(), pwd, s)
+			err = op.CheckSharingContent(access, s, true)
 		}
 	}
 	if dealErrorPage(c, err) {
@@ -317,6 +348,10 @@ func SharingArchiveExtract(c *gin.Context) {
 			if dealErrorPage(c, err) {
 				return
 			}
+			if dealErrorPage(c, op.ChargeSharing(access, s)) {
+				link.Close()
+				return
+			}
 			proxy(c, link, obj, storage.GetStorage().ProxyRange)
 		} else {
 			args.Redirect = true
@@ -324,11 +359,19 @@ func SharingArchiveExtract(c *gin.Context) {
 			if dealErrorPage(c, err) {
 				return
 			}
+			if dealErrorPage(c, op.ChargeSharing(access, s)) {
+				link.Close()
+				return
+			}
 			redirect(c, link)
 		}
 	} else {
 		rc, size, err := op.InternalExtract(c.Request.Context(), storage, actualPath, args)
 		if dealErrorPage(c, err) {
+			return
+		}
+		if dealErrorPage(c, op.ChargeSharing(access, s)) {
+			_ = rc.Close()
 			return
 		}
 		fileName := stdpath.Base(innerPath)
@@ -343,8 +386,10 @@ func dealError(c *gin.Context, err error) bool {
 		common.ErrorStrResp(c, "the share does not exist", 500)
 	} else if errors.Is(err, errs.InvalidSharing) {
 		common.ErrorStrResp(c, "the share has expired or is no longer valid", 500)
-	} else if errors.Is(err, errs.WrongShareCode) {
+	} else if errors.Is(err, errs.WrongShareCode) || errors.Is(err, errs.ShareActionNotAllowed) {
 		common.ErrorResp(c, err, 403)
+	} else if errors.Is(err, errs.TooManyShareAttempts) {
+		common.ErrorResp(c, err, 429)
 	} else if errors.Is(err, errs.WrongArchivePassword) {
 		common.ErrorResp(c, err, 202)
 	} else {
@@ -360,8 +405,10 @@ func dealErrorPage(c *gin.Context, err error) bool {
 		common.ErrorPage(c, errors.New("the share does not exist"), 500)
 	} else if errors.Is(err, errs.InvalidSharing) {
 		common.ErrorPage(c, errors.New("the share has expired or is no longer valid"), 500)
-	} else if errors.Is(err, errs.WrongShareCode) {
+	} else if errors.Is(err, errs.WrongShareCode) || errors.Is(err, errs.ShareActionNotAllowed) {
 		common.ErrorPage(c, err, 403)
+	} else if errors.Is(err, errs.TooManyShareAttempts) {
+		common.ErrorPage(c, err, 429)
 	} else if errors.Is(err, errs.WrongArchivePassword) {
 		common.ErrorPage(c, err, 202)
 	} else {
@@ -372,8 +419,62 @@ func dealErrorPage(c *gin.Context, err error) bool {
 
 type SharingResp struct {
 	*model.Sharing
-	CreatorName string `json:"creator"`
-	CreatorRole int    `json:"creator_role"`
+	CreatorName   string `json:"creator"`
+	CreatorRole   int    `json:"creator_role"`
+	HasPassword   bool   `json:"has_password"`
+	AllowPreview  bool   `json:"allow_preview"`
+	AllowDownload bool   `json:"allow_download"`
+}
+
+func sharingResp(s *model.Sharing) SharingResp {
+	return SharingResp{
+		Sharing:       s,
+		CreatorName:   s.Creator.Username,
+		CreatorRole:   s.Creator.Role,
+		HasPassword:   s.HasPassword(),
+		AllowPreview:  s.AllowPreview(),
+		AllowDownload: s.AllowDownload(),
+	}
+}
+
+// shareAccess reads what a /sd or /sad request presents: the old ?pwd=, the
+// ?auth= token, whether it is a preview (preview=1, or a thumbnail), the HEAD
+// method, and the start of a Range. preview=1 is a policy marker for the UI and
+// honest clients, not DRM: the same bytes are served either way.
+func shareAccess(c *gin.Context) op.SharingAccess {
+	return op.SharingAccess{
+		IP:         c.ClientIP(),
+		Pwd:        c.Query("pwd"),
+		Token:      shareToken(c),
+		Preview:    c.Query("preview") == "1" || c.Query("type") == "thumb",
+		Head:       c.Request.Method == "HEAD",
+		RangeStart: op.RangeStart(c.GetHeader("Range")),
+	}
+}
+
+type sharingAuthReq struct {
+	ID       string `json:"id"`
+	Password string `json:"password"`
+}
+
+// SharingAuth trades a share password for an access token (POST body, so the
+// password never sits in a URL). The token is what links carry as ?auth=.
+func SharingAuth(c *gin.Context) {
+	var req sharingAuthReq
+	if err := c.ShouldBindJSON(&req); err != nil || req.ID == "" {
+		common.ErrorStrResp(c, "invalid request", 400)
+		return
+	}
+	s, err := op.GetSharingById(req.ID)
+	if err != nil {
+		dealError(c, errors.WithStack(errs.SharingNotFound))
+		return
+	}
+	token, err := op.AuthSharing(c.ClientIP(), req.Password, s)
+	if dealError(c, err) {
+		return
+	}
+	common.SuccessResp(c, gin.H{"token": token})
 }
 
 func GetSharing(c *gin.Context) {
@@ -384,11 +485,7 @@ func GetSharing(c *gin.Context) {
 		common.ErrorStrResp(c, "sharing not found", 404)
 		return
 	}
-	common.SuccessResp(c, SharingResp{
-		Sharing:     s,
-		CreatorName: s.Creator.Username,
-		CreatorRole: s.Creator.Role,
-	})
+	common.SuccessResp(c, sharingResp(s))
 }
 
 func ListSharings(c *gin.Context) {
@@ -413,11 +510,7 @@ func ListSharings(c *gin.Context) {
 	}
 	common.SuccessResp(c, common.PageResp{
 		Content: utils.MustSliceConvert(sharings, func(s model.Sharing) SharingResp {
-			return SharingResp{
-				Sharing:     &s,
-				CreatorName: s.Creator.Username,
-				CreatorRole: s.Creator.Role,
-			}
+			return sharingResp(&s)
 		}),
 		Total: total,
 	})
@@ -428,10 +521,15 @@ type UpdateSharingReq struct {
 	Expires     *time.Time `json:"expires"`
 	Pwd         string     `json:"pwd"`
 	MaxAccessed int        `json:"max_accessed"`
-	Disabled    bool       `json:"disabled"`
-	Remark      string     `json:"remark"`
-	Readme      string     `json:"readme"`
-	Header      string     `json:"header"`
+	// BurnAfterRead, AllowPreview and AllowDownload are pointers so that a client
+	// that does not know them (an older UI) leaves them as they are.
+	BurnAfterRead *bool  `json:"burn_after_read"`
+	AllowPreview  *bool  `json:"allow_preview"`
+	AllowDownload *bool  `json:"allow_download"`
+	Disabled      bool   `json:"disabled"`
+	Remark        string `json:"remark"`
+	Readme        string `json:"readme"`
+	Header        string `json:"header"`
 	model.Sort
 	CreatorName string `json:"creator"`
 	Accessed    int    `json:"accessed"`
@@ -449,6 +547,18 @@ func validateSharingID(id string) error {
 		return errors.New("share id can only contain letters, numbers, underscores, hyphens, and CJK characters")
 	}
 	return nil
+}
+
+func applyShareFlags(s *model.SharingDB, req *UpdateSharingReq) {
+	if req.BurnAfterRead != nil {
+		s.BurnAfterRead = *req.BurnAfterRead
+	}
+	if req.AllowPreview != nil {
+		s.DenyPreview = !*req.AllowPreview
+	}
+	if req.AllowDownload != nil {
+		s.DenyDownload = !*req.AllowDownload
+	}
 }
 
 func UpdateSharing(c *gin.Context) {
@@ -495,7 +605,10 @@ func UpdateSharing(c *gin.Context) {
 	}
 	s.Files = req.Files
 	s.Expires = req.Expires
-	s.Pwd = req.Pwd
+	if req.Pwd != s.Pwd || (req.Pwd != "" && s.PasswordHash == "") {
+		s.SetPassword(req.Pwd) // a new password also invalidates issued tokens
+	}
+	applyShareFlags(s.SharingDB, &req)
 	s.Accessed = req.Accessed
 	s.MaxAccessed = req.MaxAccessed
 	s.Disabled = req.Disabled
@@ -518,14 +631,13 @@ func UpdateSharing(c *gin.Context) {
 			return
 		}
 	}
+	if !s.LimitReached() {
+		s.ConsumedAt = nil // the limit was raised or lifted: the share is open again
+	}
 	if err = op.UpdateSharing(s); err != nil {
 		common.ErrorResp(c, err, 500)
 	} else {
-		common.SuccessResp(c, SharingResp{
-			Sharing:     s,
-			CreatorName: s.Creator.Username,
-			CreatorRole: s.Creator.Role,
-		})
+		common.SuccessResp(c, sharingResp(s))
 	}
 }
 
@@ -573,7 +685,6 @@ func CreateSharing(c *gin.Context) {
 		SharingDB: &model.SharingDB{
 			ID:          req.ID,
 			Expires:     req.Expires,
-			Pwd:         req.Pwd,
 			Accessed:    req.Accessed,
 			MaxAccessed: req.MaxAccessed,
 			Disabled:    req.Disabled,
@@ -585,16 +696,14 @@ func CreateSharing(c *gin.Context) {
 		Files:   req.Files,
 		Creator: user,
 	}
+	s.SetPassword(req.Pwd)
+	applyShareFlags(s.SharingDB, &req)
 	var id string
 	if id, err = op.CreateSharing(s); err != nil {
 		common.ErrorResp(c, err, 500)
 	} else {
 		s.ID = id
-		common.SuccessResp(c, SharingResp{
-			Sharing:     s,
-			CreatorName: s.Creator.Username,
-			CreatorRole: s.Creator.Role,
-		})
+		common.SuccessResp(c, sharingResp(s))
 	}
 }
 

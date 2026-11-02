@@ -106,18 +106,21 @@ type ArchiveDecompressArgs struct {
 type SharingListArgs struct {
 	Refresh  bool
 	Pwd      string
+	Token    string // share access token (?auth= / X-Share-Token), stands for Pwd
 	ClientIP string
 }
 
 type SharingArchiveMetaArgs struct {
 	ArchiveMetaArgs
 	Pwd      string
+	Token    string
 	ClientIP string
 }
 
 type SharingArchiveListArgs struct {
 	ArchiveListArgs
 	Pwd      string
+	Token    string
 	ClientIP string
 }
 

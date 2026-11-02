@@ -21,7 +21,8 @@ func link(ctx context.Context, sid, path string, args *LinkArgs) (*model.Sharing
 	if len(sharing.Files) != 1 && path == "/" {
 		return nil, nil, nil, errors.New("cannot get sharing root link")
 	}
-	if err = op.AccessSharing(args.ClientIP, args.Pwd, sharing); err != nil {
+	access := op.SharingAccess{IP: args.ClientIP, Pwd: args.Pwd, Token: args.Token, RangeStart: op.RangeStart(args.Header.Get("Range"))}
+	if err = op.CheckSharingContent(access, sharing, true); err != nil {
 		return sharing, nil, nil, err
 	}
 	unwrapPath, err := op.GetSharingUnwrapPath(sharing, path)
@@ -35,6 +36,9 @@ func link(ctx context.Context, sid, path string, args *LinkArgs) (*model.Sharing
 	l, obj, err := op.Link(ctx, storage, actualPath, args.LinkArgs)
 	if err != nil {
 		return nil, nil, nil, errors.WithMessage(err, "failed get sharing link")
+	}
+	if err = op.ChargeSharing(access, sharing); err != nil {
+		return sharing, nil, nil, err
 	}
 	if l.URL != "" && !strings.HasPrefix(l.URL, "http://") && !strings.HasPrefix(l.URL, "https://") {
 		l.URL = conf.GetApiUrl(ctx) + l.URL

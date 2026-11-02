@@ -18,10 +18,13 @@ func list(ctx context.Context, sid, path string, args model.SharingListArgs) (*m
 	if err != nil {
 		return nil, nil, errors.WithStack(errs.SharingNotFound)
 	}
-	if err = op.CheckSharing(args.ClientIP, args.Pwd, sharing); err != nil {
+	if err = op.CheckSharingContent(op.SharingAccess{IP: args.ClientIP, Pwd: args.Pwd, Token: args.Token, RangeStart: -1}, sharing, false); err != nil {
 		return sharing, nil, err
 	}
 	path = utils.FixAndCleanPath(path)
+	if path == "/" {
+		op.CountSharingView(args.ClientIP, sharing)
+	}
 	if len(sharing.Files) == 1 || path != "/" {
 		unwrapPath, err := op.GetSharingUnwrapPath(sharing, path)
 		if err != nil {
@@ -35,9 +38,11 @@ func list(ctx context.Context, sid, path string, args model.SharingListArgs) (*m
 		var objs []model.Obj
 		if storage != nil {
 			query := url.Values{"type": {"thumb"}}
-			if sharing.Pwd != "" {
-				query.Set("pwd", sharing.Pwd)
+			if k, v := op.SharingLinkQuery(sharing.SharingDB); k != "" {
+				query.Set(k, v)
 			}
+			// thumbnails are previews, not downloads
+			query.Set("preview", "1")
 			ctx = context.WithValue(ctx, conf.ThumbnailBaseURLKey, &url.URL{
 				Path:     stdpath.Join("/sd", sid, path),
 				RawQuery: query.Encode(),

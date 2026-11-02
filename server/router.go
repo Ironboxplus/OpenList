@@ -119,6 +119,7 @@ func Init(e *gin.Engine) {
 	// no need auth
 	public := api.Group("/public")
 	public.Any("/settings", handles.PublicSettings)
+	public.POST("/sharing_auth", handles.SharingAuth)
 	public.GET("/media_status", handles.PublicMediaStatus)
 	// 封面代理与本地缩略图（媒体库页面使用，免鉴权）
 	public.GET("/media/proxy", handles.PublicMediaProxy)

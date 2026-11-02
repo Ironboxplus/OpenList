@@ -239,22 +239,22 @@ func TestResolveSidecarListsNothingExtraWithoutSubtitleFolder(t *testing.T) {
 }
 
 func TestShareLink(t *testing.T) {
-	if got, want := shareLink("http://h", "sd", "sid1", "Show/Subs/A b.srt", ""),
+	if got, want := shareLink("http://h", "sd", &model.SharingDB{}, "sid1", "Show/Subs/A b.srt"),
 		"http://h/sd/sid1/Show/Subs/A%20b.srt"; got != want {
 		t.Errorf("no pwd: got %s, want %s", got, want)
 	}
-	if got, want := shareLink("http://h", "sad", "sid1", "a.zip", "p1"),
+	if got, want := shareLink("http://h", "sad", &model.SharingDB{Pwd: "p1"}, "sid1", "a.zip"),
 		"http://h/sad/sid1/a.zip?pwd=p1"; got != want {
 		t.Errorf("pwd: got %s, want %s", got, want)
 	}
 }
 
-// A share password with URL-significant characters must survive the link: the
+// A share password (of a row that has no hash yet) with URL-significant characters must survive the link: the
 // server reads it back with c.Query, so parsing the link must give the exact
 // password.
 func TestShareLinkPasswordRoundTrip(t *testing.T) {
 	for _, pwd := range []string{"a&b", "a#b", "a+b", "a?b", "a b", "密码", "x=1&y=2#z+ ?中", "100%"} {
-		link := shareLink("http://h", "sd", "sid", "dir/f.mkv", pwd)
+		link := shareLink("http://h", "sd", &model.SharingDB{Pwd: pwd}, "sid", "dir/f.mkv")
 		u, err := url.Parse(link)
 		if err != nil {
 			t.Fatalf("%q: %v", pwd, err)

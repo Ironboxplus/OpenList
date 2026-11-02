@@ -35,6 +35,9 @@ func Init(d *gorm.DB) {
 			MediaMigrateWipeEnv,
 		)
 	}
+	if err := migrateSharingPasswords(); err != nil {
+		log.Fatalf("failed migrate sharing passwords: %s", err.Error())
+	}
 }
 
 func mediaWipeConfirmed() bool {

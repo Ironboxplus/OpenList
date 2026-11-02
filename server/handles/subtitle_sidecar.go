@@ -299,7 +299,7 @@ func sharedSidecarSubtitles(c *gin.Context, sid, path, pwd string) ([]driver.Vid
 	apiURL := common.GetApiUrl(c)
 	subs := resolveSidecar(stdpath.Base(path), sidecarSource{
 		list: func(rel string) ([]model.Obj, error) {
-			s, objs, err := sharing.List(c.Request.Context(), sid, stdpath.Join(parent, rel), model.SharingListArgs{Pwd: pwd})
+			s, objs, err := sharing.List(c.Request.Context(), sid, stdpath.Join(parent, rel), model.SharingListArgs{Pwd: pwd, Token: shareToken(c), ClientIP: c.ClientIP()})
 			if rel == "" && err != nil {
 				listErr = err
 			}
@@ -309,11 +309,11 @@ func sharedSidecarSubtitles(c *gin.Context, sid, path, pwd string) ([]driver.Vid
 			return objs, err
 		},
 		url: func(rel string, o model.Obj) string {
-			pwd := ""
-			if share != nil {
-				pwd = share.Pwd
+			if share == nil {
+				return ""
 			}
-			return shareLink(apiURL, "sd", sid, stdpath.Join(parent, rel, o.GetName()), pwd)
+			// subtitles are shown, not downloaded: a preview
+			return shareLink(apiURL, "sd", share.SharingDB, sid, stdpath.Join(parent, rel, o.GetName())) + previewParam(share.SharingDB)
 		},
 	})
 	return subs, listErr

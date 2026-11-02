@@ -17,10 +17,13 @@ func get(ctx context.Context, sid, path string, args model.SharingListArgs) (*mo
 	if err != nil {
 		return nil, nil, errors.WithStack(errs.SharingNotFound)
 	}
-	if err = op.CheckSharing(args.ClientIP, args.Pwd, sharing); err != nil {
+	if err = op.CheckSharingContent(op.SharingAccess{IP: args.ClientIP, Pwd: args.Pwd, Token: args.Token, RangeStart: -1}, sharing, false); err != nil {
 		return sharing, nil, err
 	}
 	path = utils.FixAndCleanPath(path)
+	if path == "/" {
+		op.CountSharingView(args.ClientIP, sharing)
+	}
 	if len(sharing.Files) == 1 || path != "/" {
 		unwrapPath, err := op.GetSharingUnwrapPath(sharing, path)
 		if err != nil {
