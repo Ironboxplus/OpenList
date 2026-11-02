@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/cmd/flags"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
@@ -16,6 +17,42 @@ import (
 	"github.com/pkg/errors"
 	"gorm.io/gorm"
 )
+
+// renamedSettings are keys the media merge renamed. The old row is kept (flagged
+// deprecated), so its value can still be read and copied to the new key.
+// onlyNew: copy only when the new key has no row yet (its default is not empty,
+// so "empty" cannot tell an untouched value from a chosen one).
+var renamedSettings = []struct {
+	oldKey, newKey string
+	onlyNew        bool
+}{
+	{"media_tmdb_token", conf.MediaTMDBKey, false},
+	{"media_language", conf.MediaScrapeLanguage, true},
+}
+
+// carryRenamedSetting gives a renamed key the value of its old key, once: it
+// does nothing when the new key already has a value, so it is idempotent and
+// never overrides what an administrator set afterwards.
+func carryRenamedSetting(item, stored *model.SettingItem, all map[string]*model.SettingItem) {
+	for _, r := range renamedSettings {
+		if item.Key != r.newKey {
+			continue
+		}
+		if stored != nil && (r.onlyNew || stored.Value != "") {
+			return
+		}
+		old := all[r.oldKey]
+		if old == nil || old.Value == "" || old.Value == item.Value {
+			return
+		}
+		if item.Type == conf.TypeSelect && !utils.SliceContains(strings.Split(item.Options, ","), old.Value) {
+			return
+		}
+		utils.Log.Infof("setting %s: carried over the value of the renamed key %s", r.newKey, r.oldKey)
+		item.Value = old.Value
+		return
+	}
+}
 
 func initSettings() {
 	initialSettingItems := InitialSettings()
@@ -74,6 +111,7 @@ func initSettings() {
 			(len(migrationValue) == 0 || stored.Value != migrationValue) {
 			item.Value = stored.Value
 		}
+		carryRenamedSetting(item, stored, settingMap)
 		_, err = op.HandleSettingItemHook(item)
 		if err != nil {
 			utils.Log.Errorf("failed to execute hook on %s: %+v", item.Key, err)
