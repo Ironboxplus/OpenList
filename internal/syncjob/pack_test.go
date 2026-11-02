@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -432,10 +433,10 @@ func TestPackFailureBeforeCommitKeepsOldManifest(t *testing.T) {
 	write(t, src, "d/f1.txt", "v2 edited")
 	write(t, src, "d/new.txt", "brand new")
 	// Packs go up one per file; the second one fails.
-	var puts int
+	var puts atomic.Int32 // the packs go up concurrently
 	drv.FailPut = func(path string) error {
 		if strings.HasPrefix(path, "/.oppack/p-") {
-			if puts++; puts == 2 {
+			if puts.Add(1) == 2 {
 				return fmt.Errorf("injected failure on %s", path)
 			}
 		}
@@ -734,10 +735,10 @@ func TestPackOrphanPacksAreRemovedAfterACommit(t *testing.T) {
 
 	write(t, src, "d/f1.txt", "v2 edited")
 	write(t, src, "d/new.txt", "brand new")
-	var puts int
+	var puts atomic.Int32 // the packs go up concurrently
 	drv.FailPut = func(path string) error {
 		if strings.HasPrefix(path, "/.oppack/p-") {
-			if puts++; puts == 2 {
+			if puts.Add(1) == 2 {
 				return fmt.Errorf("injected failure on %s", path)
 			}
 		}
