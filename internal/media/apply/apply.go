@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"path"
-	"sort"
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/media/identify"
@@ -174,14 +173,6 @@ func (o *Orchestrator) fillRequest(ctx context.Context, req *model.MediaSetReq, 
 	return nil
 }
 
-const maxEpisodes = 3000
-
-type fileRef struct {
-	rel       string // relative to the item path
-	name      string
-	dirSeason int
-}
-
 // mapEpisodes lists the item's directory (and its season directories, one
 // level) and pairs every episode-looking video with the provider's episode
 // info by season and number.
@@ -192,62 +183,19 @@ func (o *Orchestrator) mapEpisodes(ctx context.Context, itemPath string, tg *scr
 		byKey[[2]int{e.Season, e.Episode}] = e
 	}
 
-	top, err := o.Lister.List(ctx, itemPath)
+	files, err := identify.EpisodeFiles(func(rel string) ([]identify.Entry, error) {
+		return o.Lister.List(ctx, path.Join(itemPath, rel))
+	})
 	if err != nil {
 		return nil, fmt.Errorf("list %s: %w", itemPath, err)
 	}
-	var files []fileRef
-	var subdirs []identify.Entry
-	for _, e := range top {
-		switch {
-		case e.IsDir:
-			if !identify.IsExtraDir(e.Name) {
-				subdirs = append(subdirs, e)
-			}
-		case identify.IsVideo(e.Name):
-			files = append(files, fileRef{rel: e.Name, name: e.Name})
-		}
-	}
-	sort.Slice(subdirs, func(i, j int) bool { return subdirs[i].Name < subdirs[j].Name })
-	for i, d := range subdirs {
-		if i >= 30 {
-			break
-		}
-		if !identify.IsSeasonDir(d.Name) {
-			continue
-		}
-		kids, err := o.Lister.List(ctx, path.Join(itemPath, d.Name))
-		if err != nil {
-			return nil, fmt.Errorf("list %s: %w", d.Name, err)
-		}
-		for _, k := range kids {
-			if !k.IsDir && identify.IsVideo(k.Name) {
-				files = append(files, fileRef{rel: d.Name + "/" + k.Name, name: k.Name, dirSeason: identify.SeasonOfDir(d.Name)})
-			}
-		}
-	}
-	sort.Slice(files, func(i, j int) bool { return files[i].rel < files[j].rel })
-
-	var out []model.MediaEpisodeIn
+	out := make([]model.MediaEpisodeIn, 0, len(files))
 	for _, f := range files {
-		s, e, ok := identify.EpisodeOf(f.name)
-		if !ok {
-			continue
-		}
-		if s == 0 {
-			s = f.dirSeason
-		}
-		if s == 0 {
-			s = 1
-		}
-		ep := model.MediaEpisodeIn{FileName: f.rel, Season: s, Episode: e}
-		if in, found := byKey[[2]int{s, e}]; found {
+		ep := model.MediaEpisodeIn{FileName: f.Rel, Season: f.Season, Episode: f.Episode}
+		if in, found := byKey[[2]int{f.Season, f.Episode}]; found {
 			ep.Title, ep.Overview = in.Title, in.Overview
 		}
 		out = append(out, ep)
-		if len(out) >= maxEpisodes {
-			break
-		}
 	}
 	return out, ierr
 }

@@ -219,8 +219,12 @@ func CreateOrUpdateMediaItem(item *model.MediaItem) error {
 	if existing.Locked || existing.ScrapedAt != nil || existing.Source == model.MediaSourceManual {
 		keepScraped(item, &existing)
 	}
-	// 扫描不覆盖用户手动隐藏的状态
-	item.Hidden = existing.Hidden
+	// 扫描不覆盖用户手动隐藏的状态；被规则判为“忽略”而隐藏的条目，重新判定为作品后恢复显示
+	if existing.VideoType == model.VideoTypeIgnore && item.VideoType != model.VideoTypeIgnore {
+		item.Hidden = false
+	} else {
+		item.Hidden = existing.Hidden || item.Hidden
+	}
 	return db.Unscoped().Save(item).Error
 }
 
@@ -248,6 +252,11 @@ func keepScraped(item, existing *model.MediaItem) {
 	item.Season = existing.Season
 	item.Episode = existing.Episode
 	item.MediaCuration = existing.MediaCuration
+}
+
+// UpdateMediaItemEpisodes sets only the Episodes JSON of an item.
+func UpdateMediaItemEpisodes(id uint, episodes string) error {
+	return db.Unscoped().Model(&model.MediaItem{}).Where("id = ?", id).Update("episodes", episodes).Error
 }
 
 // UpdateMediaItem 更新媒体条目

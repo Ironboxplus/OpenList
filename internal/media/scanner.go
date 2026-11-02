@@ -253,15 +253,47 @@ func doScanPath(sp *model.MediaScanPath, p *ScanProgress) error {
 		return doScanMusicByAlbum(ctx, targets, sp, p)
 	}
 
-	for _, target := range targets {
+	// A video collection is followed into its works, so the queue can grow.
+	depth := map[string]int{}
+	queue := targets
+	for i := 0; i < len(queue); i++ {
+		target := queue[i]
 		item, err := buildMediaItemFromVFS(ctx, target, sp)
 		if err != nil {
 			log.Warnf("build media item error [%s]: %v", target, err)
 			continue
 		}
 
-		// 路径合并模式下，扫描文件夹内的文件，填充选集信息
-		if sp.PathMerge && item.IsFolder {
+		var scannedEpisodes []model.MediaEpisode
+		if sp.MediaType == model.MediaTypeVideo {
+			entries, r := identifyScanItem(ctx, target, item)
+			switch {
+			case item.IsFolder && model.IsEpisodicVideo(r.Kind):
+				if eps, err := scanEpisodes(ctx, target); err == nil {
+					scannedEpisodes = eps
+					item.Episodes = model.EpisodesJSON(eps)
+				} else {
+					log.Warnf("scan episodes error [%s]: %v", target, err)
+				}
+			case item.IsFolder && sp.PathMerge:
+				if episodes, err := buildEpisodesFromFolder(ctx, target, sp.MediaType); err == nil {
+					item.Episodes = episodes
+				} else {
+					log.Warnf("build episodes error [%s]: %v", target, err)
+				}
+			}
+			if r.Kind == model.VideoTypeCollection && depth[target] < maxCollectionDepth {
+				kids := collectionChildren(target, entries)
+				for _, k := range kids {
+					depth[k] = depth[target] + 1
+				}
+				queue = append(queue, kids...)
+				p.mu.Lock()
+				p.Total += len(kids)
+				p.mu.Unlock()
+			}
+		} else if sp.PathMerge && item.IsFolder {
+			// 路径合并模式下，扫描文件夹内的文件，填充选集信息
 			if episodes, err := buildEpisodesFromFolder(ctx, target, sp.MediaType); err == nil {
 				item.Episodes = episodes
 			} else {
@@ -274,6 +306,13 @@ func doScanPath(sp *model.MediaScanPath, p *ScanProgress) error {
 			p.mu.Lock()
 			p.Skipped++
 			p.mu.Unlock()
+		} else if scannedEpisodes != nil {
+			// keep the titles a scrape gave the episodes that are still there
+			if merged, err := db.SyncMediaEpisodes(item.ID, scannedEpisodes); err != nil {
+				log.Warnf("save episodes error [%s]: %v", target, err)
+			} else if err := db.UpdateMediaItemEpisodes(item.ID, model.EpisodesJSON(merged)); err != nil {
+				log.Warnf("save episode list error [%s]: %v", target, err)
+			}
 		}
 		p.mu.Lock()
 		p.Done++

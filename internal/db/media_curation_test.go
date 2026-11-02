@@ -221,3 +221,70 @@ func TestEpisodeInfosIndex(t *testing.T) {
 		t.Errorf("no episodes -> empty string")
 	}
 }
+
+func TestSyncMediaEpisodesKeepsScrapedTitles(t *testing.T) {
+	newCurationDB(t)
+	if err := db.AutoMigrate(&model.MediaEpisode{}); err != nil {
+		t.Fatal(err)
+	}
+	it := scanned("Show")
+	if err := CreateOrUpdateMediaItem(it); err != nil {
+		t.Fatal(err)
+	}
+	first := []model.MediaEpisode{{FileName: "e1.mkv", Season: 1, Episode: 1}, {FileName: "e2.mkv", Season: 1, Episode: 2}}
+	if _, err := SyncMediaEpisodes(it.ID, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReplaceMediaEpisodes(it.ID, []model.MediaEpisode{
+		{FileName: "e1.mkv", Season: 1, Episode: 1, Title: "Pilot", Overview: "o", Still: "s"},
+		{FileName: "e2.mkv", Season: 1, Episode: 2, Title: "Two"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// rescan: e2 is gone, e3 is new, e1 keeps what the scrape gave it
+	merged, err := SyncMediaEpisodes(it.ID, []model.MediaEpisode{
+		{FileName: "e1.mkv", Season: 1, Episode: 1}, {FileName: "e3.mkv", Season: 1, Episode: 3},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(merged) != 2 || merged[0].Title != "Pilot" || merged[0].Overview != "o" || merged[0].Still != "s" {
+		t.Errorf("merged = %+v", merged)
+	}
+	got, _ := ListMediaEpisodes(it.ID)
+	if len(got) != 2 || got[1].FileName != "e3.mkv" {
+		t.Errorf("stored = %+v", got)
+	}
+}
+
+func TestRescanUnhidesWhatIsNoLongerIgnored(t *testing.T) {
+	newCurationDB(t)
+	ost := scanned("OST")
+	ost.VideoType, ost.Hidden = model.VideoTypeIgnore, true
+	if err := CreateOrUpdateMediaItem(ost); err != nil {
+		t.Fatal(err)
+	}
+	again := scanned("OST") // now judged a movie
+	if err := CreateOrUpdateMediaItem(again); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := GetMediaItemByID(ost.ID); got.Hidden {
+		t.Errorf("an item that is no longer ignored must be shown again")
+	}
+
+	// a person's own hide survives every rescan
+	mine := scanned("Mine")
+	if err := CreateOrUpdateMediaItem(mine); err != nil {
+		t.Fatal(err)
+	}
+	mine.Hidden = true
+	if err := UpdateMediaItem(mine); err != nil {
+		t.Fatal(err)
+	}
+	if err := CreateOrUpdateMediaItem(scanned("Mine")); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := GetMediaItemByID(mine.ID); !got.Hidden {
+		t.Errorf("a hidden item must stay hidden")
+	}
+}
