@@ -334,8 +334,7 @@ func (d *Yun139) getFiles(catalogID string) ([]model.Obj, error) {
 					Modified: getTime(content.UpdateTime),
 					HashInfo: utils.NewHashInfo(utils.MD5, content.Digest),
 				},
-				Thumbnail: model.Thumbnail{Thumbnail: content.ThumbnailURL},
-				// Thumbnail: content.BigthumbnailURL,
+				Thumbnail: model.Thumbnail{Thumbnail: d.pickThumbnail(content.ThumbnailURL, content.BigthumbnailURL)},
 			}
 			files = append(files, &f)
 		}
@@ -345,6 +344,16 @@ func (d *Yun139) getFiles(catalogID string) ([]model.Obj, error) {
 		start += limit
 	}
 	return files, nil
+}
+
+// pickThumbnail returns the large thumbnail URL when UseLargeThumbnail is
+// enabled and the API provided one, otherwise it falls back to the regular
+// thumbnail URL.
+func (d *Yun139) pickThumbnail(thumbnailURL, bigThumbnailURL string) string {
+	if d.UseLargeThumbnail && bigThumbnailURL != "" {
+		return bigThumbnailURL
+	}
+	return thumbnailURL
 }
 
 func (d *Yun139) newJson(data map[string]interface{}) base.Json {
@@ -407,8 +416,7 @@ func (d *Yun139) familyGetFiles(catalogID string) ([]model.Obj, error) {
 					Ctime:    getTime(content.CreateTime),
 					Path:     path, // 文件所在目录的Path
 				},
-				Thumbnail: model.Thumbnail{Thumbnail: content.ThumbnailURL},
-				// Thumbnail: content.BigthumbnailURL,
+				Thumbnail: model.Thumbnail{Thumbnail: d.pickThumbnail(content.ThumbnailURL, content.BigthumbnailURL)},
 			}
 			files = append(files, &f)
 		}
@@ -462,8 +470,7 @@ func (d *Yun139) groupGetFiles(catalogID string) ([]model.Obj, error) {
 					Ctime:    getTime(content.CreateTime),
 					Path:     path, // 文件所在目录的Path
 				},
-				Thumbnail: model.Thumbnail{Thumbnail: content.ThumbnailURL},
-				// Thumbnail: content.BigthumbnailURL,
+				Thumbnail: model.Thumbnail{Thumbnail: d.pickThumbnail(content.ThumbnailURL, content.BigthumbnailURL)},
 			}
 			files = append(files, &f)
 		}
