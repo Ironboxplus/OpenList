@@ -118,3 +118,10 @@ jobs:
           path: ${{ runner.temp }}/bb-tail.log
           retention-days: 7
           if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: log-cluster-blackbox-nodes
+          path: ${{ runner.temp }}/cluster-bb/**/stdout.log
+          retention-days: 3
+          if-no-files-found: ignore
