@@ -689,6 +689,9 @@ func (d *Yun139) Put(ctx context.Context, dstDir model.Obj, stream model.FileStr
 	if d.isShare() {
 		return errs.NotImplement
 	}
+	if d.Addition.Type == MetaPersonalNew && d.ParallelUpload {
+		return d.putPersonalNewParallel(ctx, dstDir, stream, up)
+	}
 	// PersonalNew 以及 Group/Family 在非旧流模式时走新上传路径
 	if d.Addition.Type == MetaPersonalNew ||
 		((d.isGroup() || d.isFamily()) && !d.UseOldStreamUpload) {

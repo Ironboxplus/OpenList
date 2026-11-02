@@ -21,6 +21,8 @@ type Addition struct {
 	ReportRealSize       bool   `json:"report_real_size" type:"bool" default:"true" help:"Enable to report the real file size during upload"`
 	UseLargeThumbnail    bool   `json:"use_large_thumbnail" type:"bool" default:"false" help:"Enable to use large thumbnail for images"`
 	UseOldStreamUpload   bool   `json:"use_old_stream_upload" type:"bool" default:"false" help:"Enable to use old stream upload method (not support rapid upload)"`
+	ParallelUpload       bool   `json:"parallel_upload" type:"bool" default:"false" help:"personal_new only. Upload parts concurrently the way the official client does. Always buffers the file to the temp dir first, and needs a part size that is a multiple of 64 bytes."`
+	UploadThread         int    `json:"upload_thread" type:"number" default:"3" help:"Number of concurrent part uploads, only used when parallel_upload is enabled."`
 	ClientType           string `json:"client_type" type:"select" options:"web,pc" default:"web" help:"Client type reported to the personal cloud API. web (9) allows uploading files up to 50 GB; pc (13) raises the single file upload limit to 500 GB."`
 }
 
