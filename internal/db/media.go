@@ -106,61 +106,79 @@ type MediaItemQuery struct {
 	PageSize   int
 }
 
+// tableOf 返回模型的真实表名（带 conf.Database.TablePrefix，不能硬编码）
+func tableOf(v interface{}) string {
+	stmt := &gorm.Statement{DB: db}
+	if err := stmt.Parse(v); err != nil {
+		return ""
+	}
+	return stmt.Schema.Table
+}
+
+// mediaItemCol 返回带表名限定的 media_items 列，联表时避免列名歧义
+func mediaItemCol(col string) string {
+	return quoteIdent(tableOf(&model.MediaItem{})) + "." + quoteIdent(col)
+}
+
 // mediaItemsWhere 把查询条件套到 tx 上（不含排序和分页）
 func mediaItemsWhere(tx *gorm.DB, q MediaItemQuery) *gorm.DB {
 	if q.MediaType != "" {
-		tx = tx.Where("media_type = ?", q.MediaType)
+		tx = tx.Where(mediaItemCol("media_type")+" = ?", q.MediaType)
 	}
 	if q.ScanPathID > 0 {
-		tx = tx.Where("scan_path_id = ?", q.ScanPathID)
+		tx = tx.Where(mediaItemCol("scan_path_id")+" = ?", q.ScanPathID)
 	}
 	if q.FolderPath != "" {
-		tx = tx.Where("folder_path = ?", q.FolderPath)
+		tx = tx.Where(mediaItemCol("folder_path")+" = ?", q.FolderPath)
 	}
 	if q.PathPrefix != "" {
 		prefix := strings.TrimSuffix(q.PathPrefix, "/") + "/"
 		// an item directly in the base path has folder_path equal to it, which counts too
-		tx = tx.Where(`(folder_path = ? OR folder_path LIKE ? ESCAPE '\')`, strings.TrimSuffix(q.PathPrefix, "/"), escapeLike(prefix)+"%")
+		fp := mediaItemCol("folder_path")
+		tx = tx.Where("("+fp+` = ? OR `+fp+` LIKE ? ESCAPE '\')`, strings.TrimSuffix(q.PathPrefix, "/"), escapeLike(prefix)+"%")
 	}
 	if q.Hidden != nil {
-		tx = tx.Where("hidden = ?", *q.Hidden)
+		tx = tx.Where(mediaItemCol("hidden")+" = ?", *q.Hidden)
 	}
 	if len(q.Kinds) > 0 {
-		tx = tx.Where("video_type IN ?", q.Kinds)
+		tx = tx.Where(mediaItemCol("video_type")+" IN ?", q.Kinds)
 	}
 	if q.Keyword != "" {
 		like := "%" + q.Keyword + "%"
-		tx = tx.Where("file_name LIKE ? OR scraped_name LIKE ?", like, like)
+		tx = tx.Where(mediaItemCol("file_name")+" LIKE ? OR "+mediaItemCol("scraped_name")+" LIKE ?", like, like)
 	}
-	// 按类型标签筛选（通过关联扫描路径的type_tag）
-	if q.TypeTag != "" {
-		tx = tx.Joins("JOIN media_scan_paths ON media_scan_paths.id = media_items.scan_path_id").
-			Where("media_scan_paths.type_tag = ?", q.TypeTag)
-	}
-	// 按内容标签筛选（通过关联扫描路径的content_tags）
-	if q.ContentTag != "" {
-		tx = tx.Joins("JOIN media_scan_paths ON media_scan_paths.id = media_items.scan_path_id").
-			Where("media_scan_paths.content_tags LIKE ?", "%"+q.ContentTag+"%")
+	if q.TypeTag != "" || q.ContentTag != "" {
+		items := quoteIdent(tableOf(&model.MediaItem{}))
+		paths := quoteIdent(tableOf(&model.MediaScanPath{}))
+		tx = tx.Joins("JOIN " + paths + " ON " + paths + ".id = " + items + ".scan_path_id")
+		// 按类型标签筛选（通过关联扫描路径的type_tag）
+		if q.TypeTag != "" {
+			tx = tx.Where(paths+".type_tag = ?", q.TypeTag)
+		}
+		// 按内容标签筛选（通过关联扫描路径的content_tags）
+		if q.ContentTag != "" {
+			tx = tx.Where(paths+".content_tags LIKE ?", "%"+q.ContentTag+"%")
+		}
 	}
 	return tx
 }
 
 // mediaItemsOrder 按 q 的排序键排序；id 作为兜底，保证分页稳定
 func mediaItemsOrder(tx *gorm.DB, q MediaItemQuery) *gorm.DB {
-	orderCol := "created_at"
+	orderCol := mediaItemCol("created_at")
 	switch q.OrderBy {
 	case "name":
-		orderCol = "COALESCE(NULLIF(scraped_name,''), file_name)"
+		orderCol = "COALESCE(NULLIF(" + mediaItemCol("scraped_name") + ",''), " + mediaItemCol("file_name") + ")"
 	case "date":
-		orderCol = "release_date"
+		orderCol = mediaItemCol("release_date")
 	case "size":
-		orderCol = "file_size"
+		orderCol = mediaItemCol("file_size")
 	}
 	dir := "asc"
 	if q.OrderDir == "desc" {
 		dir = "desc"
 	}
-	return tx.Order(orderCol + " " + dir).Order("media_items.id asc")
+	return tx.Order(orderCol + " " + dir).Order(mediaItemCol("id") + " asc")
 }
 
 // ListMediaItems 分页查询媒体条目

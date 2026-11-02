@@ -52,3 +52,65 @@ func TestListMediaItemsFilteredPagesAfterFilteringAcrossBatches(t *testing.T) {
 		}
 	}
 }
+
+// With a table prefix the media_items table is not literally named
+// "media_items"; every query, including the scan path JOIN and the id
+// tiebreaker of the ordering, has to use the real names.
+func TestListMediaItemsHonorsTablePrefix(t *testing.T) {
+	for _, prefix := range []string{"x_", "ol_", ""} {
+		t.Run("prefix="+prefix, func(t *testing.T) {
+			db = openTestDB(t, prefix)
+			if err := db.AutoMigrate(&model.MediaScanPath{}, &model.MediaItem{}); err != nil {
+				t.Fatal(err)
+			}
+			sp := &model.MediaScanPath{MediaType: model.MediaTypeVideo, Name: "films", Path: "/films", TypeTag: "movie", ContentTags: "comedy,thriller"}
+			if err := db.Create(sp).Error; err != nil {
+				t.Fatal(err)
+			}
+			other := &model.MediaScanPath{MediaType: model.MediaTypeVideo, Name: "other", Path: "/other", TypeTag: "tv"}
+			if err := db.Create(other).Error; err != nil {
+				t.Fatal(err)
+			}
+			for i, name := range []string{"a", "b", "c"} {
+				it := &model.MediaItem{MediaType: model.MediaTypeVideo, ScanPathID: sp.ID, FolderPath: "/films/x", FileName: name, ScrapedName: name, FileSize: int64(i)}
+				it.VideoType = model.MediaKindMovie
+				if err := db.Create(it).Error; err != nil {
+					t.Fatal(err)
+				}
+			}
+			it := &model.MediaItem{MediaType: model.MediaTypeVideo, ScanPathID: other.ID, FolderPath: "/other", FileName: "d", ScrapedName: "d"}
+			it.VideoType = model.MediaKindTV
+			if err := db.Create(it).Error; err != nil {
+				t.Fatal(err)
+			}
+
+			cases := []struct {
+				name string
+				q    MediaItemQuery
+				want int64
+			}{
+				{"plain", MediaItemQuery{MediaType: model.MediaTypeVideo}, 4},
+				{"type tag", MediaItemQuery{MediaType: model.MediaTypeVideo, TypeTag: "movie"}, 3},
+				{"content tag", MediaItemQuery{MediaType: model.MediaTypeVideo, ContentTag: "thriller"}, 3},
+				{"both tags", MediaItemQuery{MediaType: model.MediaTypeVideo, TypeTag: "movie", ContentTag: "comedy"}, 3},
+				{"path prefix", MediaItemQuery{MediaType: model.MediaTypeVideo, PathPrefix: "/films"}, 3},
+				{"keyword", MediaItemQuery{MediaType: model.MediaTypeVideo, Keyword: "b"}, 1},
+				{"kinds", MediaItemQuery{MediaType: model.MediaTypeVideo, Kinds: []string{model.MediaKindTV}}, 1},
+				{"scan path", MediaItemQuery{MediaType: model.MediaTypeVideo, ScanPathID: sp.ID}, 3},
+			}
+			for _, c := range cases {
+				for _, order := range []string{"", "name", "date", "size"} {
+					q := c.q
+					q.OrderBy, q.OrderDir = order, "desc"
+					items, total, err := ListMediaItems(q)
+					if err != nil {
+						t.Fatalf("%s order %q: %v", c.name, order, err)
+					}
+					if total != c.want || int64(len(items)) != c.want {
+						t.Fatalf("%s order %q: total %d len %d, want %d", c.name, order, total, len(items), c.want)
+					}
+				}
+			}
+		})
+	}
+}
