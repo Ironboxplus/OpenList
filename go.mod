@@ -246,6 +246,7 @@ require (
 	github.com/mikelolasagasti/xz v1.0.1 // indirect
 	github.com/minio/minlz v1.2.0 // indirect
 	github.com/minio/sha256-simd v1.0.1 // indirect
+	github.com/minio/sio v0.5.1
 	github.com/minio/xxml v0.0.3 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/moby/sys/mountinfo v0.7.2 // indirect
