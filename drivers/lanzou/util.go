@@ -313,7 +313,19 @@ var findSubFolderReg = regexp.MustCompile(`(?i)(?:folderlink|mbxfolder).+href="/
 var findDownPageParamReg = regexp.MustCompile(`<iframe.*?src="(.+?)"`)
 
 // 获取文件ID
-var findFileIDReg = regexp.MustCompile(`'/ajax(?:file|m)\.php\?file=(\d+)'`)
+// The ajax endpoint on a share page is either relative or a full URL (the
+// password file page hands out an absolute apifile address).
+var findFileIDReg = regexp.MustCompile(`'((?:https?://[^'"\s]+)?/ajax(?:file|m)\.php\?file=(\d+))'`)
+
+// ajaxURLFromMatch turns a findFileIDReg match into the request URL: an
+// absolute endpoint is kept as it is, a relative one is resolved against the
+// configured share URL.
+func ajaxURLFromMatch(match []string, shareURL string) string {
+	if strings.HasPrefix(strings.ToLower(match[1]), "http") {
+		return match[1]
+	}
+	return shareURL + match[1]
+}
 
 // 2026-10 改版：文件页将下载参数移入 /fn? 内页，接口变为 apifile 绝对地址并携带签名
 var (
@@ -446,7 +458,7 @@ func (d *LanZou) getFilesByShareUrl(shareID, pwd string, sharePageData string) (
 		if len(matches) < 2 {
 			return nil, fmt.Errorf("not find file id")
 		}
-		ajaxUrl := d.ShareUrl + matches[0][1:len(matches[0])-1]
+		ajaxUrl := ajaxURLFromMatch(matches, d.ShareUrl)
 		var resp FileShareInfoAndUrlResp[string]
 		_, err = d.post(ajaxUrl, func(req *resty.Request) { req.SetFormData(param) }, &resp)
 		if err != nil {
@@ -476,7 +488,7 @@ func (d *LanZou) getFilesByShareUrl(shareID, pwd string, sharePageData string) (
 			if err != nil {
 				return nil, err
 			}
-			ajaxUrl := d.ShareUrl + matches[0][1:len(matches[0])-1]
+			ajaxUrl := ajaxURLFromMatch(matches, d.ShareUrl)
 			_, err = d.post(ajaxUrl, func(req *resty.Request) { req.SetFormData(param) }, &resp)
 		} else if fnUrl, fnForm, ferr := parseFnPage(nextPageData); ferr == nil {
 			// 2026-10 改版结构：/fn? 内页携带 apifile 绝对地址与签名参数
