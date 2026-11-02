@@ -873,13 +873,6 @@ func (s *store) revokePair(id *identity, groupID, mount, hash string, at int64) 
 	return &cp, true
 }
 
-// pairRevoked reports whether a group-wide tombstone exists for the pair.
-func (s *store) pairRevoked(groupID, hash string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.pairRevokedLocked(groupID, hash)
-}
-
 func (s *store) pairRevokedLocked(groupID, hash string) bool {
 	if hash == "" {
 		return false

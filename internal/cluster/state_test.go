@@ -698,7 +698,7 @@ func TestDesiredCandidateSkipsCurrentAndQuarantinedCredentials(t *testing.T) {
 	}}}, 1)
 	m := &Manager{id: local, state: s}
 	failing := model.Storage{Driver: "115 Open", MountPath: "/local", Status: "token invalid", Addition: `{"access_token":"B"}`}
-	got, _ := m.desiredCandidate("g1", "/local", failing)
+	got := m.desiredCandidate("g1", "/local", failing)
 	if got == nil || got.CredHash != credHash(map[string]json.RawMessage{"access_token": json.RawMessage(`"C"`)}) {
 		t.Fatalf("desired candidate = %#v, want only remaining C candidate", got)
 	}
@@ -1369,11 +1369,11 @@ func TestReconcileRejectsVersionRegression(t *testing.T) {
 			wantProbes:       1,
 		},
 		{
-			name:             "uncatalogued working pair waits for its record",
+			name:             "no catalog record permits candidate",
 			catalogVersion:   0,
 			candidateVersion: 1,
-			wantAttempted:    false,
-			wantProbes:       0,
+			wantAttempted:    true,
+			wantProbes:       1,
 		},
 	}
 

@@ -140,15 +140,7 @@ func (m *Manager) reconcile(q workqueue.TypedRateLimitingInterface[string], key 
 	}
 	before := *d.GetStorage() // also the rollback point
 
-	want, settling := m.desiredCandidate(groupID, mount, before)
-	if settling {
-		// The mount is working on a pair the catalogue does not know yet: a local
-		// refresh whose record is still being minted. Its version is unknown, so
-		// any catalogued candidate could be an older, already consumed pair.
-		// Look again once the record exists.
-		q.AddRateLimited(key)
-		return
-	}
+	want := m.desiredCandidate(groupID, mount, before)
 	if want == nil {
 		if before.Status == op.WORK {
 			q.Forget(key)
@@ -228,20 +220,15 @@ func (m *Manager) mountInGroup(groupID, mount string) bool {
 //     self-authored echo, and never a version not above its current pair's
 //     (115 rotates the refresh_token on use: a lower version is a dead pair that
 //     still probes clean until its access_token lapses).
-//
-// settling is true when a WORK mount runs a pair that is neither catalogued nor
-// revoked: nothing can be said about candidates until its record exists.
-func (m *Manager) desiredCandidate(groupID, mount string, st model.Storage) (best *credRecord, settling bool) {
+func (m *Manager) desiredCandidate(groupID, mount string, st model.Storage) *credRecord {
 	var currentVer uint64
 	haveCurrent := false
 	if st.Status == op.WORK {
-		curHash := credHash(extractCreds(st.Addition))
-		if cur, ok := m.state.credByHash(groupID, curHash); ok {
+		if cur, ok := m.state.credByHash(groupID, credHash(extractCreds(st.Addition))); ok {
 			currentVer, haveCurrent = cur.Version, true
-		} else if curHash != "" && !m.state.pairRevoked(groupID, curHash) {
-			return nil, true
 		}
 	}
+	var best *credRecord
 	for _, r := range m.state.credsForGroup(groupID) {
 		if !m.credentialAuthorized(r) || m.state.candidateFailed(groupID, mount, r.CredHash) {
 			continue
@@ -259,7 +246,7 @@ func (m *Manager) desiredCandidate(groupID, mount string, st model.Storage) (bes
 			best = r
 		}
 	}
-	return best, false
+	return best
 }
 
 // rejectCandidate records a provider 401 on a candidate: tombstone first,
