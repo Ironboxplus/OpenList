@@ -171,6 +171,54 @@ func isNoiseToken(p string) bool {
 	return noiseTokenWholeRe.MatchString(p)
 }
 
+var fullYearRe = regexp.MustCompile(`^(?:19|20)\d{2}$`)
+
+// splitLeadingYear handles release names that start with the year
+// ("1995.Toy.Story.1920x1080.BDRip"): the first field is the year and the
+// title is what follows, up to the first release-noise field. If a different
+// year follows ("2001.A.Space.Odyssey.1968", "1917.2019.1080p") the first
+// field belongs to the title and the later year is the year. The fields to
+// parse are returned; result.Year or englishParts are filled as needed.
+// (Fix 120c6cd9, re-applied on the upstream parser.)
+func splitLeadingYear(parts []string, result *parsedVideoTitle, english *[]string) []string {
+	var fields []string
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			fields = append(fields, p)
+		}
+	}
+	if len(fields) < 2 || !fullYearRe.MatchString(fields[0]) {
+		return parts
+	}
+	rest := fields[1:]
+	titleLeft, other := false, false
+	for _, p := range rest {
+		switch {
+		case fullYearRe.MatchString(p):
+			other = other || p != fields[0]
+		case isNoiseToken(p):
+		default:
+			titleLeft = true
+		}
+	}
+	if other {
+		*english = append(*english, fields[0])
+		return rest
+	}
+	if !titleLeft {
+		return parts
+	}
+	result.Year = fields[0]
+	// the title ends where the release noise starts
+	for i, p := range rest {
+		if isNoiseToken(p) || fullYearRe.MatchString(p) {
+			// keep one field of noise so foundYear logic stays out of the way
+			return append(append([]string(nil), rest[:i]...), "")
+		}
+	}
+	return rest
+}
+
 // extractBracketChinese 从原始文件名中提取出方括号/中文括号里的中文片段
 //
 //	"01 [钢铁侠]Iron.Man.2008..."          -> ["钢铁侠"]
@@ -261,6 +309,7 @@ func parseVideoFileName(fileName string) parsedVideoTitle {
 
 	var result parsedVideoTitle
 	var englishParts []string
+	parts = splitLeadingYear(parts, &result, &englishParts)
 	var chineseParts []string // 收集所有中文片段，便于兜底
 	foundYear := false
 	foundChinese := false // 一旦出现中文片段，后面的非中文片段都不再加入英文标题
