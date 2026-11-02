@@ -143,6 +143,11 @@ type Config struct {
 	MCP                   MCP         `json:"mcp" envPrefix:"MCP_"`
 	LastLaunchedVersion   string      `json:"last_launched_version"`
 	ProxyAddress          string      `json:"proxy_address" env:"PROXY_ADDRESS"`
+	// TrustedProxies are the addresses/CIDRs whose X-Forwarded-For / X-Real-IP
+	// the server believes. A client that connects from anywhere else cannot
+	// choose its own IP with a header. Default: loopback and private ranges
+	// (a reverse proxy on the same host or LAN). Put a public load balancer here.
+	TrustedProxies []string `json:"trusted_proxies" env:"TRUSTED_PROXIES" envSeparator:","`
 }
 
 func DefaultConfig(dataDir string) *Config {
@@ -151,6 +156,7 @@ func DefaultConfig(dataDir string) *Config {
 	logPath := filepath.Join(dataDir, "log/log.log")
 	dbPath := filepath.Join(dataDir, "data.db")
 	return &Config{
+		TrustedProxies: []string{"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7", "fe80::/10"},
 		Scheme: Scheme{
 			Address:    "0.0.0.0",
 			UnixFile:   "",

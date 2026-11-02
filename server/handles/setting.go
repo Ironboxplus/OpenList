@@ -36,6 +36,11 @@ func GetSetting(c *gin.Context) {
 			common.ErrorResp(c, err, 400)
 			return
 		}
+		if secretSettingKeys[item.Key] {
+			masked := *item
+			masked.Value = ""
+			item = &masked
+		}
 		common.SuccessResp(c, item)
 	} else {
 		items, err := op.GetSettingItemInKeys(strings.Split(keys, ","))
@@ -43,6 +48,8 @@ func GetSetting(c *gin.Context) {
 			common.ErrorResp(c, err, 400)
 			return
 		}
+		items = append([]model.SettingItem(nil), items...)
+		maskSecretSettings(items)
 		common.SuccessResp(c, items)
 	}
 }
@@ -53,7 +60,8 @@ func SaveSettings(c *gin.Context) {
 		common.ErrorResp(c, err, 400)
 		return
 	}
-	if err := op.SaveSettingItems(req); err != nil {
+	// secret settings (frp) are changed through their own API only
+	if err := op.SaveSettingItems(dropSecretSettings(req)); err != nil {
 		common.ErrorResp(c, err, 500)
 	} else {
 		common.SuccessResp(c)
@@ -90,6 +98,8 @@ func ListSettings(c *gin.Context) {
 		common.ErrorResp(c, err, 400)
 		return
 	}
+	settings = append([]model.SettingItem(nil), settings...) // the cache's slice is shared
+	maskSecretSettings(settings)
 	common.SuccessResp(c, settings)
 }
 

@@ -392,6 +392,21 @@ videotoolbox = macOS 硬件加速`},
 		{Key: conf.TranscodeChunkPrefetch, Value: "true", Type: conf.TypeBool, Group: model.TRANSCODE, Flag: model.PRIVATE,
 			Help: `当前 chunk 转码进度过半时，是否预启动下一个 chunk（默认开启，可让顺序播放无缝衔接）`},
 
+		// frp: built-in tunnel client. Changed through /api/admin/frp, which restarts the client.
+		{Key: conf.FRPEnabled, Value: "false", Type: conf.TypeBool, Group: model.FRP, Flag: model.PRIVATE,
+			Help: `Run the built-in frp client. Off by default.`},
+		{Key: conf.FRPServerAddr, Value: "", Type: conf.TypeString, Group: model.FRP, Flag: model.PRIVATE},
+		{Key: conf.FRPServerPort, Value: "7000", Type: conf.TypeNumber, Group: model.FRP, Flag: model.PRIVATE},
+		{Key: conf.FRPTLSEnable, Value: "true", Type: conf.TypeBool, Group: model.FRP, Flag: model.PRIVATE,
+			Help: `Encrypt the connection to the frp server. Leave on: the token is sent during login.`},
+		{Key: conf.FRPAuthToken, Value: "", Type: conf.TypeString, Group: model.FRP, Flag: model.PRIVATE,
+			Help: `Secret. Never shown again after it is saved; set it through the frp page.`},
+		{Key: conf.FRPProxies, Value: "[]", Type: conf.TypeText, Group: model.FRP, Flag: model.PRIVATE},
+		{Key: conf.FRPProxySecrets, Value: "{}", Type: conf.TypeText, Group: model.FRP, Flag: model.PRIVATE,
+			Help: `Secret. Never shown again after it is saved.`},
+		{Key: conf.FRPExposeCluster, Value: "false", Type: conf.TypeBool, Group: model.FRP, Flag: model.PRIVATE,
+			Help: `Let the tunnels reach /api/cluster (the node-to-node websocket). Off: it answers 404 through frp.`},
+
 		// multipart upload settings (from main)
 		{Key: conf.MultipartEnabled, Value: "true", Type: conf.TypeBool, Group: model.TRAFFIC, Flag: model.PUBLIC},
 		{Key: conf.MultipartChunkSize, Value: "10", Type: conf.TypeNumber, Group: model.TRAFFIC, Flag: model.PUBLIC, Help: `chunk size of multipart upload in MB (positive integer), keep it under your CDN's request body limit; each active session buffers up to 8 chunks on the server's disk`},

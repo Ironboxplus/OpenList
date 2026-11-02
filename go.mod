@@ -39,6 +39,8 @@ require (
 	github.com/disintegration/imaging v1.6.2
 	github.com/dlclark/regexp2 v1.12.0
 	github.com/dustinxie/ecc v0.0.0-20210511000915-959544187564
+	github.com/fatedier/frp v0.71.1
+	github.com/fatedier/golib v0.8.2
 	github.com/fclairamb/ftpserverlib v0.26.1-0.20250709223522-4a925d79caf6
 	github.com/foxxorcat/mopan-sdk-go v0.1.6
 	github.com/foxxorcat/weiyun-sdk-go v0.1.4
@@ -68,6 +70,7 @@ require (
 	github.com/natefinch/lumberjack v2.0.0+incompatible
 	github.com/ncw/swift/v2 v2.0.5
 	github.com/nwaples/rardecode/v2 v2.4.1
+	github.com/pires/go-proxyproto v0.16.0
 	github.com/pkg/errors v0.9.1
 	github.com/pkg/sftp v1.13.11
 	github.com/pquerna/otp v1.5.0
@@ -109,6 +112,7 @@ require (
 require (
 	filippo.io/edwards25519 v1.1.0 // indirect
 	github.com/Azure/azure-sdk-for-go/sdk/internal v1.12.0 // indirect
+	github.com/Azure/go-ntlmssp v0.1.1 // indirect
 	github.com/BurntSushi/toml v1.6.0 // indirect
 	github.com/Max-Sum/base32768 v0.0.0-20230304063302-18e6ce5945fd // indirect
 	github.com/OpenListTeam/gsync v0.1.0 // indirect
@@ -127,6 +131,7 @@ require (
 	github.com/andybalholm/brotli v1.2.2 // indirect
 	github.com/andybalholm/cascadia v1.3.4 // indirect
 	github.com/apache/arrow-go/v18 v18.7.0 // indirect
+	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5 // indirect
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/aymerick/douceur v0.2.0 // indirect
 	github.com/benbjohnson/clock v1.3.0 // indirect
@@ -169,6 +174,7 @@ require (
 	github.com/cloudflare/circl v1.6.4 // indirect
 	github.com/cloudsoda/sddl v0.0.0-20250224235906-926454e91efc // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
+	github.com/coreos/go-oidc/v3 v3.18.0 // indirect
 	github.com/coreos/go-semver v0.3.1 // indirect
 	github.com/coreos/go-systemd/v22 v22.6.0 // indirect
 	github.com/crackcomm/go-gitignore v0.0.0-20170627025303-887ab5e44cc3 // indirect
@@ -180,6 +186,7 @@ require (
 	github.com/emersion/go-message v0.18.2 // indirect
 	github.com/emersion/go-vcard v0.0.0-20260618161152-d854b7e0e2d3 // indirect
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
+	github.com/fatedier/yamux v0.2.0 // indirect
 	github.com/fclairamb/go-log v0.6.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.3 // indirect
 	github.com/gabriel-vasile/mimetype v1.4.13 // indirect
@@ -189,6 +196,7 @@ require (
 	github.com/go-chi/chi/v5 v5.3.1 // indirect
 	github.com/go-darwin/apfs v0.0.0-20211011131704-f84b94dbf348 // indirect
 	github.com/go-git/go-billy/v5 v5.9.0 // indirect
+	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/go-playground/locales v0.14.1 // indirect
@@ -205,6 +213,7 @@ require (
 	github.com/google/flatbuffers v25.12.19+incompatible // indirect
 	github.com/google/go-tpm v0.9.8 // indirect
 	github.com/gorilla/css v1.0.1 // indirect
+	github.com/gorilla/mux v1.8.1 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
 	github.com/hashicorp/go-uuid v1.0.3 // indirect
 	github.com/hashicorp/go-version v1.6.0 // indirect
@@ -230,6 +239,7 @@ require (
 	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/klauspost/pgzip v1.2.6 // indirect
+	github.com/klauspost/reedsolomon v1.12.0 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/lanrat/extsort v1.4.2 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
@@ -286,13 +296,18 @@ require (
 	github.com/rfjakob/eme v1.2.0 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/ryszard/goskiplist v0.0.0-20150312221310-2dfbae5fcf46 // indirect
+	github.com/samber/lo v1.53.0 // indirect
 	github.com/shabbyrobe/gocovmerge v0.0.0-20230507112040-c3350d9342df // indirect
 	github.com/skratchdot/open-golang v0.0.0-20200116055534-eef842397966 // indirect
+	github.com/songgao/water v0.0.0-20200317203138-2b4b6d7c09d8 // indirect
 	github.com/sorairolake/lzip-go v0.3.8 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/stangelandcl/ppmd v0.1.1 // indirect
 	github.com/taruti/bytepool v0.0.0-20160310082835-5e3a9ea56543 // indirect
+	github.com/templexxx/cpu v0.1.1 // indirect
+	github.com/templexxx/xorsimd v0.4.3 // indirect
 	github.com/tinylib/msgp v1.6.4 // indirect
+	github.com/tjfoc/gmsm v1.4.1 // indirect
 	github.com/tklauser/go-sysconf v0.4.0 // indirect
 	github.com/tklauser/numcpus v0.12.0 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
@@ -300,8 +315,11 @@ require (
 	github.com/ugorji/go/codec v1.3.1 // indirect
 	github.com/ulikunitz/xz v0.5.15 // indirect
 	github.com/unknwon/goconfig v1.0.0 // indirect
+	github.com/vishvananda/netlink v1.3.0 // indirect
+	github.com/vishvananda/netns v0.0.4 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
+	github.com/xtaci/kcp-go/v5 v5.6.13 // indirect
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
@@ -309,15 +327,19 @@ require (
 	go.etcd.io/bbolt v1.5.0 // indirect
 	go.mongodb.org/mongo-driver v1.17.9 // indirect
 	go.mongodb.org/mongo-driver/v2 v2.5.0 // indirect
+	go.yaml.in/yaml/v2 v2.4.4 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/arch v0.23.0 // indirect
 	golang.org/x/exp v0.0.0-20260813180055-c1d0aacb2297 // indirect
 	golang.org/x/term v0.47.0 // indirect
 	golang.org/x/tools v0.52.0 // indirect
+	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
+	golang.zx2c4.com/wireguard v0.0.0-20231211153847-12269c276173 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260817212433-ac3dfec99bb1 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/asn1-ber.v1 v1.0.0-20181015200546-f715ec2f112d // indirect
 	gopkg.in/go-jose/go-jose.v2 v2.6.3 // indirect
+	gopkg.in/ini.v1 v1.67.3 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	k8s.io/apimachinery v0.37.2 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
@@ -329,6 +351,8 @@ require (
 	modernc.org/sqlite v1.61.0 // indirect
 	moul.io/http2curl/v2 v2.3.0 // indirect
 	resty.dev/v3 v3.0.0-beta.2 // indirect
+	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect
+	sigs.k8s.io/yaml v1.6.0 // indirect
 )
 
 replace github.com/ProtonMail/go-proton-api => github.com/henrybear327/go-proton-api v1.0.0

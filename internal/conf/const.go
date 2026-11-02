@@ -54,6 +54,15 @@ const (
 	WebauthnLoginEnabled    = "webauthn_login_enabled"
 	MaxDevices              = "max_devices"
 	DeviceEvictPolicy       = "device_evict_policy"
+	// frp (built-in client, internal/frp)
+	FRPEnabled       = "frp_enabled"
+	FRPServerAddr    = "frp_server_addr"
+	FRPServerPort    = "frp_server_port"
+	FRPTLSEnable     = "frp_tls_enable"
+	FRPAuthToken     = "frp_auth_token"    // secret
+	FRPProxies       = "frp_proxies"       // JSON list, no secrets
+	FRPProxySecrets  = "frp_proxy_secrets" // secret: JSON {proxy name: stcp secret key}
+	FRPExposeCluster = "frp_expose_cluster"
 	DeviceSessionTTL        = "device_session_ttl"
 	SharePwdMaxAttempts     = "share_pwd_max_attempts"
 	SharePwdLockSeconds     = "share_pwd_lock_seconds"

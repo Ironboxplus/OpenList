@@ -99,6 +99,16 @@ func IsRunning(t string) bool {
 	return running
 }
 
+// applyTrustedProxies makes the engine believe forwarding headers only from the
+// configured proxies. gin's default is "everyone", which lets any client pick
+// its own IP (and with it dodge every per-IP limit).
+func applyTrustedProxies(r *gin.Engine) {
+	if err := r.SetTrustedProxies(conf.Conf.TrustedProxies); err != nil {
+		utils.Log.Errorf("invalid trusted_proxies %v, trusting no proxy: %v", conf.Conf.TrustedProxies, err)
+		_ = r.SetTrustedProxies(nil)
+	}
+}
+
 func Start() {
 	if conf.Conf.DelayedStart != 0 {
 		utils.Log.Infof("delayed start for %d seconds", conf.Conf.DelayedStart)
@@ -116,6 +126,7 @@ func Start() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 	r := gin.New()
+	applyTrustedProxies(r)
 
 	// gin log
 	if conf.Conf.Log.Filter.Enable {
@@ -130,6 +141,7 @@ func Start() {
 	if conf.Conf.Scheme.EnableH2c {
 		httpHandler = h2c.NewHandler(r, &http2.Server{})
 	}
+	InitFRP(httpHandler)
 	if conf.Conf.Scheme.HttpPort != -1 {
 		httpBase := fmt.Sprintf("%s:%d", conf.Conf.Scheme.Address, conf.Conf.Scheme.HttpPort)
 		fmt.Printf("start HTTP server @ %s\n", httpBase)
@@ -294,6 +306,7 @@ func Start() {
 func Shutdown(timeout time.Duration) {
 	utils.Log.Println("Shutdown server...")
 	frontend.StopWatcher()
+	StopFRP() // before the listeners: tunnelled requests end first
 	fs.ArchiveContentUploadTaskManager.RemoveAll()
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()

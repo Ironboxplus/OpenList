@@ -15,6 +15,7 @@ const (
 	TRAFFIC
 	MEDIA
 	TRANSCODE
+	FRP
 )
 
 const (
