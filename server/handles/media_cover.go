@@ -8,7 +8,6 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
-	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/internal/sign"
 	"github.com/gin-gonic/gin"
@@ -65,26 +64,6 @@ func mediaCoverURL(ref string) string {
 		return "/d" + (&url.URL{Path: p}).EscapedPath() + "?sign=" + url.QueryEscape(sign.Sign(p))
 	}
 	return ref
-}
-
-// MediaItemView is an item as the public APIs return it: the stored fields
-// plus the URLs to fetch its images from.
-type MediaItemView struct {
-	model.MediaItem
-	CoverURL    string `json:"cover_url,omitempty"`
-	BackdropURL string `json:"backdrop_url,omitempty"`
-}
-
-func mediaItemView(it *model.MediaItem) MediaItemView {
-	return MediaItemView{MediaItem: *it, CoverURL: mediaCoverURL(it.Cover), BackdropURL: mediaCoverURL(it.Backdrop)}
-}
-
-func mediaItemViews(items []model.MediaItem) []MediaItemView {
-	out := make([]MediaItemView, len(items))
-	for i := range items {
-		out[i] = mediaItemView(&items[i])
-	}
-	return out
 }
 
 // MediaAlbumView is an album with the URL of its cover.

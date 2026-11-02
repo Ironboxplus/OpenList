@@ -146,15 +146,10 @@ func Init(e *gin.Engine) {
 	api.GET("/plugin/manifest", handles.PluginManifest)
 	api.GET("/plugin/asset/:name", handles.PluginAsset)
 
-
 	// Cluster storage-sync peer endpoint: a persistent WebSocket so NAT'd nodes
 	// can dial out and stay connected. Authentication/encryption come from the
 	// cluster pre-shared key (per-frame AEAD), not the HTTP layer.
 	api.GET("/cluster/ws", handles.ClusterWS)
-
-	// The library listing of scraped media: any signed-in user (a disabled
-	// guest gets 401 from Auth), filtered by the same rule as /fs/media.
-	auth.GET("/media/library", handles.MediaLibrary)
 
 	_fs(auth.Group("/fs"))
 	// 媒体库公开 API：与文件浏览一致，允许访客访问（访客仍受自身 base_path/权限限制）
@@ -355,8 +350,6 @@ func fsAndShare(g *gin.RouterGroup) {
 	g.Any("/get", handles.FsGetSplit)
 	g.POST("/video_play", handles.FsVideoPlay)
 	g.POST("/video_subtitle", handles.FsVideoSubtitle)
-	// Media info of a directory: reads the database only, never the storage.
-	g.POST("/media", handles.FsMedia)
 	a := g.Group("/archive")
 	a.Any("/meta", handles.FsArchiveMetaSplit)
 	a.Any("/list", handles.FsArchiveListSplit)

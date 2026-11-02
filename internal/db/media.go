@@ -98,6 +98,7 @@ type MediaItemQuery struct {
 	ContentTag string // 按内容标签筛选（喜剧、惊悚等）
 	PathPrefix string // 按文件夹路径前缀筛选（用于用户 base_path 隔离）
 	Hidden     *bool
+	Kinds      []string // 按 video_type 筛选（movie、tv、anime、collection）
 	Keyword    string
 	OrderBy    string // "name", "date", "size"
 	OrderDir   string // "asc", "desc"
@@ -105,9 +106,8 @@ type MediaItemQuery struct {
 	PageSize   int
 }
 
-// ListMediaItems 分页查询媒体条目
-func ListMediaItems(q MediaItemQuery) ([]model.MediaItem, int64, error) {
-	tx := db.Model(&model.MediaItem{})
+// mediaItemsWhere 把查询条件套到 tx 上（不含排序和分页）
+func mediaItemsWhere(tx *gorm.DB, q MediaItemQuery) *gorm.DB {
 	if q.MediaType != "" {
 		tx = tx.Where("media_type = ?", q.MediaType)
 	}
@@ -124,6 +124,9 @@ func ListMediaItems(q MediaItemQuery) ([]model.MediaItem, int64, error) {
 	if q.Hidden != nil {
 		tx = tx.Where("hidden = ?", *q.Hidden)
 	}
+	if len(q.Kinds) > 0 {
+		tx = tx.Where("video_type IN ?", q.Kinds)
+	}
 	if q.Keyword != "" {
 		like := "%" + q.Keyword + "%"
 		tx = tx.Where("file_name LIKE ? OR scraped_name LIKE ?", like, like)
@@ -138,13 +141,11 @@ func ListMediaItems(q MediaItemQuery) ([]model.MediaItem, int64, error) {
 		tx = tx.Joins("JOIN media_scan_paths ON media_scan_paths.id = media_items.scan_path_id").
 			Where("media_scan_paths.content_tags LIKE ?", "%"+q.ContentTag+"%")
 	}
+	return tx
+}
 
-	var total int64
-	if err := tx.Count(&total).Error; err != nil {
-		return nil, 0, err
-	}
-
-	// 排序
+// mediaItemsOrder 按 q 的排序键排序；id 作为兜底，保证分页稳定
+func mediaItemsOrder(tx *gorm.DB, q MediaItemQuery) *gorm.DB {
 	orderCol := "created_at"
 	switch q.OrderBy {
 	case "name":
@@ -158,7 +159,17 @@ func ListMediaItems(q MediaItemQuery) ([]model.MediaItem, int64, error) {
 	if q.OrderDir == "desc" {
 		dir = "desc"
 	}
-	tx = tx.Order(orderCol + " " + dir)
+	return tx.Order(orderCol + " " + dir).Order("media_items.id asc")
+}
+
+// ListMediaItems 分页查询媒体条目
+func ListMediaItems(q MediaItemQuery) ([]model.MediaItem, int64, error) {
+	tx := mediaItemsWhere(db.Model(&model.MediaItem{}), q)
+	var total int64
+	if err := tx.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	tx = mediaItemsOrder(tx, q)
 
 	// 分页
 	if q.PageSize <= 0 {
@@ -172,6 +183,45 @@ func ListMediaItems(q MediaItemQuery) ([]model.MediaItem, int64, error) {
 	var items []model.MediaItem
 	err := tx.Find(&items).Error
 	return items, total, err
+}
+
+var mediaItemsBatch = 500
+
+// ListMediaItemsFiltered 与 ListMediaItems 相同，但先用 keep 过滤再分页：
+// 按排序一批一批读，丢掉 keep 拒绝的条目，再取这一页，所以一页不会因为权限过滤而变短，
+// total 也是过滤后的数量。
+func ListMediaItemsFiltered(q MediaItemQuery, keep func(*model.MediaItem) bool) ([]model.MediaItem, int64, error) {
+	if q.PageSize <= 0 {
+		q.PageSize = 20
+	}
+	if q.Page <= 0 {
+		q.Page = 1
+	}
+	from := int64(q.Page-1) * int64(q.PageSize)
+	to := from + int64(q.PageSize)
+	var (
+		out   []model.MediaItem
+		total int64
+	)
+	for offset := 0; ; offset += mediaItemsBatch {
+		var batch []model.MediaItem
+		tx := mediaItemsOrder(mediaItemsWhere(db.Model(&model.MediaItem{}), q), q)
+		if err := tx.Offset(offset).Limit(mediaItemsBatch).Find(&batch).Error; err != nil {
+			return nil, 0, err
+		}
+		for i := range batch {
+			if keep != nil && !keep(&batch[i]) {
+				continue
+			}
+			if total >= from && total < to {
+				out = append(out, batch[i])
+			}
+			total++
+		}
+		if len(batch) < mediaItemsBatch {
+			return out, total, nil
+		}
+	}
 }
 
 // GetMediaItemByID 按ID获取媒体条目

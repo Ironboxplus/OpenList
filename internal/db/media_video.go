@@ -3,6 +3,7 @@ package db
 import (
 	"errors"
 	stdpath "path"
+	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"gorm.io/gorm"
@@ -90,6 +91,21 @@ func ListVideoItems(f VideoListFilter) ([]model.MediaItem, int64, error) {
 	var items []model.MediaItem
 	err := tx.Order("folder_path, file_name").Offset((f.Page - 1) * f.PerPage).Limit(f.PerPage).Find(&items).Error
 	return items, total, err
+}
+
+// ListVideoCoversUnder returns the visible video works below prefix that have
+// a cover, the ones to show first first: known release year ascending, unknown
+// years last, then by title and path. It reads at most limit rows.
+func ListVideoCoversUnder(prefix string, limit int) ([]model.MediaItem, error) {
+	prefix = stdpath.Clean("/" + prefix)
+	var items []model.MediaItem
+	err := db.Model(&model.MediaItem{}).
+		Select("id", "media_type", "folder_path", "file_name", "scraped_name", "release_date", "cover", "hidden").
+		Where("media_type = ? AND hidden = ? AND cover <> ''", model.MediaTypeVideo, false).
+		Where(`folder_path = ? OR folder_path LIKE ? ESCAPE ''`, prefix, escapeLike(strings.TrimSuffix(prefix, "/")+"/")+"%").
+		Order("(release_date = '' OR release_date IS NULL), release_date, COALESCE(NULLIF(scraped_name, ''), file_name), folder_path, file_name").
+		Limit(limit).Find(&items).Error
+	return items, err
 }
 
 // SaveVideoItem writes a work together with its ratings and episodes in one

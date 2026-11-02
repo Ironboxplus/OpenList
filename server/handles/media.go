@@ -806,6 +806,10 @@ func hasAnyScrapedField(item *model.MediaItem) bool {
 // ==================== 公开API（前端媒体库浏览） ====================
 
 // PublicListMedia 公开媒体列表（前端浏览用）
+//
+// 除上游的筛选外：path（相对用户 base_path，同 fs 路径）只列该路径下一层的条目，
+// kind（逗号分隔的 movie/tv/anime/collection）按视频类型筛选。列表先按权限过滤再分页，
+// total 是过滤后的数量。条目带评分、封面地址（cover_url）和合集的海报拼图（child_posters）。
 func PublicListMedia(c *gin.Context) {
 	mediaType := model.MediaType(c.Query("media_type"))
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
@@ -814,6 +818,12 @@ func PublicListMedia(c *gin.Context) {
 	orderBy := c.DefaultQuery("order_by", "name")
 	orderDir := c.DefaultQuery("order_dir", "asc")
 	folderPath := c.Query("folder_path")
+	var kinds []string
+	for _, k := range strings.Split(c.Query("kind"), ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			kinds = append(kinds, k)
+		}
+	}
 	keyword := c.Query("keyword")
 	typeTag := c.Query("type_tag")
 	contentTag := c.Query("content_tag")
@@ -827,10 +837,24 @@ func PublicListMedia(c *gin.Context) {
 
 	hidden := false
 	user := mediaUser(c)
+	if p := c.Query("path"); p != "" {
+		if user == nil {
+			common.SuccessResp(c, common.PageResp{Content: []MediaItemView{}, Total: 0})
+			return
+		}
+		joined, err := user.JoinPath(p)
+		if err != nil {
+			// 越出 base_path：和没有权限一样，返回空而不是报错
+			common.SuccessResp(c, common.PageResp{Content: []MediaItemView{}, Total: 0})
+			return
+		}
+		folderPath = joined
+	}
 	q := db.MediaItemQuery{
 		MediaType:  mediaType,
 		ScanPathID: scanPathID,
 		FolderPath: folderPath,
+		Kinds:      kinds,
 		TypeTag:    typeTag,
 		ContentTag: contentTag,
 		PathPrefix: userPathPrefix(user),
@@ -841,22 +865,22 @@ func PublicListMedia(c *gin.Context) {
 		Page:       page,
 		PageSize:   pageSize,
 	}
-	items, total, err := db.ListMediaItems(q)
+	// 元信息(meta) 级别的读权限无法下推到 SQL，所以先过滤再分页
+	items, total, err := db.ListMediaItemsFiltered(q, func(it *model.MediaItem) bool { return CanUserAccessItem(user, it) })
 	if err != nil {
 		common.ErrorResp(c, err, 500)
 		return
 	}
-	// 元信息(meta) 级别的读权限无法下推到 SQL，这里对当前页做二次过滤
-	filtered := make([]model.MediaItem, 0, len(items))
-	for i := range items {
-		if CanUserAccessItem(user, &items[i]) {
-			filtered = append(filtered, items[i])
-		}
+	v, err := newMediaViewer(user, items)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
 	}
-	common.SuccessResp(c, common.PageResp{Content: mediaItemViews(filtered), Total: total})
+	common.SuccessResp(c, common.PageResp{Content: v.views(items), Total: total})
 }
 
-// PublicGetMedia 公开获取媒体详情
+// PublicGetMedia 公开获取媒体详情：除条目本身外带评分、分集列表（episode_list）和封面地址；
+// 候选（candidates）只给管理员。
 func PublicGetMedia(c *gin.Context) {
 	idStr := c.Param("id")
 	id, err := strconv.ParseUint(idStr, 10, 64)
@@ -873,7 +897,17 @@ func PublicGetMedia(c *gin.Context) {
 		common.ErrorStrResp(c, "资源不存在", 404)
 		return
 	}
-	common.SuccessResp(c, mediaItemView(item))
+	v, err := newMediaViewer(mediaUser(c), []model.MediaItem{*item})
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	out, err := v.detail(item)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c, out)
 }
 
 // PublicListAlbums 公开专辑列表（音乐）
@@ -928,7 +962,12 @@ func PublicGetAlbum(c *gin.Context) {
 			filtered = append(filtered, tracks[i])
 		}
 	}
-	common.SuccessResp(c, mediaItemViews(filtered))
+	v, err := newMediaViewer(user, filtered)
+	if err != nil {
+		common.ErrorResp(c, err, 500)
+		return
+	}
+	common.SuccessResp(c, v.views(filtered))
 }
 
 // PublicListFolders 公开文件夹列表（目录浏览模式）
