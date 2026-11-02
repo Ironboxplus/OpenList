@@ -95,6 +95,7 @@ import (
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/url_tree"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/uss"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/virtual"
+	_ "github.com/OpenListTeam/OpenList/v4/drivers/vtencent"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/webdav"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/weiyun"
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/wopan"
