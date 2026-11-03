@@ -38,11 +38,31 @@ func listEntries(ctx context.Context, p string) ([]identify.Entry, error) {
 // provider: the title and year it writes are the query a later scrape starts
 // from, and a scrape replaces them.
 func identifyScanItem(ctx context.Context, vfsPath string, item *model.MediaItem) ([]identify.Entry, identify.Result) {
+	entries, r, _ := identifyScanItemChecked(ctx, vfsPath, item)
+	return entries, r
+}
+
+// identifyScanItemChecked is identifyScanItem that also reports the first
+// listing that failed (the folder's own or one a rule looked into): the verdict
+// then rests on the name alone and must not replace a better one.
+func identifyScanItemChecked(ctx context.Context, vfsPath string, item *model.MediaItem) ([]identify.Entry, identify.Result, error) {
+	var first error
+	note := func(err error) {
+		if err != nil && first == nil {
+			first = err
+		}
+	}
 	var entries []identify.Entry
 	if item.IsFolder {
-		entries, _ = listEntries(ctx, vfsPath)
+		var err error
+		entries, err = listEntries(ctx, vfsPath)
+		note(err)
 	}
-	peek := func(name string) ([]identify.Entry, error) { return listEntries(ctx, stdpath.Join(vfsPath, name)) }
+	peek := func(name string) ([]identify.Entry, error) {
+		es, err := listEntries(ctx, stdpath.Join(vfsPath, name))
+		note(err)
+		return es, err
+	}
 	r := identify.ClassifyWith(item.FileName, item.IsFolder, entries, peek)
 	applyIdentify(item, r)
 	if !item.IsFolder && model.IsEpisodicVideo(r.Kind) {
@@ -53,7 +73,7 @@ func identifyScanItem(ctx context.Context, vfsPath string, item *model.MediaItem
 			item.Episode = e
 		}
 	}
-	return entries, r
+	return entries, r, first
 }
 
 // applyIdentify copies an identification into a scanned item.
@@ -103,3 +123,4 @@ func scanEpisodes(ctx context.Context, folder string) ([]model.MediaEpisode, err
 	}
 	return eps, nil
 }
+

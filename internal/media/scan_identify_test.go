@@ -81,3 +81,17 @@ func TestEpisodeFilesOfASeasonedShow(t *testing.T) {
 		t.Errorf("index of S02E01 = %d, want 3", infos[2].Index)
 	}
 }
+
+// A folder that cannot be listed gives a verdict from its name alone; the scan
+// must be told, so that it neither re-classifies the row nor prunes below it.
+func TestIdentifyScanItemCheckedReportsAFailedListing(t *testing.T) {
+	item := &model.MediaItem{FileName: "怦然心动", IsFolder: true}
+	_, _, err := identifyScanItemChecked(context.Background(), "/no-such-storage/怦然心动", item)
+	if err == nil {
+		t.Fatal("a failed listing was not reported")
+	}
+	file := &model.MediaItem{FileName: "x.mkv"}
+	if _, _, err := identifyScanItemChecked(context.Background(), "/lib/x.mkv", file); err != nil {
+		t.Fatalf("a file has no listing to fail: %v", err)
+	}
+}

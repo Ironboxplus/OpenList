@@ -218,6 +218,10 @@ func doScanPath(sp *model.MediaScanPath, p *ScanProgress) error {
 
 	// 收集所有待处理路径（VFS 虚拟路径）
 	var targets []string
+	// produced: the rows this scan wrote; failed: paths where something went wrong,
+	// under which nothing is pruned (see db.PruneMediaItems)
+	var failed []string
+	produced := map[uint]bool{}
 
 	ctx := context.Background()
 
@@ -239,7 +243,7 @@ func doScanPath(sp *model.MediaScanPath, p *ScanProgress) error {
 		}
 	} else {
 		// 普通模式：递归扫描所有匹配文件（每个目录都刷新缓存）
-		if err := walkVFS(ctx, scanRoot, sp.MediaType, &targets); err != nil {
+		if err := walkVFS(ctx, scanRoot, sp.MediaType, &targets, &failed); err != nil {
 			return err
 		}
 	}
@@ -261,12 +265,18 @@ func doScanPath(sp *model.MediaScanPath, p *ScanProgress) error {
 		item, err := buildMediaItemFromVFS(ctx, target, sp)
 		if err != nil {
 			log.Warnf("build media item error [%s]: %v", target, err)
+			failed = append(failed, target)
 			continue
 		}
 
 		var scannedEpisodes []model.MediaEpisode
+		trusted := true // the listings behind the verdict all worked
 		if sp.MediaType == model.MediaTypeVideo {
-			entries, r := identifyScanItem(ctx, target, item)
+			entries, r, lerr := identifyScanItemChecked(ctx, target, item)
+			if lerr != nil {
+				trusted = false
+				log.Warnf("media scan: listing under [%s] failed: %v", target, lerr)
+			}
 			switch {
 			case item.IsFolder && model.IsEpisodicVideo(r.Kind):
 				if eps, err := scanEpisodes(ctx, target); err == nil {
@@ -274,6 +284,7 @@ func doScanPath(sp *model.MediaScanPath, p *ScanProgress) error {
 					item.Episodes = model.EpisodesJSON(eps)
 				} else {
 					log.Warnf("scan episodes error [%s]: %v", target, err)
+					trusted = false
 				}
 			case item.IsFolder && len(r.Versions) > 1:
 				// one film kept in several versions: the files are the choices
@@ -283,6 +294,7 @@ func doScanPath(sp *model.MediaScanPath, p *ScanProgress) error {
 					item.Episodes = episodes
 				} else {
 					log.Warnf("build episodes error [%s]: %v", target, err)
+					trusted = false
 				}
 			}
 			if r.Kind == model.VideoTypeCollection && depth[target] < maxCollectionDepth {
@@ -304,23 +316,41 @@ func doScanPath(sp *model.MediaScanPath, p *ScanProgress) error {
 			}
 		}
 
-		if err := db.CreateOrUpdateMediaItem(item); err != nil {
+		if !trusted {
+			failed = append(failed, target)
+		}
+		if err := db.SaveScannedMediaItem(item, trusted && sp.MediaType == model.MediaTypeVideo); err != nil {
 			log.Warnf("save media item error [%s]: %v", target, err)
+			failed = append(failed, target)
 			p.mu.Lock()
 			p.Skipped++
 			p.mu.Unlock()
-		} else if scannedEpisodes != nil {
-			// keep the titles a scrape gave the episodes that are still there
-			if merged, err := db.SyncMediaEpisodes(item.ID, scannedEpisodes); err != nil {
-				log.Warnf("save episodes error [%s]: %v", target, err)
-			} else if err := db.UpdateMediaItemEpisodes(item.ID, model.EpisodesJSON(merged)); err != nil {
-				log.Warnf("save episode list error [%s]: %v", target, err)
+		} else {
+			produced[item.ID] = true
+			if scannedEpisodes != nil {
+				// keep the titles a scrape gave the episodes that are still there
+				if merged, err := db.SyncMediaEpisodes(item.ID, scannedEpisodes); err != nil {
+					log.Warnf("save episodes error [%s]: %v", target, err)
+				} else if err := db.UpdateMediaItemEpisodes(item.ID, model.EpisodesJSON(merged)); err != nil {
+					log.Warnf("save episode list error [%s]: %v", target, err)
+				}
 			}
 		}
 		p.mu.Lock()
 		p.Done++
 		p.Message = "已扫描: " + stdpath.Base(target)
 		p.mu.Unlock()
+	}
+	// The scan finished: what it did not produce is gone from the library. A
+	// failed root returned above, and a failed subtree is in failed.
+	if sp.MediaType == model.MediaTypeVideo && sp.ID != 0 {
+		n, err := db.PruneMediaItems(sp.ID, produced, failed)
+		switch {
+		case err != nil:
+			log.Warnf("media scan [%s]: pruning failed: %v", sp.Path, err)
+		case n > 0:
+			log.Infof("media scan [%s]: %d rows no longer produced were removed", sp.Path, n)
+		}
 	}
 	return nil
 }
@@ -618,16 +648,18 @@ func FetchFileReader(ctx context.Context, vfsPath string) io.ReadCloser {
 }
 
 // walkVFS 递归遍历 VFS 路径，收集匹配的媒体文件路径（每个目录都刷新缓存）
-func walkVFS(ctx context.Context, dirPath string, mediaType model.MediaType, targets *[]string) error {
+func walkVFS(ctx context.Context, dirPath string, mediaType model.MediaType, targets *[]string, failed *[]string) error {
 	entries, err := fs.List(ctx, dirPath, &fs.ListArgs{NoLog: true, Refresh: true})
 	if err != nil {
 		log.Warnf("media scan: list vfs path [%s] error: %v", dirPath, err)
-		return nil // 跳过无权限目录，不中断整体扫描
+		// 跳过无权限目录，不中断整体扫描；记下来，扫描结束时不清理它下面的条目
+		*failed = append(*failed, dirPath)
+		return nil
 	}
 	for _, e := range entries {
 		childPath := stdpath.Join(dirPath, e.GetName())
 		if e.IsDir() {
-			if err := walkVFS(ctx, childPath, mediaType, targets); err != nil {
+			if err := walkVFS(ctx, childPath, mediaType, targets, failed); err != nil {
 				return err
 			}
 		} else if isMediaFile(e.GetName(), mediaType) {
