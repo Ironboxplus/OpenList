@@ -57,6 +57,8 @@ type MediaItem struct {
 
 	// 刮削/编辑信息
 	ScrapedName string  `json:"scraped_name"`
+	// SortName is the key order_by=name sorts on (see MediaSortName); kept by BeforeSave.
+	SortName string `gorm:"size:191;index" json:"-"`
 	Description string  `gorm:"type:text"               json:"description"`
 	Cover       string  `json:"cover"`                                  // 封面URL或本地路径
 	ReleaseDate string  `json:"release_date"`                           // 发布时间，格式 YYYY-MM-DD

@@ -114,3 +114,46 @@ func TestListMediaItemsHonorsTablePrefix(t *testing.T) {
 		})
 	}
 }
+
+func TestMediaNameOrderUsesTheSortKeyAndTopLevelHidesMembers(t *testing.T) {
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	d, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:db-media-sort-%d?mode=memory&cache=shared", time.Now().UnixNano())), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	Init(d)
+	save := func(folder, name, title string, isFolder bool) {
+		it := &model.MediaItem{MediaType: model.MediaTypeVideo, FolderPath: folder, FileName: name, ScrapedName: title, IsFolder: isFolder}
+		it.VideoType = model.MediaKindMovie
+		if err := SaveVideoItem(it, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	save("/lib", "z", "周星驰", false)
+	save("/lib", "a", "阿凡达", false)
+	save("/lib", "m2", "Movie 2", false)
+	save("/lib", "m10", "Movie 10", false)
+	save("/lib", "coll", "合集", true)
+	save("/lib/coll", "inner", "成员", false)
+
+	names := func(q MediaItemQuery) []string {
+		q.MediaType, q.OrderBy, q.PageSize = model.MediaTypeVideo, "name", 50
+		items, _, err := ListMediaItems(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, it := range items {
+			out = append(out, it.ScrapedName)
+		}
+		return out
+	}
+	want := []string{"阿凡达", "成员", "合集", "Movie 2", "Movie 10", "周星驰"}
+	if got := names(MediaItemQuery{}); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("flat: %v, want %v", got, want)
+	}
+	top := []string{"阿凡达", "合集", "Movie 2", "Movie 10", "周星驰"}
+	if got := names(MediaItemQuery{TopLevel: true}); fmt.Sprint(got) != fmt.Sprint(top) {
+		t.Fatalf("top level: %v, want %v", got, top)
+	}
+}

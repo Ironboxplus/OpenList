@@ -38,6 +38,9 @@ func Init(d *gorm.DB) {
 	if err := migrateSharingPasswords(); err != nil {
 		log.Fatalf("failed migrate sharing passwords: %s", err.Error())
 	}
+	if err := backfillMediaSortNames(); err != nil {
+		log.Errorf("failed to fill media sort names: %s", err.Error())
+	}
 }
 
 func mediaWipeConfirmed() bool {

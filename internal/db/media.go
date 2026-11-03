@@ -3,6 +3,7 @@ package db
 import (
 	"encoding/json"
 	"fmt"
+	stdpath "path"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -100,6 +101,9 @@ type MediaItemQuery struct {
 	Hidden     *bool
 	Kinds      []string // 按 video_type 筛选（movie、tv、anime、collection）
 	Keyword    string
+	// TopLevel leaves out the works that sit inside another work of the library
+	// (members of a collection, extras of a show): they are listed under it.
+	TopLevel bool
 	OrderBy    string // "name", "date", "size"
 	OrderDir   string // "asc", "desc"
 	Page       int
@@ -137,6 +141,11 @@ func mediaItemsWhere(tx *gorm.DB, q MediaItemQuery) *gorm.DB {
 		fp := mediaItemCol("folder_path")
 		tx = tx.Where("("+fp+` = ? OR `+fp+` LIKE ? ESCAPE '\')`, strings.TrimSuffix(q.PathPrefix, "/"), escapeLike(prefix)+"%")
 	}
+	if q.TopLevel {
+		if parents := videoFolderPaths(); len(parents) > 0 {
+			tx = tx.Where(mediaItemCol("folder_path")+" NOT IN ?", parents)
+		}
+	}
 	if q.Hidden != nil {
 		tx = tx.Where(mediaItemCol("hidden")+" = ?", *q.Hidden)
 	}
@@ -163,12 +172,29 @@ func mediaItemsWhere(tx *gorm.DB, q MediaItemQuery) *gorm.DB {
 	return tx
 }
 
+// videoFolderPaths are the paths of the video works that are folders: what a
+// member of a collection or a show has as its folder_path.
+func videoFolderPaths() []string {
+	var rows []struct{ FolderPath, FileName string }
+	if err := db.Model(&model.MediaItem{}).Select("folder_path", "file_name").
+		Where("media_type = ? AND is_folder = ?", model.MediaTypeVideo, true).Find(&rows).Error; err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, stdpath.Join("/", r.FolderPath, r.FileName))
+	}
+	return out
+}
+
 // mediaItemsOrder 按 q 的排序键排序；id 作为兜底，保证分页稳定
 func mediaItemsOrder(tx *gorm.DB, q MediaItemQuery) *gorm.DB {
 	orderCol := mediaItemCol("created_at")
 	switch q.OrderBy {
 	case "name":
-		orderCol = "COALESCE(NULLIF(" + mediaItemCol("scraped_name") + ",''), " + mediaItemCol("file_name") + ")"
+		// SortName is the pinyin/zero-padded key kept by MediaItem.BeforeSave; rows
+		// not yet backfilled fall back to the title
+		orderCol = "COALESCE(NULLIF(" + mediaItemCol("sort_name") + ",''), NULLIF(" + mediaItemCol("scraped_name") + ",''), " + mediaItemCol("file_name") + ")"
 	case "date":
 		orderCol = mediaItemCol("release_date")
 	case "size":
@@ -403,6 +429,7 @@ func ClearMediaScrapedData(mediaType model.MediaType) (int64, error) {
 		"confidence":     0,
 		"candidates":     "",
 		"scraped_name":   "",
+		"sort_name":      "",
 		"description":    "",
 		"cover":          "",
 		"release_date":   "",
@@ -742,4 +769,38 @@ func FindScanPathFor(mediaType model.MediaType, p string) (*model.MediaScanPath,
 		}
 	}
 	return best, nil
+}
+
+// backfillMediaSortNames fills SortName of the rows written before the column
+// existed (and those a clearing update emptied). It runs at start-up, in id
+// order and in batches; rows with no title stay empty.
+func backfillMediaSortNames() error {
+	table := tableOf(&model.MediaItem{})
+	last := uint(0)
+	for {
+		var rows []model.MediaItem
+		if err := db.Unscoped().Select("id", "scraped_name", "file_name").
+			Where("sort_name = ? AND id > ?", "", last).Order("id asc").Limit(mediaItemsBatch).Find(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+		err := db.Transaction(func(tx *gorm.DB) error {
+			for i := range rows {
+				key := model.MediaSortName(rows[i].SortTitle())
+				if key == "" {
+					continue
+				}
+				if err := tx.Table(table).Where("id = ?", rows[i].ID).UpdateColumn("sort_name", key).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		last = rows[len(rows)-1].ID
+	}
 }

@@ -837,6 +837,9 @@ func PublicListMedia(c *gin.Context) {
 
 	hidden := false
 	user := mediaUser(c)
+	// The video library lists its top-level works; what sits inside a collection or
+	// a show is listed under it (path=) or found by keyword. flat=1 lists every work.
+	topLevel := mediaType == model.MediaTypeVideo && folderPath == "" && keyword == "" && c.Query("path") == "" && c.Query("flat") == ""
 	if p := c.Query("path"); p != "" {
 		if user == nil {
 			common.SuccessResp(c, common.PageResp{Content: []MediaItemView{}, Total: 0})
@@ -860,6 +863,7 @@ func PublicListMedia(c *gin.Context) {
 		PathPrefix: userPathPrefix(user),
 		Hidden:     &hidden,
 		Keyword:    keyword,
+		TopLevel:   topLevel,
 		OrderBy:    orderBy,
 		OrderDir:   orderDir,
 		Page:       page,
