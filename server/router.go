@@ -255,6 +255,7 @@ func admin(g *gin.RouterGroup) {
 	curate.POST("/image", handles.CurateImage)
 	curate.POST("/scrape", handles.CurateScrape)
 	curate.GET("/search", handles.CurateSearch)
+	curate.POST("/export_nfo", handles.CurateExportNFO)
 
 	// Admin-only user operations (create/delete/role-affecting). The profile-edit
 	// endpoints (list/get/update) live in a separate group that also accepts a

@@ -1,9 +1,14 @@
 package handles
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/OpenListTeam/OpenList/v4/internal/fs"
+	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"io"
+	"path"
 	"reflect"
 	"strconv"
 	"strings"
@@ -377,4 +382,36 @@ func CurateSearch(c *gin.Context) {
 		cs = []scraper.Candidate{}
 	}
 	common.SuccessResp(c, cs)
+}
+
+// CurateExportNFO writes an NFO next to the works a person fixed (locked, or
+// picked by hand) so another player or a rebuilt library reads the same match.
+// Without "apply" it only reports what it would write; it never overwrites an
+// NFO, and uploads one file at a time.
+func CurateExportNFO(c *gin.Context) {
+	var req struct {
+		Paths []string `json:"paths"`
+		Apply bool     `json:"apply"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || len(req.Paths) == 0 {
+		common.ErrorStrResp(c, "paths is required", 400)
+		return
+	}
+	var items []model.MediaItem
+	for _, p := range req.Paths {
+		found, err := db.ListVideoItemsUnder(path.Clean("/" + strings.TrimLeft(strings.ReplaceAll(p, "\\", "/"), "/")))
+		if err != nil {
+			common.ErrorResp(c, err, 500, true)
+			return
+		}
+		items = append(items, found...)
+	}
+	put := func(ctx context.Context, dir, name string, data []byte) error {
+		return fs.PutDirectly(ctx, dir, &stream.FileStream{
+			Obj:      &model.Object{Name: name, Size: int64(len(data)), Modified: time.Now()},
+			Reader:   bytes.NewReader(data),
+			Mimetype: "text/xml",
+		})
+	}
+	common.SuccessResp(c, apply.ExportNFO(c.Request.Context(), apply.LocalLister{}, put, items, req.Apply))
 }

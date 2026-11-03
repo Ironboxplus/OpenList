@@ -40,6 +40,7 @@ var mediaFlags struct {
 	rules    string
 	probe    bool
 	out      string
+	apply    bool
 }
 
 // Test hooks: point the providers at local servers and allow loopback image
@@ -152,6 +153,24 @@ one /api/fs/get and one Range request per work.`,
 		lib.AddCommand(c)
 	}
 	mediaCmd.AddCommand(lib)
+
+	nfoCmd := &cobra.Command{Use: "nfo", Short: "NFO files next to the works"}
+	nfoExport := &cobra.Command{
+		Use:   "export",
+		Short: "Write tvshow.nfo / movie.nfo next to the works a person fixed (dry run unless --apply)",
+		Long: `For every locked or hand-picked work under --path that has a TMDB or IMDb id and
+no NFO next to it, write a small NFO (title, year, ids) that Kodi and Jellyfin
+read back, and that this server reads when it scrapes. Never overwrites a
+file. Without --apply nothing is written. Uploads are sequential, one at a time.`,
+		Args: cobra.NoArgs,
+		RunE: runMediaNFOExport,
+	}
+	nfoExport.Flags().StringVar(&mediaFlags.path, "path", "", "the library directory or work to export, e.g. /115/arc/MOV/Anime (required)")
+	nfoExport.Flags().BoolVar(&mediaFlags.apply, "apply", false, "really write the files")
+	_ = nfoExport.MarkFlagRequired("path")
+	addServerFlags(nfoExport.Flags())
+	nfoCmd.AddCommand(nfoExport)
+	mediaCmd.AddCommand(nfoCmd)
 
 	for _, c := range []*cobra.Command{plan, app, scrape, ls, chk} {
 		addServerFlags(c.Flags())
@@ -488,6 +507,30 @@ func runLibraryLs(cmd *cobra.Command, args []string) error {
 	}
 	for _, sp := range paths {
 		fmt.Fprintln(cmd.OutOrStdout(), sp.Path)
+	}
+	return nil
+}
+
+func runMediaNFOExport(cmd *cobra.Command, args []string) error {
+	c, err := newSyncClient()
+	if err != nil {
+		return err
+	}
+	var res []apply.ExportResult
+	if err := c.Call("POST", "/api/admin/media/curate/export_nfo", map[string]any{"paths": []string{mediaFlags.path}, "apply": mediaFlags.apply}, &res); err != nil {
+		return err
+	}
+	counts := map[string]int{}
+	for _, r := range res {
+		counts[r.Action]++
+		if r.Action != "skip" {
+			fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%s\n", r.Action, r.Path, r.File, r.Reason)
+		}
+	}
+	fmt.Fprintf(os.Stderr, "%d works: %d to write, %d written, %d skipped, %d failed\n",
+		len(res), counts["write"], counts["written"], counts["skip"], counts["error"])
+	if !mediaFlags.apply && counts["write"] > 0 {
+		fmt.Fprintln(os.Stderr, "dry run: nothing was written; add --apply to write")
 	}
 	return nil
 }
