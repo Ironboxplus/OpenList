@@ -41,7 +41,43 @@ func stem(name string) string {
 }
 
 // Directory names that hold extras, not works.
-var extraDirRe = regexp.MustCompile(`(?i)^(subs?|subtitles?|字幕|sample|samples|extras?|featurettes?|scans?|cds?\d*|bdmv|certificate|menu|screens?|screenshots?|covers?|artworks?|nced|ncop|sps?|bonus|special features?|cd\d+|disc\s*\d+|dvd\d*|\.?[a-z_]*(thumb|cache)[a-z_]*)$`)
+var extraDirRe = regexp.MustCompile(`(?i)^(subs?|subtitles?|字幕|samples?([\s._-]*(videos?|clips?|files?))?|extras?|featurettes?|trailers?|behind[\s._-]*the[\s._-]*scenes|scans?|cds?\d*|bdmv|certificate|menu|screens?|screenshots?|covers?|artworks?|nced|ncop|sps?|bonus|special features?|cd\d+|disc\s*\d+|dvd\d*|\.?[a-z_]*(thumb|cache)[a-z_]*)$`)
+
+// bracketsRe strips the brackets some releases put around an extras directory
+// name ("[Subs]", "【字幕】").
+var bracketsRe = regexp.MustCompile(`[\[\]()（）【】]`)
+
+func isExtraDirName(name string) bool {
+	return extraDirRe.MatchString(strings.TrimSpace(bracketsRe.ReplaceAllString(name, "")))
+}
+
+// junkVideoRe names files that are never the work: samples, trailers, teasers.
+var junkVideoRe = regexp.MustCompile(`(?i)(^|[\s._\[(-])(sample|trailer|teaser|featurette)s?([\s._\])-]|$)`)
+
+// mainVideos drops what is not the work from a list of videos: files named
+// like samples or trailers, and files far smaller than the largest one (a few
+// megabytes next to gigabytes). A set where nothing passes is returned as it was.
+func mainVideos(videos []Entry) []Entry {
+	var largest int64
+	for _, v := range videos {
+		largest = max(largest, v.Size)
+	}
+	out := make([]Entry, 0, len(videos))
+	for _, v := range videos {
+		if junkVideoRe.MatchString(stem(v.Name)) {
+			continue
+		}
+		if v.Size > 0 && v.Size*20 < largest && v.Size < 300<<20 {
+			continue
+		}
+		out = append(out, v)
+	}
+	if len(out) == 0 {
+		return videos
+	}
+	return out
+}
+
 
 // Directory names that are seasons of one show.
 var seasonDirRe = regexp.MustCompile(`(?i)^(season|series|s)[\s._-]*\d{1,2}\b|^第\s*[\d一二三四五六七八九十百]+\s*[季部期]|^specials?$|^ova$|^oad$|^特典|^特别篇|^剧场版$`)
@@ -150,6 +186,7 @@ func ClassifyEntries(entries []Entry) Shape {
 			other++
 		}
 	}
+	videos = mainVideos(videos)
 	if len(entries) == 0 {
 		return Shape{Why: "empty listing"}
 	}
@@ -164,7 +201,7 @@ func ClassifyEntries(entries []Entry) Shape {
 		case seasonDirRe.MatchString(d.Name):
 			seasons++
 			workDirs = append(workDirs, d)
-		case extraDirRe.MatchString(d.Name):
+		case isExtraDirName(d.Name):
 		default:
 			workDirs = append(workDirs, d)
 		}
@@ -261,7 +298,7 @@ func EpisodeOf(name string) (season, episode int, ok bool) {
 func IsSeasonDir(name string) bool { return seasonDirRe.MatchString(name) }
 
 // IsExtraDir reports whether a directory name holds extras, not a work.
-func IsExtraDir(name string) bool { return extraDirRe.MatchString(name) }
+func IsExtraDir(name string) bool { return isExtraDirName(name) }
 
 // SeasonOfDir returns the season number a directory name carries ("Season 2",
 // "第3季"), or 0.

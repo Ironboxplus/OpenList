@@ -349,6 +349,10 @@ func ParseName(name string, isFile bool) NameInfo {
 		year = yearBracket
 		ni.Title, ni.English, ni.Chinese = core, core, ""
 		ni.Parsed.English, ni.Parsed.Chinese = core, ""
+		ni.Parsed.Year = "" // the parser read the title as the year; the search must not
+		if year > 0 {
+			ni.Parsed.Year = strconv.Itoa(year)
+		}
 	}
 	ni.Year = year
 	// a bare number is a title, not a year ("1917")
