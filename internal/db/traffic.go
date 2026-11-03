@@ -86,7 +86,9 @@ func GetMediaStats() (MediaStats, error) {
 			out.Collection = r.N
 		}
 	}
-	if err := db.Model(&model.MediaEpisode{}).Count(&out.Episodes).Error; err != nil {
+	if err := db.Model(&model.MediaEpisode{}).
+		Where("item_id IN (?)", db.Model(&model.MediaItem{}).Select("id")). // not the episodes of pruned works
+		Count(&out.Episodes).Error; err != nil {
 		return out, errors.WithStack(err)
 	}
 	err = db.Model(&model.MediaItem{}).

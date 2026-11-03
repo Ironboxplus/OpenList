@@ -113,6 +113,15 @@ func ListVideoCoversUnder(prefix string, limit int) ([]model.MediaItem, error) {
 // one replaces it with nothing.
 func SaveVideoItem(it *model.MediaItem, ratings []model.MediaRating, eps []model.MediaEpisode) error {
 	return db.Transaction(func(tx *gorm.DB) error {
+		if it.ID == 0 {
+			// a work the scan pruned still holds its path in the unique index: take its row back
+			var old model.MediaItem
+			if err := tx.Unscoped().Where("folder_path = ? AND file_name = ? AND album_name = ?", it.FolderPath, it.FileName, it.AlbumName).First(&old).Error; err == nil {
+				it.ID, it.CreatedAt, it.DeletedAt = old.ID, old.CreatedAt, gorm.DeletedAt{}
+			} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+				return err
+			}
+		}
 		if err := tx.Unscoped().Save(it).Error; err != nil {
 			return err
 		}

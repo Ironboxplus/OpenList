@@ -78,20 +78,22 @@ func ListMediaUserDataByItems(userID uint, itemIDs []uint) ([]model.MediaUserDat
 	return list, err
 }
 
-// ListMediaFavorites 用户收藏的条目
+// ListMediaFavorites 用户收藏的条目（已被扫描清理的条目不算）
 func ListMediaFavorites(userID uint) ([]model.MediaUserData, error) {
 	var list []model.MediaUserData
-	err := db.Where("user_id = ? AND is_favorite = ?", userID, true).Order("updated_at desc").Find(&list).Error
+	err := db.Where("user_id = ? AND is_favorite = ?", userID, true).
+		Where("item_id IN (?)", db.Model(&model.MediaItem{}).Select("id")).Order("updated_at desc").Find(&list).Error
 	return list, err
 }
 
-// ListMediaResume 继续观看：未看完且有进度
+// ListMediaResume 继续观看：未看完且有进度（已被扫描清理的条目不算，否则它们会挤占 limit）
 func ListMediaResume(userID uint, limit int) ([]model.MediaUserData, error) {
 	var list []model.MediaUserData
 	if limit <= 0 {
 		limit = 50
 	}
 	err := db.Where("user_id = ? AND played = ? AND position_ticks > 0", userID, false).
+		Where("item_id IN (?)", db.Model(&model.MediaItem{}).Select("id")).
 		Order("last_played_at desc").Limit(limit).Find(&list).Error
 	return list, err
 }
