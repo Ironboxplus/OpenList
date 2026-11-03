@@ -113,5 +113,56 @@ func (m *MediaItem) SortTitle() string {
 // BeforeSave keeps SortName in step with the title whenever the row is written.
 func (m *MediaItem) BeforeSave(_ *gorm.DB) error {
 	m.SortName = MediaSortName(m.SortTitle())
+	fileTitle, _ := m.DisplayTitles(TitleSourceFile)
+	m.SortNameFile = MediaSortName(fileTitle)
 	return nil
+}
+
+// Title sources: which name a work is shown and ordered by.
+const (
+	TitleSourceFile    = "file"    // the folder or file name, cleaned by the identification
+	TitleSourceScraped = "scraped" // the scraped title
+)
+
+// ScrapedTitle is the title today's library shows: the scraped (or rule) title,
+// else the file name.
+func (m *MediaItem) ScrapedTitle() string { return m.SortTitle() }
+
+// FileNameTitle is the title taken from the folder or file name: the one the scan
+// derived, else the file name without its extension.
+func (m *MediaItem) FileNameTitle() string {
+	if t := strings.TrimSpace(m.FileTitle); t != "" {
+		return t
+	}
+	name := m.FileName
+	if !m.IsFolder {
+		if i := strings.LastIndexByte(name, '.'); i > 0 && len(name)-i <= 5 {
+			name = name[:i]
+		}
+	}
+	return name
+}
+
+// fixedTitle reports whether a person set the title (locked or picked by hand):
+// it is shown as set in both modes.
+func (m *MediaItem) fixedTitle() bool {
+	return (m.Locked || m.Source == MediaSourceManual) && strings.TrimSpace(m.ScrapedName) != ""
+}
+
+// DisplayTitles returns the title to show for the source ("file" or "scraped";
+// anything else is "scraped") and the other one, empty when it is the same.
+func (m *MediaItem) DisplayTitles(source string) (display, alt string) {
+	scraped, file := m.ScrapedTitle(), m.FileNameTitle()
+	if m.fixedTitle() {
+		return scraped, ""
+	}
+	if source == TitleSourceFile {
+		display, alt = file, scraped
+	} else {
+		display, alt = scraped, file
+	}
+	if alt == display {
+		alt = ""
+	}
+	return display, alt
 }

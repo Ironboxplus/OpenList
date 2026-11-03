@@ -85,6 +85,7 @@ func applyIdentify(item *model.MediaItem, r identify.Result) {
 	item.Hidden = item.Hidden || r.Kind == model.VideoTypeIgnore
 	if r.Title != "" {
 		item.ScrapedName = r.Title
+		item.FileTitle = r.Title
 	}
 	item.OriginalTitle = r.English
 	if r.Year > 0 {

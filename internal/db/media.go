@@ -104,6 +104,9 @@ type MediaItemQuery struct {
 	// TopLevel leaves out the works that sit inside another work of the library
 	// (members of a collection, extras of a show): they are listed under it.
 	TopLevel bool
+	// TitleSource is the media_title_source setting: the order by name follows the
+	// title that is shown (model.TitleSourceFile or TitleSourceScraped).
+	TitleSource string
 	OrderBy    string // "name", "date", "size"
 	OrderDir   string // "asc", "desc"
 	Page       int
@@ -194,6 +197,10 @@ func mediaItemsOrder(tx *gorm.DB, q MediaItemQuery) *gorm.DB {
 	case "name":
 		// SortName is the pinyin/zero-padded key kept by MediaItem.BeforeSave; rows
 		// not yet backfilled fall back to the title
+		if q.TitleSource == model.TitleSourceFile {
+			orderCol = "COALESCE(NULLIF(" + mediaItemCol("sort_name_file") + ",''), NULLIF(" + mediaItemCol("sort_name") + ",''), " + mediaItemCol("file_name") + ")"
+			break
+		}
 		orderCol = "COALESCE(NULLIF(" + mediaItemCol("sort_name") + ",''), NULLIF(" + mediaItemCol("scraped_name") + ",''), " + mediaItemCol("file_name") + ")"
 	case "date":
 		orderCol = mediaItemCol("release_date")
@@ -430,6 +437,7 @@ func ClearMediaScrapedData(mediaType model.MediaType) (int64, error) {
 		"candidates":     "",
 		"scraped_name":   "",
 		"sort_name":      "",
+		"sort_name_file": "",
 		"description":    "",
 		"cover":          "",
 		"release_date":   "",
@@ -771,6 +779,44 @@ func FindScanPathFor(mediaType model.MediaType, p string) (*model.MediaScanPath,
 	return best, nil
 }
 
+// backfillMediaFileTitles fills FileTitle of the video works written before the
+// column existed: the title the identification reads from the folder or file
+// name. A scan keeps it current afterwards. It runs before the sort names.
+// FileTitleOf cleans a folder or file name into a title. internal/media sets it
+// (it can import the identification; this package cannot).
+var FileTitleOf = func(name string, isFile bool) string { return "" }
+
+func backfillMediaFileTitles() error {
+	table := tableOf(&model.MediaItem{})
+	last := uint(0)
+	for {
+		var rows []model.MediaItem
+		if err := db.Unscoped().Select("id", "file_name", "is_folder").
+			Where("media_type = ? AND file_title = ? AND id > ?", model.MediaTypeVideo, "", last).Order("id asc").Limit(mediaItemsBatch).Find(&rows).Error; err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+		err := db.Transaction(func(tx *gorm.DB) error {
+			for i := range rows {
+				title := FileTitleOf(rows[i].FileName, !rows[i].IsFolder)
+				if title == "" {
+					continue
+				}
+				if err := tx.Table(table).Where("id = ?", rows[i].ID).UpdateColumn("file_title", title).Error; err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		last = rows[len(rows)-1].ID
+	}
+}
+
 // backfillMediaSortNames fills SortName of the rows written before the column
 // existed (and those a clearing update emptied). It runs at start-up, in id
 // order and in batches; rows with no title stay empty.
@@ -779,8 +825,8 @@ func backfillMediaSortNames() error {
 	last := uint(0)
 	for {
 		var rows []model.MediaItem
-		if err := db.Unscoped().Select("id", "scraped_name", "file_name").
-			Where("sort_name = ? AND id > ?", "", last).Order("id asc").Limit(mediaItemsBatch).Find(&rows).Error; err != nil {
+		if err := db.Unscoped().Select("id", "scraped_name", "file_name", "file_title", "is_folder", "locked", "source").
+			Where("(sort_name = ? OR sort_name_file = ?) AND id > ?", "", "", last).Order("id asc").Limit(mediaItemsBatch).Find(&rows).Error; err != nil {
 			return err
 		}
 		if len(rows) == 0 {
@@ -788,11 +834,9 @@ func backfillMediaSortNames() error {
 		}
 		err := db.Transaction(func(tx *gorm.DB) error {
 			for i := range rows {
-				key := model.MediaSortName(rows[i].SortTitle())
-				if key == "" {
-					continue
-				}
-				if err := tx.Table(table).Where("id = ?", rows[i].ID).UpdateColumn("sort_name", key).Error; err != nil {
+				fileTitle, _ := rows[i].DisplayTitles(model.TitleSourceFile)
+				keys := map[string]any{"sort_name": model.MediaSortName(rows[i].SortTitle()), "sort_name_file": model.MediaSortName(fileTitle)}
+				if err := tx.Table(table).Where("id = ?", rows[i].ID).UpdateColumns(keys).Error; err != nil {
 					return err
 				}
 			}

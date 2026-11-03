@@ -32,6 +32,11 @@ type MediaItemView struct {
 	// than one): clients show a version picker, not an episode list, and the
 	// entries of episode_list are marked version.
 	Versions int `json:"versions,omitempty"`
+	// DisplayTitle is the title to show, by the media_title_source setting (the
+	// cleaned file name, or the scraped title; a title a person set is shown as set
+	// in both). AltTitle is the other one, only when it differs.
+	DisplayTitle string `json:"display_title"`
+	AltTitle     string `json:"alt_title,omitempty"`
 }
 
 // MediaEpisodeView is one episode of a show.
@@ -51,6 +56,7 @@ type mediaViewer struct {
 	user    *model.User
 	rel     func(string) string
 	ratings map[uint][]model.MediaRating
+	titles  string // media_title_source
 }
 
 // newMediaViewer prepares the views of items (their ratings are read in one
@@ -64,7 +70,7 @@ func newMediaViewer(user *model.User, items []model.MediaItem) (*mediaViewer, er
 	if err != nil {
 		return nil, err
 	}
-	v := &mediaViewer{user: user, ratings: rs, rel: identityPath}
+	v := &mediaViewer{user: user, ratings: rs, rel: identityPath, titles: mediaTitleSource()}
 	if user != nil {
 		v.rel = userRelPath(user)
 	}
@@ -78,6 +84,7 @@ func (v *mediaViewer) view(it *model.MediaItem) MediaItemView {
 		Ratings:  store.RatingsToMap(v.ratings[it.ID]),
 		CoverURL: mediaCoverURL(it.Cover), BackdropURL: mediaCoverURL(it.Backdrop),
 	}
+	out.DisplayTitle, out.AltTitle = it.DisplayTitles(v.titles)
 	if v.user == nil || !v.user.IsAdmin() {
 		out.Candidates = ""
 	}

@@ -242,6 +242,7 @@ func ListMediaItemsAdmin(c *gin.Context) {
 		ScanPathID: scanPathID,
 		Keyword:    keyword,
 		OrderBy:    orderBy,
+		TitleSource: mediaTitleSource(),
 		OrderDir:   orderDir,
 		Page:       page,
 		PageSize:   pageSize,
@@ -874,6 +875,7 @@ func PublicListMedia(c *gin.Context) {
 		Keyword:    keyword,
 		TopLevel:   topLevel,
 		OrderBy:    orderBy,
+		TitleSource: mediaTitleSource(),
 		OrderDir:   orderDir,
 		Page:       page,
 		PageSize:   pageSize,
@@ -1248,4 +1250,12 @@ func ImportMediaDB(c *gin.Context) {
 // filter lists every matching work.
 func listsTopLevel(mediaType model.MediaType, folderPath, keyword, path, flat string, kinds []string) bool {
 	return mediaType == model.MediaTypeVideo && folderPath == "" && keyword == "" && path == "" && flat == "" && len(kinds) == 0
+}
+
+// mediaTitleSource is the media_title_source setting: "file" (default) or "scraped".
+func mediaTitleSource() string {
+	if setting.GetStr(conf.MediaTitleSource, model.TitleSourceFile) == model.TitleSourceScraped {
+		return model.TitleSourceScraped
+	}
+	return model.TitleSourceFile
 }

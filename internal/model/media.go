@@ -59,6 +59,11 @@ type MediaItem struct {
 	ScrapedName string  `json:"scraped_name"`
 	// SortName is the key order_by=name sorts on (see MediaSortName); kept by BeforeSave.
 	SortName string `gorm:"size:191;index" json:"-"`
+	// FileTitle is the title the identification derived from the folder or file name
+	// (release tags, resolution and group stripped); a scan sets it, a scrape never
+	// touches it. SortNameFile is the sort key of the file-name display title.
+	FileTitle    string `gorm:"size:255" json:"-"`
+	SortNameFile string `gorm:"size:191;index" json:"-"`
 	Description string  `gorm:"type:text"               json:"description"`
 	Cover       string  `json:"cover"`                                  // 封面URL或本地路径
 	ReleaseDate string  `json:"release_date"`                           // 发布时间，格式 YYYY-MM-DD

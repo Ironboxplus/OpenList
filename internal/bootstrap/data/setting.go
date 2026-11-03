@@ -337,6 +337,8 @@ func InitialSettings() []model.SettingItem {
 			Help: `Google Books API Key，可留空（无 Key 时配额较低）；申请地址 https://developers.google.com/books/docs/v1/using#APIKey`},
 		{Key: conf.MediaDownloadCover, Value: "false", Type: conf.TypeBool, Group: model.MEDIA, Flag: model.PRIVATE,
 			Help: `开启后把 TMDB / Google Books / OpenLibrary 等返回的封面链接下载到下方缩略图存储路径，而不是直接保存图片链接`},
+		{Key: conf.MediaTitleSource, Value: "file", Type: conf.TypeSelect, Options: "file,scraped", Group: model.MEDIA, Flag: model.PUBLIC,
+			Help: `标题来源 / Title source：file = 文件名（经识别清洗，去掉发布组、分辨率等）；scraped = 刮削标题。手动改过或锁定的标题两种模式下都保持不变`},
 		{Key: conf.MediaEnabled, Value: "false", Type: conf.TypeBool, Group: model.MEDIA, Flag: model.PUBLIC,
 			Help: `媒体库总开关。关闭时媒体库相关页面、API 与协议端点全部不可用（返回 404），与未安装媒体库时表现一致`},
 		{Key: conf.MediaEmbyEnabled, Value: "false", Type: conf.TypeBool, Group: model.MEDIA, Flag: model.PRIVATE,

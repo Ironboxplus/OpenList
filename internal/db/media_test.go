@@ -157,3 +157,62 @@ func TestMediaNameOrderUsesTheSortKeyAndTopLevelHidesMembers(t *testing.T) {
 		t.Fatalf("top level: %v, want %v", got, top)
 	}
 }
+
+func TestMediaNameOrderFollowsTheTitleSource(t *testing.T) {
+	conf.Conf = conf.DefaultConfig(t.TempDir())
+	d, err := gorm.Open(sqlite.Open(fmt.Sprintf("file:db-media-title-src-%d?mode=memory&cache=shared", time.Now().UnixNano())), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	Init(d)
+	save := func(name, file, scraped string, locked bool) {
+		it := &model.MediaItem{MediaType: model.MediaTypeVideo, FolderPath: "/lib", FileName: name, FileTitle: file, ScrapedName: scraped, IsFolder: true}
+		it.VideoType, it.Locked = model.MediaKindMovie, locked
+		if err := SaveVideoItem(it, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// the file says Alpha, the scraper Zulu; and the reverse; and one a person fixed
+	save("a", "Alpha", "Zulu", false)
+	save("b", "Yankee", "Bravo", false)
+	save("c", "Delta", "Mike", true)
+	order := func(src string) string {
+		items, _, err := ListMediaItems(MediaItemQuery{MediaType: model.MediaTypeVideo, OrderBy: "name", TitleSource: src, PageSize: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, it := range items {
+			out = append(out, it.FileName)
+		}
+		return fmt.Sprint(out)
+	}
+	// file: Alpha, Mike (locked: as set), Yankee; scraped: Bravo, Mike, Zulu
+	if got := order(model.TitleSourceFile); got != "[a c b]" {
+		t.Errorf("file order %s", got)
+	}
+	if got := order(model.TitleSourceScraped); got != "[b c a]" {
+		t.Errorf("scraped order %s", got)
+	}
+
+	// rows from before the columns existed get both keys and the file title at start-up
+	old := &model.MediaItem{MediaType: model.MediaTypeVideo, FolderPath: "/lib", FileName: "Old.Film.2001.1080p.mkv", ScrapedName: "Old"}
+	old.VideoType = model.MediaKindMovie
+	if err := SaveVideoItem(old, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	db.Model(&model.MediaItem{}).Where("id = ?", old.ID).UpdateColumns(map[string]any{"sort_name": "", "sort_name_file": "", "file_title": ""})
+	FileTitleOf = func(name string, _ bool) string { return "Old Film" }
+	defer func() { FileTitleOf = func(string, bool) string { return "" } }()
+	if err := backfillMediaFileTitles(); err != nil {
+		t.Fatal(err)
+	}
+	if err := backfillMediaSortNames(); err != nil {
+		t.Fatal(err)
+	}
+	var got model.MediaItem
+	db.First(&got, old.ID)
+	if got.FileTitle != "Old Film" || got.SortName != "old" || got.SortNameFile != "old film" {
+		t.Errorf("backfill: %+v", got)
+	}
+}

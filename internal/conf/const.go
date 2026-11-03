@@ -208,6 +208,7 @@ const (
 	MediaStoreThumbnail    = "media_store_thumbnail"
 	MediaScrapeConcurrency = "media_scrape_concurrency"
 	MediaScrapeLanguage    = "media_scrape_language"  // 首选刮削语言（TMDB / Google Books）
+	MediaTitleSource       = "media_title_source"     // 作品标题显示来源：file（文件名清洗后）/ scraped（刮削标题），PUBLIC
 	MediaBookSource        = "media_book_source"      // 书籍刮削源：douban/google/openlibrary
 	MediaGoogleBooksKey    = "media_google_books_key" // Google Books API Key（可选）
 	MediaDownloadCover     = "media_download_cover"   // 是否把远程封面下载到本地存储
