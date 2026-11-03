@@ -704,3 +704,72 @@ func TestFetchFollowsConfiguredChannelTag(t *testing.T) {
 		}
 	}
 }
+
+// A host that cannot reach github.com (txcloud in China) must still update: the
+// tarball comes through the API asset endpoint, which redirects to the CDN.
+// Any request to a github.com-style download path fails the test.
+func TestFetchDownloadsThroughTheAPIAssetEndpoint(t *testing.T) {
+	tarData := createTestTarGz(t, map[string]string{"./dist/index.html": "<html>api asset</html>"})
+	var browserHits, apiHits int
+	var accept string
+	blob := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(tarData)
+	}))
+	defer blob.Close()
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/OpenListTeam/OpenList-Frontend/releases/tags/canary":
+			w.Write([]byte(fmt.Sprintf(`{"tag_name":"canary","assets":[{"id":4242,"url":"%s/repos/OpenListTeam/OpenList-Frontend/releases/assets/4242","name":"openlist-frontend-dist.tar.gz","browser_download_url":"%s/OpenListTeam/OpenList-Frontend/releases/download/canary/openlist-frontend-dist.tar.gz"}]}`, ts.URL, ts.URL)))
+		case r.URL.Path == "/repos/OpenListTeam/OpenList-Frontend/git/ref/tags/canary":
+			w.Write([]byte(`{"object":{"type":"commit","sha":"0123456789abcdef0123456789abcdef01234567"}}`))
+		case r.URL.Path == "/repos/OpenListTeam/OpenList-Frontend/releases/assets/4242":
+			apiHits++
+			accept = r.Header.Get("Accept")
+			http.Redirect(w, r, blob.URL+"/release-assets/blob", http.StatusFound)
+		case strings.Contains(r.URL.Path, "/releases/download/"):
+			browserHits++ // github.com/<repo>/releases/download/...
+			w.WriteHeader(http.StatusServiceUnavailable)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer ts.Close()
+
+	ResetFetchState()
+	os.RemoveAll(filepath.Join(GetDistPath(), distDirName))
+	os.Remove(GetVersionFilePath())
+	res, err := fetchFromTag(context.Background(), "canary", ts.URL)
+	if err != nil {
+		t.Fatalf("fetchFromTag: %v", err)
+	}
+	if browserHits != 0 {
+		t.Errorf("%d requests went to the github.com download path", browserHits)
+	}
+	if apiHits != 1 || accept != "application/octet-stream" {
+		t.Errorf("asset endpoint hits %d, Accept %q", apiHits, accept)
+	}
+	if b, _ := os.ReadFile(filepath.Join(res.DistPath, "index.html")); string(b) != "<html>api asset</html>" {
+		t.Errorf("index.html = %q", b)
+	}
+
+	// the API download failing falls back to the browser URL
+	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/releases/tags/canary"):
+			w.Write([]byte(fmt.Sprintf(`{"tag_name":"canary","assets":[{"id":7,"name":"openlist-frontend-dist.tar.gz","browser_download_url":"%s/releases/download/canary/d.tar.gz"}]}`, "http://"+r.Host)))
+		case strings.HasSuffix(r.URL.Path, "/releases/assets/7"):
+			w.WriteHeader(http.StatusForbidden)
+		case strings.HasSuffix(r.URL.Path, "/d.tar.gz"):
+			w.Write(tarData)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer ts2.Close()
+	os.RemoveAll(filepath.Join(GetDistPath(), distDirName))
+	os.Remove(GetVersionFilePath())
+	if _, err := fetchFromTag(context.Background(), "canary", ts2.URL); err != nil {
+		t.Fatalf("fallback: %v", err)
+	}
+}

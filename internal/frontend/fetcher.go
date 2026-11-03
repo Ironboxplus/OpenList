@@ -92,6 +92,8 @@ func FetchFromLatest(ctx context.Context) (*FetchResult, error) {
 type githubRelease struct {
 	TagName string `json:"tag_name"`
 	Assets  []struct {
+		ID                 int64  `json:"id"`
+		URL                string `json:"url"`
 		BrowserDownloadURL string `json:"browser_download_url"`
 		Name               string `json:"name"`
 	} `json:"assets"`
@@ -261,12 +263,13 @@ func fetchFromTag(ctx context.Context, tag string, baseURL string) (*FetchResult
 	}
 
 	// Find the dist tarball URL (non-lite)
-	var tarURL string
+	var tarURL, apiAssetURL string
 	for _, asset := range release.Assets {
 		if strings.Contains(asset.Name, "openlist-frontend-dist") &&
 			!strings.Contains(asset.Name, "lite") &&
 			strings.HasSuffix(asset.Name, ".tar.gz") {
 			tarURL = asset.BrowserDownloadURL
+			apiAssetURL = assetAPIURL(baseURL, repo, asset.ID, asset.URL)
 			break
 		}
 	}
@@ -295,8 +298,19 @@ func fetchFromTag(ctx context.Context, tag string, baseURL string) (*FetchResult
 	}
 
 	utils.Log.Infof("[frontend] downloading version %s from %s", resolvedVersion, tarURL)
-	if err := downloadAndExtract(ctx, client, tarURL); err != nil {
-		return nil, fmt.Errorf("download and extract: %w", err)
+	// Download through the API asset endpoint: it answers 302 to the release CDN
+	// and never touches github.com, which some networks cannot reach. The
+	// browser URL is only the fallback.
+	var dlErr error
+	if apiAssetURL != "" {
+		if dlErr = downloadAndExtract(ctx, client, apiAssetURL, "application/octet-stream"); dlErr != nil {
+			utils.Log.Warnf("[frontend] API asset download failed, trying the browser URL: %v", dlErr)
+		}
+	}
+	if apiAssetURL == "" || dlErr != nil {
+		if err := downloadAndExtract(ctx, client, tarURL, ""); err != nil {
+			return nil, fmt.Errorf("download and extract: %w", err)
+		}
 	}
 
 	if err := writeVersion(resolvedVersion); err != nil {
@@ -311,12 +325,32 @@ func fetchFromTag(ctx context.Context, tag string, baseURL string) (*FetchResult
 	}, nil
 }
 
-func downloadAndExtract(ctx context.Context, client *http.Client, url string) error {
+// assetAPIURL is the API endpoint of a release asset,
+// GET /repos/{owner}/{repo}/releases/assets/{asset_id} ("Get a release asset",
+// GitHub REST docs): with Accept: application/octet-stream it redirects to the
+// asset's CDN URL, which is how gh release download fetches assets. baseURL
+// replaces api.github.com (tests). Without an id the url field of the asset is
+// used; "" when neither is known.
+func assetAPIURL(baseURL, repo string, id int64, assetURL string) string {
+	if id == 0 {
+		return assetURL
+	}
+	apiBase := "https://api.github.com"
+	if baseURL != "" {
+		apiBase = strings.TrimRight(baseURL, "/")
+	}
+	return fmt.Sprintf("%s/repos/%s/releases/assets/%d", apiBase, repo, id)
+}
+
+func downloadAndExtract(ctx context.Context, client *http.Client, url, accept string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return fmt.Errorf("create download request: %w", err)
 	}
 	req.Header.Set("User-Agent", "OpenList")
+	if accept != "" {
+		req.Header.Set("Accept", accept)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {
