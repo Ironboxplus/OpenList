@@ -82,7 +82,6 @@ func mainVideos(videos []Entry) []Entry {
 	return out
 }
 
-
 // Directory names that are seasons of one show: the keyword forms at the
 // start ("Season 2", "第3季", "Specials"), and a season marker anywhere in the
 // name, because release folders carry the show name first ("Friends.S01.1080p",
@@ -205,7 +204,6 @@ func peekKinds(dirs []Entry, peek Peek) []string {
 	}
 	return out
 }
-
 
 // specialDirRe are directory names that are extras of a show or a film rather
 // than seasons when nothing else says "show".
@@ -382,7 +380,6 @@ func extendsSeason(season string, workDirs []Entry) bool {
 	}
 	return false
 }
-
 
 // dominant: one video is at least 80% of all video bytes (the rest are
 // trailers and samples).

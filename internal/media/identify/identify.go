@@ -15,20 +15,21 @@ import (
 
 // Result is what the rules concluded about one item.
 type Result struct {
-	Kind       string // movie | tv | anime | collection | ignore
-	Theatrical bool   // an anime movie (剧场版): look it up as a movie
-	Title      string
-	English    string
-	Year       int
-	Season     int
-	Episodes   int     // announced episode count, 0 = unknown
-	Confidence float32 // how sure the rules are about Kind
-	Why        string
-	Parsed     scraper.ParsedName // for building search terms
-	Group      string
-	TMDBID     string // inline id tag in the name (digits); wins over any search
-	IMDbID     string
-	Versions   []string // movie: the files that are versions of it, default first
+	Kind        string // movie | tv | anime | collection | ignore
+	Theatrical  bool   // an anime movie (剧场版): look it up as a movie
+	Title       string
+	English     string
+	Year        int
+	Season      int
+	Episodes    int     // announced episode count, 0 = unknown
+	Confidence  float32 // how sure the rules are about Kind
+	Why         string
+	Parsed      scraper.ParsedName // for building search terms
+	Group       string
+	TMDBID      string // inline id tag in the name (digits); wins over any search
+	IMDbID      string
+	Versions    []string // movie: the files that are versions of it, default first
+	FromContent bool     // Kind comes from what the directory holds, not from its name
 }
 
 // Terms are the queries to send to a provider, best first.
@@ -114,6 +115,7 @@ func ClassifyWith(name string, isDir bool, entries []Entry, peek Peek) Result {
 		kind = "movie"
 	}
 	r.Kind, r.Confidence, r.Why = kind, conf, why
+	r.FromContent = shape.Kind != "" && shape.Kind == kind
 	if kind == "movie" || kind == "anime" {
 		r.Versions = shape.Versions
 	}

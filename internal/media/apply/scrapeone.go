@@ -95,6 +95,14 @@ func (o *Orchestrator) ScrapeOne(ctx context.Context, p string, opts ScrapeOpts)
 		}
 	}
 
+	if !explicit && !inline && r.Kind == "collection" {
+		if best, ok := o.showBehindCollection(ctx, r); ok {
+			r.Kind = "tv"
+			opts.Provider, opts.ID, inline = best.Provider, best.ID, true
+			res.Confidence = best.Score
+		}
+	}
+
 	if !explicit && !inline {
 		if r.Kind == "ignore" || r.Kind == "collection" {
 			src := model.MediaSourceRule
@@ -176,4 +184,26 @@ func toModelCandidates(cs []scraper.Candidate) []model.MediaCandidate {
 		out = append(out, model.MediaCandidate{Provider: c.Provider, ID: c.ID, Title: c.Title, Year: c.Year, PosterURL: c.PosterURL, Score: c.Score})
 	}
 	return out
+}
+
+// showBehindCollection asks the provider whether a directory the rules took
+// for a collection is really one show whose subdirectories are its seasons or
+// releases (魔道祖师, 星蝶公主: two folders, one show). One tv search; a strong
+// tv hit counts only when no film of that name scores as well, so a film
+// series (教父) is never merged into a show. Names alone cannot decide this:
+// the benchmark found no rule that separates the two.
+func (o *Orchestrator) showBehindCollection(ctx context.Context, r identify.Result) (scraper.Candidate, bool) {
+	if r.Kind != "collection" || !r.FromContent {
+		return scraper.Candidate{}, false
+	}
+	q := scraper.IdentifyQuery{Terms: r.Terms(), Year: r.Year, English: r.English}
+	tv, err := o.search().Identify(ctx, "tv", false, q)
+	if err != nil || len(tv) == 0 || tv[0].Score < scraper.StrongMatch || !strings.HasPrefix(tv[0].ID, "tv/") {
+		return scraper.Candidate{}, false
+	}
+	film, err := o.search().Identify(ctx, "movie", false, q)
+	if err == nil && len(film) > 0 && film[0].Score >= tv[0].Score {
+		return scraper.Candidate{}, false
+	}
+	return tv[0], true
 }

@@ -6,9 +6,9 @@ func TestSeasonMarkerAnywhereInADirectoryName(t *testing.T) {
 	for name, want := range map[string]int{
 		"Friends.S01.1080p.BluRay.x265-RARBG":      1,
 		"Jojo No Kimyou Na Bouken S06 Stone Ocean": 6,
-		"葬送的芙莉莲 S01":                              1,
-		"绝命D师 第3季 2008 豆瓣9.2":                     3,
-		"【熟肉】Love.Death.and.Robots.S02":          2,
+		"葬送的芙莉莲 S01":                               1,
+		"绝命D师 第3季 2008 豆瓣9.2":                      3,
+		"【熟肉】Love.Death.and.Robots.S02":            2,
 		"Love.Death.and.Robots.S03-v2":             3,
 		"S01高码率":                                   1,
 		"BEASTARS 2nd Season":                      2,
@@ -63,7 +63,7 @@ func TestSeasonDirsOfDifferentShowsStayACollection(t *testing.T) {
 
 func TestEpisodeFilesInSeasonNamedDirs(t *testing.T) {
 	tree := map[string][]Entry{
-		"": cat(dirs("Friends.S01.1080p", "Friends.S02.1080p", "[Subs]")),
+		"":                  cat(dirs("Friends.S01.1080p", "Friends.S02.1080p", "[Subs]")),
 		"Friends.S01.1080p": vids("Friends.S01E01.mkv", "Friends.S01E02.mkv"),
 		"Friends.S02.1080p": vids("Friends.S02E01.mkv"),
 	}
@@ -77,9 +77,9 @@ func TestEpisodeFilesInSeasonNamedDirs(t *testing.T) {
 // convention), not an episode of a numbered season.
 func TestFilmNextToSeasonsIsASpecial(t *testing.T) {
 	tree := map[string][]Entry{
-		"": dirs("绝命D师 第1季", "绝命D师 第2季", "绝命D师电影 续命之徒 2019"),
-		"绝命D师 第1季":        eps("Breaking.Bad.S01E%02d.mkv", 2),
-		"绝命D师 第2季":        eps("Breaking.Bad.S02E%02d.mkv", 2),
+		"":                 dirs("绝命D师 第1季", "绝命D师 第2季", "绝命D师电影 续命之徒 2019"),
+		"绝命D师 第1季":         eps("Breaking.Bad.S01E%02d.mkv", 2),
+		"绝命D师 第2季":         eps("Breaking.Bad.S02E%02d.mkv", 2),
 		"绝命D师电影 续命之徒 2019": one("El.Camino.2019.1080p.mkv"),
 	}
 	got, err := EpisodeFiles(func(rel string) ([]Entry, error) { return tree[rel], nil })

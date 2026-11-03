@@ -14,7 +14,7 @@ import (
 // names and sizes only, three levels below each root, recorded 2026-11-03):
 // the offline replay every identification rule must keep passing.
 type libNode struct {
-	E [][]any            `json:"e"` // [name, size] or [name, 0, 1] for a directory
+	E [][]any             `json:"e"` // [name, size] or [name, 0, 1] for a directory
 	C map[string]*libNode `json:"c"`
 }
 
