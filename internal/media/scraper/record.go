@@ -34,10 +34,17 @@ type Recorder struct {
 // RecordedResponse is one kept answer. URL has no scheme and no key parameter.
 type RecordedResponse struct {
 	Provider string `json:"provider"`
+	// Method is empty for GET. Request is the body of a POST (Bangumi searches are
+	// POSTs); it holds no credential.
+	Method   string `json:"method,omitempty"`
+	Request  string `json:"request,omitempty"`
 	URL      string `json:"url"`
 	Status   int    `json:"status"`
 	Body     string `json:"body"`
 }
+
+// maxRequestBody caps the POST body that is kept.
+const maxRequestBody = 64 << 10
 
 // ErrRecordLimit is returned (and nothing is sent) once MaxRequests is reached.
 var ErrRecordLimit = errors.New("recorder: request limit reached")
@@ -91,8 +98,19 @@ func (t recorderTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 	r.total++
 	r.requests[prov]++
+	var sent []byte
+	if req.Method == http.MethodPost && req.Body != nil {
+		var rerr error
+		if sent, rerr = io.ReadAll(req.Body); rerr != nil {
+			return nil, rerr
+		}
+		_ = req.Body.Close()
+		req = req.Clone(req.Context())
+		req.Body = io.NopCloser(bytes.NewReader(sent))
+		req.ContentLength = int64(len(sent))
+	}
 	resp, err := t.next.RoundTrip(req)
-	if err != nil || req.Method != http.MethodGet || prov == "tmdb_image" {
+	if err != nil || (req.Method != http.MethodGet && req.Method != http.MethodPost) || prov == "tmdb_image" || len(sent) > maxRequestBody {
 		return resp, err
 	}
 	body, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
@@ -102,7 +120,11 @@ func (t recorderTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	if len(body) <= maxBody {
-		r.entries = append(r.entries, RecordedResponse{Provider: prov, URL: cleanURL(req.URL), Status: resp.StatusCode, Body: string(body)})
+		e := RecordedResponse{Provider: prov, URL: cleanURL(req.URL), Status: resp.StatusCode, Body: string(body)}
+		if req.Method == http.MethodPost {
+			e.Method, e.Request = "POST", string(sent)
+		}
+		r.entries = append(r.entries, e)
 	}
 	return resp, nil
 }
@@ -153,6 +175,7 @@ func (r *Recorder) Marshal() ([]byte, error) {
 			}
 			e.URL = strings.ReplaceAll(e.URL, s, "<redacted>")
 			e.Body = strings.ReplaceAll(e.Body, s, "<redacted>")
+			e.Request = strings.ReplaceAll(e.Request, s, "<redacted>")
 		}
 		line, err := json.Marshal(e)
 		if err != nil {

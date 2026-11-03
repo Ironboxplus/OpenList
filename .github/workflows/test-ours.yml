@@ -22,6 +22,8 @@ defaults:
 
 env:
   CGO_ENABLED: "0"
+  # pipe = fall through to the next proxy on any error (proxy.golang.org drops streams now and then)
+  GOPROXY: "https://proxy.golang.org|https://goproxy.cn|direct"
 
 jobs:
   test:

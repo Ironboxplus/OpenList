@@ -75,3 +75,31 @@ func TestRecorderRefusesToWriteASurvivingSecret(t *testing.T) {
 		t.Fatal("a secret that reappears after redaction was written")
 	}
 }
+
+func TestRecorderKeepsPostBodies(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b := new(bytes.Buffer)
+		_, _ = b.ReadFrom(r.Body)
+		_, _ = w.Write(append([]byte("got "), b.Bytes()...))
+	}))
+	defer srv.Close()
+	cfg := Config{BaseURLs: map[string]string{"bgm": srv.URL}}
+	rec, err := Record(&cfg, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := cfg.HTTPClient.Post(srv.URL+"/v0/search/subjects?limit=10", "application/json", strings.NewReader(`{"keyword":"x"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got bytes.Buffer
+	_, _ = got.ReadFrom(resp.Body)
+	_ = resp.Body.Close()
+	if got.String() != `got {"keyword":"x"}` {
+		t.Fatalf("the server saw %q", got.String())
+	}
+	data, _ := rec.Marshal()
+	if !strings.Contains(string(data), `"method":"POST"`) || !strings.Contains(string(data), `keyword`) {
+		t.Fatalf("recorded: %s", data)
+	}
+}
