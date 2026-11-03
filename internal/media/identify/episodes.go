@@ -75,6 +75,60 @@ func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error)
 			}
 		}
 	}
+	// No season folders and no episodes of its own: the subfolders are copies or
+	// seasons under other names (魔道祖师: two releases, 星蝶公主: two languages).
+	// A folder that names its season keeps it; of the others the one with most
+	// episodes is the show and the rest are taken for copies of it.
+	if seasonDirs == 0 && len(files) == 0 {
+		type variant struct {
+			refs   []fileRef
+			season int
+		}
+		var named, unnamed []variant
+		for i, d := range specialDirs {
+			if i >= maxSeasonDirs {
+				break
+			}
+			kids, err := list(d.Name)
+			if err != nil {
+				return nil, fmt.Errorf("list %s: %w", d.Name, err)
+			}
+			v := variant{season: seasonOfDirName(d.Name)}
+			for _, k := range kids {
+				if _, _, ok := EpisodeOf(k.Name); ok && !k.IsDir && IsVideo(k.Name) {
+					v.refs = append(v.refs, fileRef{rel: path.Join(d.Name, k.Name), name: k.Name, dirSeason: v.season})
+				}
+			}
+			switch {
+			case len(v.refs) == 0:
+			case v.season > 0:
+				named = append(named, v)
+			default:
+				unnamed = append(unnamed, v)
+			}
+		}
+		taken := map[int]bool{}
+		for _, v := range named {
+			taken[v.season] = true
+			files = append(files, v.refs...)
+		}
+		if len(unnamed) > 0 {
+			best := unnamed[0]
+			for _, v := range unnamed[1:] {
+				if len(v.refs) > len(best.refs) {
+					best = v
+				}
+			}
+			s := 1
+			for taken[s] {
+				s++
+			}
+			for _, r := range best.refs {
+				r.dirSeason = s
+				files = append(files, r)
+			}
+		}
+	}
 	// A directory next to the seasons holding one video without an episode
 	// marker is a film of the show (续命之徒 beside 绝命毒师's five seasons): a
 	// special, season 0, as Jellyfin files it.

@@ -654,16 +654,18 @@ func normalizeForCompare(s string) string {
 
 // tmdbHit 从 tmdbSearchResult.Results 提取出来的单个命中项（仅用于内部传递）
 type tmdbHit = struct {
-	ID           int     `json:"id"`
-	Title        string  `json:"title"`
-	Name         string  `json:"name"`
-	Overview     string  `json:"overview"`
-	PosterPath   string  `json:"poster_path"`
-	ReleaseDate  string  `json:"release_date"`
-	FirstAirDate string  `json:"first_air_date"`
-	VoteAverage  float32 `json:"vote_average"`
-	MediaType    string  `json:"media_type"`
-	GenreIDs     []int   `json:"genre_ids"`
+	ID            int     `json:"id"`
+	Title         string  `json:"title"`
+	Name          string  `json:"name"`
+	OriginalTitle string  `json:"original_title"`
+	OriginalName  string  `json:"original_name"`
+	Overview      string  `json:"overview"`
+	PosterPath    string  `json:"poster_path"`
+	ReleaseDate   string  `json:"release_date"`
+	FirstAirDate  string  `json:"first_air_date"`
+	VoteAverage   float32 `json:"vote_average"`
+	MediaType     string  `json:"media_type"`
+	GenreIDs      []int   `json:"genre_ids"`
 }
 
 // scoreMatch 给一个 TMDB 搜索结果打分，作为「这个 hit 是否可信」的依据。
@@ -681,6 +683,13 @@ func scoreMatch(query string, year string, hit tmdbHit) float32 {
 	}
 
 	titleSim := titleSimilarity(query, hitTitle)
+	// a hit is also its original title: TMDB's zh-CN title of Love, Death & Robots is
+	// English and that of One Flew Over the Cuckoo's Nest is 飞越疯人院
+	for _, orig := range []string{hit.OriginalTitle, hit.OriginalName} {
+		if orig != "" && orig != hitTitle {
+			titleSim = max(titleSim, titleSimilarity(query, orig))
+		}
+	}
 
 	var yearScore float32
 	if year == "" {
@@ -958,6 +967,7 @@ func extractCandidates(parsed parsedVideoTitle, bracketChinese []string) []Title
 // foldTitle removes diacritics ("Léon" -> "Leon") so accented and plain
 // spellings compare equal.
 func foldTitle(s string) string {
+	s = strings.Join(strings.Fields(strings.ReplaceAll(s, "&", " and ")), " ")
 	d := norm.NFD.String(s)
 	var b strings.Builder
 	for _, r := range d {

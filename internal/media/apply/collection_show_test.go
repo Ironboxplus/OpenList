@@ -31,13 +31,20 @@ func TestCollectionThatIsOneShowOnTMDBBecomesTheShow(t *testing.T) {
 		"movie|教父": {{Provider: "tmdb", ID: "movie/238", Title: "教父", Score: 0.95}},
 	}}
 	o := &Orchestrator{Search: s}
-	got, ok := o.showBehindCollection(context.Background(), identify.Result{Kind: "collection", FromContent: true, Title: "星蝶公主", Parsed: scraper.ParseName("星蝶公主.mkv")})
+	got, ok := o.showBehindCollection(context.Background(), identify.Result{Kind: "collection", FromContent: true, ChildKinds: []string{"tv", "tv"}, Title: "星蝶公主", Parsed: scraper.ParseName("星蝶公主.mkv")})
 	if !ok || got.ID != "tv/1" {
 		t.Fatalf("星蝶公主: %v %v", got, ok)
 	}
 	// a film series: the film scores as well as the show, so it stays a collection
-	if _, ok := o.showBehindCollection(context.Background(), identify.Result{Kind: "collection", FromContent: true, Title: "教父", Parsed: scraper.ParseName("教父.mkv")}); ok {
+	if _, ok := o.showBehindCollection(context.Background(), identify.Result{Kind: "collection", FromContent: true, ChildKinds: []string{"tv", ""}, Title: "教父", Parsed: scraper.ParseName("教父.mkv")}); ok {
 		t.Fatal("教父 merged into a show")
+	}
+	// children seen to be films, or a verdict made of positive evidence: never a show
+	if _, ok := o.showBehindCollection(context.Background(), identify.Result{Kind: "collection", FromContent: true, ChildKinds: []string{"movie", "movie"}, Title: "星蝶公主", Parsed: scraper.ParseName("星蝶公主.mkv")}); ok {
+		t.Fatal("a collection of films became a show")
+	}
+	if _, ok := o.showBehindCollection(context.Background(), identify.Result{Kind: "collection", FromContent: true, Firm: true, ChildKinds: []string{"tv", "tv"}, Title: "星蝶公主", Parsed: scraper.ParseName("星蝶公主.mkv")}); ok {
+		t.Fatal("a firm collection was overridden")
 	}
 	// a collection decided by its name alone is not searched at all
 	before := len(s.calls)

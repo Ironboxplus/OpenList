@@ -28,8 +28,11 @@ type Result struct {
 	Group       string
 	TMDBID      string // inline id tag in the name (digits); wins over any search
 	IMDbID      string
-	Versions    []string // movie: the files that are versions of it, default first
-	FromContent bool     // Kind comes from what the directory holds, not from its name
+	Versions    []string      // movie: the files that are versions of it, default first
+	FromContent bool          // Kind comes from what the directory holds, not from its name
+	Content     []ContentName // English names found inside the directory, for the provider search
+	Firm        bool          // collection by positive evidence; see Shape.Firm
+	ChildKinds  []string      // what the first subdirectories hold, when a rule looked
 }
 
 // Terms are the queries to send to a provider, best first.
@@ -115,6 +118,8 @@ func ClassifyWith(name string, isDir bool, entries []Entry, peek Peek) Result {
 		kind = "movie"
 	}
 	r.Kind, r.Confidence, r.Why = kind, conf, why
+	r.Content = shape.Content
+	r.Firm, r.ChildKinds = shape.Firm, shape.ChildKinds
 	r.FromContent = shape.Kind != "" && shape.Kind == kind
 	if kind == "movie" || kind == "anime" {
 		r.Versions = shape.Versions

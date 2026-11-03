@@ -172,6 +172,16 @@ type IdentifyQuery struct {
 	Kind    string // movie | tv
 	Year    int
 	English string
+	// Content are names found in what the directory holds (the English name of its
+	// video file or season folders, with a year): a second opinion on a title
+	// the folder only spells in Chinese. See ContentName.
+	Content []ContentName
+}
+
+// ContentName is a title read from inside a directory.
+type ContentName struct {
+	Name string
+	Year int // 0 = none
 }
 
 // Identify walks the dev-media fallback ladder: each term with and without
@@ -189,6 +199,7 @@ func (t *TMDB) Identify(ctx context.Context, q IdentifyQuery) ([]Candidate, erro
 	seen := map[string]bool{}
 	var firstErr error
 	strong := false
+	found := map[string]map[string]bool{} // candidate id -> the queries that returned it
 
 	try := func(ep, query string, year int, lang string) (stop bool, err error) {
 		if attempts >= tmdbMaxAttempts || strings.TrimSpace(query) == "" {
@@ -221,6 +232,10 @@ func (t *TMDB) Identify(ctx context.Context, q IdentifyQuery) ([]Candidate, erro
 			}
 			sc := scoreMatch(query, ys, h)
 			c := t.toCandidate(h, sc)
+			if found[c.ID] == nil {
+				found[c.ID] = map[string]bool{}
+			}
+			found[c.ID][query] = true
 			if old, ok := pool[c.ID]; !ok || old.Score < sc {
 				pool[c.ID] = c
 			}
@@ -251,6 +266,14 @@ func (t *TMDB) Identify(ctx context.Context, q IdentifyQuery) ([]Candidate, erro
 		return nil, err
 	}
 
+	// finishAll adds the second opinion of the directory content before it answers.
+	finishAll := func(err error) ([]Candidate, error) {
+		if err == nil {
+			err = t.identifyByContent(ctx, q, kind, try, pool, found)
+		}
+		return finish(err)
+	}
+
 	terms := append([]SearchTerm(nil), q.Terms...)
 	sort.SliceStable(terms, func(i, j int) bool { return terms[i].Confidence > terms[j].Confidence })
 	year := q.Year
@@ -261,11 +284,11 @@ func (t *TMDB) Identify(ctx context.Context, q IdentifyQuery) ([]Candidate, erro
 	for _, c := range terms {
 		if year > 0 {
 			if stop, err := try(kind, c.Name, year, c.Lang); stop {
-				return finish(err)
+				return finishAll(err)
 			}
 		}
 		if stop, err := try(kind, c.Name, 0, c.Lang); stop {
-			return finish(err)
+			return finishAll(err)
 		}
 	}
 	// Nothing strong yet: multi endpoint, any language, for the first terms.
@@ -274,17 +297,17 @@ func (t *TMDB) Identify(ctx context.Context, q IdentifyQuery) ([]Candidate, erro
 			break
 		}
 		if stop, err := try("multi", c.Name, 0, "none"); stop {
-			return finish(err)
+			return finishAll(err)
 		}
 	}
 	if kw := extractEnglishKeywords(q.English); kw != "" && kw != q.English {
 		for _, ep := range []string{kind, "multi"} {
 			if stop, err := try(ep, kw, 0, "none"); stop {
-				return finish(err)
+				return finishAll(err)
 			}
 		}
 	}
-	return finish(nil)
+	return finishAll(nil)
 }
 
 type tmdbDetail struct {
@@ -451,4 +474,63 @@ func (t *TMDB) FindIMDb(ctx context.Context, imdb string) ([]string, error) {
 		out = append(out, "tv/"+strconv.Itoa(m.ID))
 	}
 	return out, nil
+}
+
+// contentSkipScore is how sure the name search must already be to skip the
+// content search: a clean match on title and year needs no second opinion.
+const contentSkipScore = 0.85
+
+// identifyByContent searches the English names found inside the directory and
+// lets the two searches vouch for each other: a hit that both the folder name
+// and a content name return gains, one whose year disagrees with the year the
+// files name loses. 回忆三部曲 found by "回忆" is 杀人回忆 (2003); "Memories"
+// 1995 finds 回忆三部曲 (MEMORIES, 1995) and the year settles it. The caller
+// sees only the final scores. A returned error is fatal (network, auth).
+func (t *TMDB) identifyByContent(ctx context.Context, q IdentifyQuery, kind string,
+	try func(ep, query string, year int, lang string) (bool, error),
+	pool map[string]Candidate, found map[string]map[string]bool) error {
+	if len(q.Content) == 0 {
+		return nil
+	}
+	best := float32(0)
+	for _, c := range pool {
+		best = max(best, c.Score)
+	}
+	if best >= contentSkipScore {
+		return nil
+	}
+	contentYear := 0
+	for i, c := range q.Content {
+		if i >= 2 {
+			break
+		}
+		if contentYear == 0 {
+			contentYear = c.Year
+		}
+		if c.Year > 0 {
+			if _, err := try(kind, c.Name, c.Year, "zh-CN"); err != nil {
+				return err
+			}
+		}
+		if _, err := try(kind, c.Name, 0, "zh-CN"); err != nil {
+			return err
+		}
+	}
+	for id, c := range pool {
+		sc := c.Score
+		if len(found[id]) >= 2 {
+			sc += 0.15
+		}
+		if contentYear > 0 && c.Year > 0 {
+			switch d := absInt(c.Year - contentYear); {
+			case d == 0:
+				sc += 0.05
+			case d > 1:
+				sc -= 0.3
+			}
+		}
+		c.Score = min(max(sc, 0), 1)
+		pool[id] = c
+	}
+	return nil
 }

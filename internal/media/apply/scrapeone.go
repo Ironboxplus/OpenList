@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path"
+	"slices"
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/media/identify"
@@ -113,7 +114,7 @@ func (o *Orchestrator) ScrapeOne(ctx context.Context, p string, opts ScrapeOpts)
 			res.Title, res.Confidence, res.Matched = r.Title, r.Confidence, true
 			return res, nil
 		}
-		cs, err := o.search().Identify(ctx, r.Kind, r.Theatrical, scraper.IdentifyQuery{Terms: r.Terms(), Year: r.Year, English: r.English})
+		cs, err := o.search().Identify(ctx, r.Kind, r.Theatrical, scraper.IdentifyQuery{Terms: r.Terms(), Year: r.Year, English: r.English, Content: r.Content})
 		if err != nil && len(cs) == 0 {
 			return nil, err
 		}
@@ -193,10 +194,13 @@ func toModelCandidates(cs []scraper.Candidate) []model.MediaCandidate {
 // series (教父) is never merged into a show. Names alone cannot decide this:
 // the benchmark found no rule that separates the two.
 func (o *Orchestrator) showBehindCollection(ctx context.Context, r identify.Result) (scraper.Candidate, bool) {
-	if r.Kind != "collection" || !r.FromContent {
+	// only a collection the rules took for several works with nothing to say they are
+	// films, and whose subdirectories were seen to hold no film (与神同行, 杀戮都市
+	// are collections of films and stay so)
+	if r.Kind != "collection" || !r.FromContent || r.Firm || len(r.ChildKinds) == 0 || slices.Contains(r.ChildKinds, "movie") {
 		return scraper.Candidate{}, false
 	}
-	q := scraper.IdentifyQuery{Terms: r.Terms(), Year: r.Year, English: r.English}
+	q := scraper.IdentifyQuery{Terms: r.Terms(), Year: r.Year, English: r.English, Content: r.Content}
 	tv, err := o.search().Identify(ctx, "tv", false, q)
 	if err != nil || len(tv) == 0 || tv[0].Score < scraper.StrongMatch || !strings.HasPrefix(tv[0].ID, "tv/") {
 		return scraper.Candidate{}, false

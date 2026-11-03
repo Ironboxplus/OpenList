@@ -229,7 +229,7 @@ func doScanPath(sp *model.MediaScanPath, p *ScanProgress) error {
 		// 路径合并模式：
 		//   - 子文件夹 → 作为一个合并条目（带 Episodes 选集信息）
 		//   - 直接放在根目录下的单个媒体文件 → 正常作为独立条目扫描
-		entries, err := fs.List(ctx, scanRoot, &fs.ListArgs{NoLog: true, Refresh: true})
+		entries, err := scanList(ctx, scanRoot, &fs.ListArgs{NoLog: true, Refresh: true})
 		if err != nil {
 			return err
 		}
@@ -649,7 +649,7 @@ func FetchFileReader(ctx context.Context, vfsPath string) io.ReadCloser {
 
 // walkVFS 递归遍历 VFS 路径，收集匹配的媒体文件路径（每个目录都刷新缓存）
 func walkVFS(ctx context.Context, dirPath string, mediaType model.MediaType, targets *[]string, failed *[]string) error {
-	entries, err := fs.List(ctx, dirPath, &fs.ListArgs{NoLog: true, Refresh: true})
+	entries, err := scanList(ctx, dirPath, &fs.ListArgs{NoLog: true, Refresh: true})
 	if err != nil {
 		log.Warnf("media scan: list vfs path [%s] error: %v", dirPath, err)
 		// 跳过无权限目录，不中断整体扫描；记下来，扫描结束时不清理它下面的条目
@@ -675,7 +675,7 @@ func walkVFS(ctx context.Context, dirPath string, mediaType model.MediaType, tar
 //   - file_name：文件夹就是文件夹名，文件就是文件名
 //   - episodes：文件夹时存里面每个文件的信息，文件时为空
 func buildMediaItemFromVFS(ctx context.Context, vfsPath string, sp *model.MediaScanPath) (*model.MediaItem, error) {
-	obj, err := fs.Get(ctx, vfsPath, &fs.GetArgs{NoLog: true})
+	obj, err := scanGet(ctx, vfsPath, &fs.GetArgs{NoLog: true})
 	if err != nil {
 		return nil, err
 	}
@@ -709,7 +709,7 @@ type EpisodeInfo = model.EpisodeInfo
 
 // buildEpisodesFromFolder 扫描文件夹内的媒体文件，构建选集信息 JSON 字符串
 func buildEpisodesFromFolder(ctx context.Context, folderPath string, mediaType model.MediaType) (string, error) {
-	entries, err := fs.List(ctx, folderPath, &fs.ListArgs{NoLog: true})
+	entries, err := scanList(ctx, folderPath, &fs.ListArgs{NoLog: true})
 	if err != nil {
 		return "", err
 	}

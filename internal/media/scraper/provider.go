@@ -300,6 +300,17 @@ func (a *api) do(ctx context.Context, mk func() (*http.Request, error)) ([]byte,
 				class = ClassOther
 			}
 			log.Warnf("[media/%s] request failed: %s", a.name, a.mask(cause.Error()))
+			// A request that stalled until the client timeout is retried once: the
+			// endpoints answer in well under a second as a rule (measured from the
+			// scan host: bgm.tv 0.3 s), so a stall is a lost connection, not a verdict.
+			if attempt == 0 && isTimeout(cause) {
+				select {
+				case <-time.After(a.retryDelay):
+					continue
+				case <-ctx.Done():
+					return nil, a.fail(ClassCanceled, 0, "canceled", ctx.Err())
+				}
+			}
 			return nil, a.fail(class, 0, "request failed: "+cause.Error(), cause)
 		}
 		body, rerr := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
@@ -345,4 +356,10 @@ func snippet(b []byte) string {
 		s = s[:160]
 	}
 	return s
+}
+
+// isTimeout reports a request that ran into a deadline or a net timeout.
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout())
 }

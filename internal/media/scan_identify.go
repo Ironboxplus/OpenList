@@ -17,7 +17,7 @@ const maxCollectionDepth = 3
 // listEntries lists one directory for the identification rules. It refreshes
 // nothing: the scan has just walked the directory.
 func listEntries(ctx context.Context, p string) ([]identify.Entry, error) {
-	objs, err := fs.List(ctx, p, &fs.ListArgs{NoLog: true})
+	objs, err := scanList(ctx, p, &fs.ListArgs{NoLog: true})
 	if err != nil {
 		return nil, err
 	}
@@ -123,4 +123,3 @@ func scanEpisodes(ctx context.Context, folder string) ([]model.MediaEpisode, err
 	}
 	return eps, nil
 }
-

@@ -171,9 +171,12 @@ type Shape struct {
 	Kind       string // movie | tv | collection | ignore | "" (can't tell)
 	Confidence float32
 	Why        string
-	Episodes   int      // video files that look like episodes
-	Versions   []string // movie: the files that are versions of it, default first
-	Year       int      // movie: the year its main video file names, 0 = none
+	Episodes   int           // video files that look like episodes
+	Versions   []string      // movie: the files that are versions of it, default first
+	Year       int           // movie: the year its main video file names, 0 = none
+	Content    []ContentName // English names found inside, for the provider search
+	Firm       bool          // a collection because of positive evidence (films, a show beside a film): a provider must not override it
+	ChildKinds []string      // what the first subdirectories hold, when a rule looked
 }
 
 // Peek lists the subdirectory name of the directory being classified. It is
@@ -220,6 +223,14 @@ func ClassifyEntries(entries []Entry) Shape { return ClassifyEntriesWith(entries
 // films ("死神来了1", "死神来了2") or seasons, and a directory that only wraps
 // another one.
 func ClassifyEntriesWith(entries []Entry, peek Peek) Shape {
+	s := classifyEntries(entries, peek)
+	if s.Kind == "collection" || s.Kind == "tv" || s.Kind == "movie" || s.Kind == "" {
+		s.Content = contentNames(entries, peek)
+	}
+	return s
+}
+
+func classifyEntries(entries []Entry, peek Peek) Shape {
 	var videos, dirs []Entry
 	var audio, other int
 	for _, e := range entries {
@@ -278,13 +289,13 @@ func ClassifyEntriesWith(entries []Entry, peek Peek) Shape {
 		seasons = 0
 	}
 	if seasons >= 1 && unrelatedFilmDir(seasonNames, workDirs, peek) {
-		return Shape{Kind: "collection", Confidence: 0.75, Why: "seasons of a show next to an unrelated film"}
+		return Shape{Kind: "collection", Confidence: 0.75, Why: "seasons of a show next to an unrelated film", Firm: true}
 	}
 	// Bare numbers ("1", "2") are seasons only when what they hold is a show:
 	// 与神同行's "1" and "2" are two films.
 	if seasons > 0 && allBareNumbers(seasonNames) {
 		if filmsNotShows(peekKinds(seasonDirs, peek)) {
-			return Shape{Kind: "collection", Confidence: 0.75, Why: "numbered directories that each hold one film"}
+			return Shape{Kind: "collection", Confidence: 0.75, Why: "numbered directories that each hold one film", Firm: true}
 		}
 	}
 
@@ -324,13 +335,13 @@ func ClassifyEntriesWith(entries []Entry, peek Peek) Shape {
 		case len(workDirs) >= 2 && numberedSeries(names):
 			// "死神来了1".."死神来了5" are five films, "蓝光原盘"-style parts one show
 			if filmsNotShows(peekKinds(workDirs, peek)) {
-				return Shape{Kind: "collection", Confidence: 0.75, Why: "numbered directories that each hold one film"}
+				return Shape{Kind: "collection", Confidence: 0.75, Why: "numbered directories that each hold one film", Firm: true}
 			}
 			return Shape{Kind: "tv", Confidence: 0.7, Why: "numbered subdirectories (parts of one show)"}
 		case releasesOfOneFilm(workDirs, peek):
 			return Shape{Kind: "movie", Confidence: 0.7, Why: "directories that are copies of one film"}
 		case len(workDirs) >= 2:
-			return Shape{Kind: "collection", Confidence: 0.8, Why: "several subdirectories, each its own work"}
+			return Shape{Kind: "collection", Confidence: 0.8, Why: "several subdirectories, each its own work", ChildKinds: peekKinds(workDirs, peek)}
 		case len(workDirs) == 1:
 			// a wrapper: what it holds is what this is
 			if k := peekKinds(workDirs, peek); len(k) == 1 && (k[0] == "movie" || k[0] == "tv") {
@@ -342,7 +353,7 @@ func ClassifyEntriesWith(entries []Entry, peek Peek) Shape {
 	}
 	// videos present, not episodic
 	if len(videos) >= 1 && showDirBeside(workDirs, peek) {
-		return Shape{Kind: "collection", Confidence: 0.75, Why: "a show beside a film"}
+		return Shape{Kind: "collection", Confidence: 0.75, Why: "a show beside a film", Firm: true}
 	}
 	if len(workDirs) >= 2 && len(videos) <= 1 {
 		return Shape{Kind: "collection", Confidence: 0.75, Why: "several subdirectories next to at most one video"}

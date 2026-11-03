@@ -131,7 +131,7 @@ func (o *Orchestrator) resolve(ctx context.Context, p string, r identify.Result)
 			return row, nil
 		}
 	}
-	q := scraper.IdentifyQuery{Terms: r.Terms(), Year: r.Year, English: r.English}
+	q := scraper.IdentifyQuery{Terms: r.Terms(), Year: r.Year, English: r.English, Content: r.Content}
 	cs, err := o.search().Identify(ctx, r.Kind, r.Theatrical, q)
 	if err != nil && fatal(err) {
 		row.Confidence = 0
