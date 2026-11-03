@@ -87,3 +87,38 @@ func TestAProviderRequestThatStalledIsTriedOnce(t *testing.T) {
 		t.Fatalf("calls %d err %v, want the second try to succeed", calls, err)
 	}
 }
+
+// A show names the years of its later seasons and of what sits beside it (食戟之灵
+// holds a 2021 film): the year of a content name does not count against a show.
+func TestContentYearDoesNotCountAgainstAShow(t *testing.T) {
+	srv := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("query")
+		if q == "食戟之灵" {
+			writeJSON(w, []byte(`{"results":[{"id":62273,"name":"食戟之灵","original_name":"食戟のソーマ","first_air_date":"2015-04-06","vote_average":8.2}]}`))
+			return
+		}
+		writeJSON(w, []byte(`{"results":[]}`))
+	})
+	cfg := fastConfig(map[string]string{"tmdb": srv.URL + "/3"})
+	cfg.TMDBToken = fakeBearer
+	set, _ := NewSet(cfg)
+	q := IdentifyQuery{Terms: SearchTerms(ParseName("食戟之灵")), Kind: "tv", Content: []ContentName{{Name: "Shoujo Kageki Revue Starlight The Movie", Year: 2021}}}
+	cs, err := set.TMDB.Identify(context.Background(), q)
+	if err != nil || len(cs) == 0 || cs[0].ID != "tv/62273" || cs[0].Score < StrongMatch {
+		t.Fatalf("candidates %+v (%v)", cs, err)
+	}
+}
+
+// A year right before another year is part of the title.
+func TestTheYearOfAReleaseIsTheLastOne(t *testing.T) {
+	for name, want := range map[string][2]string{
+		"The.Legend.of.1900.1998.1080p.BluRay.REMUX.VC-1.DTS-HD.MA.5.1": {"The Legend of 1900", "1998"},
+		"Blade.Runner.2049.2017.2160p.WEB-DL":                           {"Blade Runner 2049", "2017"},
+		"Inception.2010.1080p.BluRay":                                   {"Inception", "2010"},
+	} {
+		p := ParseName(name)
+		if p.English != want[0] || p.Year != want[1] {
+			t.Errorf("%s: %q %q, want %q %q", name, p.English, p.Year, want[0], want[1])
+		}
+	}
+}

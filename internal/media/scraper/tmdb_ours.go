@@ -567,7 +567,9 @@ func (t *TMDB) identifyByContent(ctx context.Context, q IdentifyQuery, kind stri
 		if len(found[id]) >= 2 {
 			sc += 0.15
 		}
-		if contentYear > 0 && c.Year > 0 {
+		// Only a film has one year to agree on: a show names the years of its later
+		// seasons and of whatever sits beside them (食戟之灵 holds a 2021 film).
+		if kind == "movie" && contentYear > 0 && c.Year > 0 {
 			switch d := absInt(c.Year - contentYear); {
 			case d == 0:
 				sc += 0.05

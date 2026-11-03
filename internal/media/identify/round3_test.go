@@ -192,3 +192,23 @@ func TestMaybeShow(t *testing.T) {
 		}
 	}
 }
+
+// The year of a content name is not the first number of a resolution, and a title
+// that holds a year (The Legend of 1900) takes the release year after it.
+func TestContentNameYears(t *testing.T) {
+	c, ok := contentName("The.Legend.of.1900.1998.1080p.BluRay.REMUX.mkv", true)
+	if !ok || c.Name != "The Legend of 1900" || c.Year != 1998 {
+		t.Errorf("%+v %v", c, ok)
+	}
+	c, ok = contentName("[Shoujo Kageki Revue Starlight The Movie][BDRIP][1920x804][H264_FLAC].mkv", true)
+	if !ok || c.Year != 0 {
+		t.Errorf("a resolution was read as a year: %+v", c)
+	}
+}
+
+func TestContentNameDropsABareEpisodeMarker(t *testing.T) {
+	c, ok := contentName("Paranoia.Agent.E07.2004.1080p.BluRay.x264-WiKi.mkv", true)
+	if !ok || c.Name != "Paranoia Agent" || c.Year != 2004 {
+		t.Errorf("%+v %v", c, ok)
+	}
+}

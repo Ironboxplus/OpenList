@@ -341,7 +341,7 @@ func parseVideoFileName(fileName string) parsedVideoTitle {
 		return false
 	}
 
-	for _, p := range parts {
+	for i, p := range parts {
 		p = strings.TrimSpace(p)
 		if p == "" {
 			continue
@@ -359,6 +359,13 @@ func parseVideoFileName(fileName string) parsedVideoTitle {
 			}
 			chineseParts = append(chineseParts, p)
 			foundChinese = true
+			continue
+		}
+
+		// A year right before another year is part of the title (The.Legend.of.1900.1998,
+		// Blade.Runner.2049.2017): the year of a release is the last one before its tags.
+		if yearRegexp.MatchString(p) && !foundYear && !foundChinese && i+1 < len(parts) && yearRegexp.MatchString(strings.TrimSpace(parts[i+1])) {
+			englishParts = append(englishParts, p)
 			continue
 		}
 

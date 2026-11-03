@@ -19,7 +19,7 @@ const maxContentNames = 3
 
 var (
 	// seasonTailRe cuts a name at its season or episode marker.
-	seasonTailRe = regexp.MustCompile(`(?i)[\s._\-\[(]+(?:S\d{1,3}(?:E\d{1,3})?|Season[\s._-]*\d+|\d{1,2}(?:st|nd|rd|th)[\s._-]*season)(?:\b|$).*$|\s*第\s*[\d一二三四五六七八九十]+\s*[季部期].*$`)
+	seasonTailRe = regexp.MustCompile(`(?i)[\s._\-\[(]+(?:S\d{1,3}(?:E\d{1,3})?|E\d{1,3}|Season[\s._-]*\d+|\d{1,2}(?:st|nd|rd|th)[\s._-]*season)(?:\b|$).*$|\s*第\s*[\d一二三四五六七八九十]+\s*[季部期].*$`)
 	// titleYearRe finds "Title.1995." in a name whose parsed title came out Chinese.
 	titleYearRe = regexp.MustCompile(`([A-Za-z][A-Za-z'’&: ]*[A-Za-z])[ ._]+((?:19|20)\d{2})(?:[^0-9]|$)`)
 )
@@ -36,8 +36,9 @@ func contentName(name string, isFile bool) (ContentName, bool) {
 		raw = stem(name)
 	}
 	if year == 0 {
-		if m := yearInNameRe.FindStringSubmatch(raw); m != nil {
-			year, _ = strconv.Atoi(m[1])
+		// the last year: a title may hold one (The.Legend.of.1900.1998)
+		if all := yearInNameRe.FindAllStringSubmatch(raw, -1); len(all) > 0 {
+			year, _ = strconv.Atoi(all[len(all)-1][1])
 		}
 	}
 	if en == "" || hasHan(en) {

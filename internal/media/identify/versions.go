@@ -115,7 +115,8 @@ func videoYear(videos []Entry) int {
 }
 
 var (
-	yearInNameRe = regexp.MustCompile(`(?:^|[^0-9])((?:19|20)\d{2})(?:[^0-9]|$)`)
+	// a year is not the first number of a resolution (1920x1080)
+	yearInNameRe = regexp.MustCompile(`(?:^|[^0-9])((?:19|20)\d{2})(?:[^0-9xX×]|$)`)
 	latinWordRe  = regexp.MustCompile(`[A-Za-z]{5,}`)
 )
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/bootstrap"
@@ -31,7 +32,7 @@ var mediaRecordCmd = &cobra.Command{
 	Use:    "record",
 	Short:  "Record provider search/detail/season answers for a list of names (fixture for tests)",
 	Hidden: true,
-	Long: `Reads --names (lines "kind<TAB>name", kind anime|tv|movie), identifies each name
+	Long: `Reads --names (lines "kind<TAB>name[<TAB>Name:Year;Name:Year]" (the optional names are what the scan found inside the folder), kind anime|tv|movie), identifies each name
 with the rules, searches the providers the way a scrape does, fetches the top
 3 candidates (and the seasons of a TMDB show) and writes the answers to --out as
 JSON lines. The settings (TMDB key, OMDb, Douban, language, proxy, TMDB API URL,
@@ -54,7 +55,10 @@ func init() {
 	_ = mediaRecordCmd.MarkFlagRequired("out")
 }
 
-type recordName struct{ kind, name string }
+type recordName struct {
+	kind, name string
+	content    []scraper.ContentName // names found inside the folder, as the scan would give them
+}
 
 func readRecordNames(path string) ([]recordName, error) {
 	f, err := os.Open(path)
@@ -71,6 +75,7 @@ func readRecordNames(path string) ([]recordName, error) {
 			continue
 		}
 		kind, name, ok := strings.Cut(line, "\t")
+		name, inside, _ := strings.Cut(name, "\t")
 		if !ok || strings.TrimSpace(name) == "" {
 			return nil, fmt.Errorf("bad line %q: want kind<TAB>name", line)
 		}
@@ -79,7 +84,14 @@ func readRecordNames(path string) ([]recordName, error) {
 		default:
 			return nil, fmt.Errorf("bad kind %q in %q", kind, line)
 		}
-		out = append(out, recordName{kind, name})
+		rn := recordName{kind: kind, name: name}
+		for _, c := range strings.Split(inside, ";") {
+			if cn, y, ok := strings.Cut(c, ":"); ok && strings.TrimSpace(cn) != "" {
+				year, _ := strconv.Atoi(strings.TrimSpace(y))
+				rn.content = append(rn.content, scraper.ContentName{Name: strings.TrimSpace(cn), Year: year})
+			}
+		}
+		out = append(out, rn)
 	}
 	return out, sc.Err()
 }
@@ -146,7 +158,7 @@ func recordOne(ctx context.Context, set *scraper.Set, rules identify.Rules, n re
 		return err
 	}
 	kind := n.kind
-	cs, err := set.Identify(ctx, kind, r.Theatrical, scraper.IdentifyQuery{Terms: r.Terms(), Year: r.Year, English: r.English, Content: r.Content})
+	cs, err := set.Identify(ctx, kind, r.Theatrical, scraper.IdentifyQuery{Terms: r.Terms(), Year: r.Year, English: r.English, Content: append(r.Content, n.content...)})
 	if errors.Is(err, scraper.ErrRecordLimit) {
 		return err
 	}
