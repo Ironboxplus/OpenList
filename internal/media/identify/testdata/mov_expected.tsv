@@ -22,7 +22,7 @@ Live/禁闭岛	movie	rule
 Live/火星救援	movie	rule
 Live/咒怨系列	collection	rule
 Live/死神来了系列	collection	rule
-Live/银护合集	collection	doubtful
+Live/银护合集	collection	rule
 Live/绝望主妇(2004)	tv	rule
 Live/宫崎骏	collection	rule
 Live/与神同行	collection	rule
@@ -81,9 +81,9 @@ Live/活死人归来	movie	rule
 Live/憨豆先生系列	collection	rule
 Live/钢琴师	movie	rule
 Live/沉默的羔羊	movie	rule
-Anime/回忆三部曲	movie	doubtful
+Anime/回忆三部曲	movie	rule
 Anime/紫罗兰永恒花园合集	collection	rule
-Anime/杀戮都市	collection	doubtful
+Anime/杀戮都市	collection	rule
 Anime/十万个冷笑话	tv	rule
 Anime/我的三体	tv	rule
 Anime/魔法少女小圆	collection	rule

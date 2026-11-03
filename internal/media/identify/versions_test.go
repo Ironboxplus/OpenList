@@ -139,3 +139,53 @@ func TestWrapperDirectoryTakesWhatItHolds(t *testing.T) {
 		t.Errorf("no peek: kind %q, want no verdict", s.Kind)
 	}
 }
+
+func TestSeasonsBesideAnUnrelatedFilmAreACollection(t *testing.T) {
+	tree := map[string][]Entry{
+		"银河护卫队3.2160p.BluRay.REMUX (2023)": one("Guardians.of.the.Galaxy.Vol.3.2023.REMUX.mkv"),
+		"Frieren":          eps("Frieren.S01E%02d.mkv", 12),
+		"绝命D师电影 续命之徒 2019": one("El.Camino.2019.mkv"),
+	}
+	peek := func(n string) ([]Entry, error) { return tree[n], nil }
+	groot := dirs("I.Am.Groot.S01.2160p", "I.Am.Groot.S02.2160p", "银河护卫队3.2160p.BluRay.REMUX (2023)")
+	if s := ClassifyEntriesWith(groot, peek); s.Kind != "collection" {
+		t.Errorf("groot: kind %q (%s), want collection", s.Kind, s.Why)
+	}
+	// the same show under another name, and a film named after the show, stay one show
+	if s := ClassifyEntriesWith(dirs("葬送的芙莉莲 S01", "Frieren"), peek); s.Kind != "tv" {
+		t.Errorf("frieren: kind %q (%s), want tv", s.Kind, s.Why)
+	}
+	if s := ClassifyEntriesWith(dirs("绝命D师 第1季", "绝命D师 第2季", "绝命D师电影 续命之徒 2019"), peek); s.Kind != "tv" {
+		t.Errorf("breaking bad: kind %q (%s), want tv", s.Kind, s.Why)
+	}
+}
+
+func TestDirectoriesThatAreCopiesOfOneFilm(t *testing.T) {
+	a := "【高清影视之家发布 www.WHATMV.com】回忆三部曲[中文字幕].Memories.1995.1080p.BluRay.Remux-QuickIO"
+	b := "Memories _ Memorizu [Movie] [RUS(int), JAP+Sub] [1995, BDRemux] [1080p]"
+	tree := map[string][]Entry{a: one("Memories.1995.mkv"), b: dirs("STINK BOMB", "MAGNETIC ROSE")}
+	peek := func(n string) ([]Entry, error) { return tree[n], nil }
+	if s := ClassifyEntriesWith(dirs(a, b), peek); s.Kind != "movie" {
+		t.Errorf("kind %q (%s), want movie", s.Kind, s.Why)
+	}
+	// different films of one year are not copies
+	c := "Dogs.1995.BluRay"
+	d := "Cats.1995.BluRay"
+	tree = map[string][]Entry{c: one("a.mkv"), d: one("b.mkv")}
+	if s := ClassifyEntriesWith(dirs(c, d), peek); s.Kind != "collection" {
+		t.Errorf("kind %q (%s), want collection", s.Kind, s.Why)
+	}
+}
+
+func TestShowFolderBesideAFilmIsACollection(t *testing.T) {
+	tree := map[string][]Entry{"杀戮都市 (2004) {tmdb-11279}": dirs("Season 1", "Season 2", "Specials")}
+	peek := func(n string) ([]Entry, error) { return tree[n], nil }
+	entries := cat(dirs("杀戮都市 (2004) {tmdb-11279}"), []Entry{{Name: "AV1_Recode_GantzO.2016.mkv", Size: 9 * gb}})
+	if s := ClassifyEntriesWith(entries, peek); s.Kind != "collection" {
+		t.Errorf("kind %q (%s), want collection", s.Kind, s.Why)
+	}
+	// a film with an extras folder is still a film
+	if s := ClassifyEntriesWith(cat(dirs("Extras", "Subs"), one("x.2010.mkv")), peek); s.Kind != "movie" {
+		t.Errorf("kind %q (%s), want movie", s.Kind, s.Why)
+	}
+}

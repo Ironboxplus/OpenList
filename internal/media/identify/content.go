@@ -277,6 +277,9 @@ func ClassifyEntriesWith(entries []Entry, peek Peek) Shape {
 	if seasons == 1 && extendsSeason(seasonNames[0], workDirs) {
 		seasons = 0
 	}
+	if seasons >= 1 && unrelatedFilmDir(seasonNames, workDirs, peek) {
+		return Shape{Kind: "collection", Confidence: 0.75, Why: "seasons of a show next to an unrelated film"}
+	}
 	// Bare numbers ("1", "2") are seasons only when what they hold is a show:
 	// 与神同行's "1" and "2" are two films.
 	if seasons > 0 && allBareNumbers(seasonNames) {
@@ -324,6 +327,8 @@ func ClassifyEntriesWith(entries []Entry, peek Peek) Shape {
 				return Shape{Kind: "collection", Confidence: 0.75, Why: "numbered directories that each hold one film"}
 			}
 			return Shape{Kind: "tv", Confidence: 0.7, Why: "numbered subdirectories (parts of one show)"}
+		case releasesOfOneFilm(workDirs, peek):
+			return Shape{Kind: "movie", Confidence: 0.7, Why: "directories that are copies of one film"}
 		case len(workDirs) >= 2:
 			return Shape{Kind: "collection", Confidence: 0.8, Why: "several subdirectories, each its own work"}
 		case len(workDirs) == 1:
@@ -336,6 +341,9 @@ func ClassifyEntriesWith(entries []Entry, peek Peek) Shape {
 		return Shape{Why: "only extra directories"}
 	}
 	// videos present, not episodic
+	if len(videos) >= 1 && showDirBeside(workDirs, peek) {
+		return Shape{Kind: "collection", Confidence: 0.75, Why: "a show beside a film"}
+	}
 	if len(workDirs) >= 2 && len(videos) <= 1 {
 		return Shape{Kind: "collection", Confidence: 0.75, Why: "several subdirectories next to at most one video"}
 	}

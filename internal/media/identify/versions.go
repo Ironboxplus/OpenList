@@ -2,6 +2,7 @@ package identify
 
 import (
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"unicode"
@@ -111,4 +112,112 @@ func videoYear(videos []Entry) int {
 	}
 	_, y := workKey(videos[best].Name)
 	return y
+}
+
+var (
+	yearInNameRe = regexp.MustCompile(`(?:^|[^0-9])((?:19|20)\d{2})(?:[^0-9]|$)`)
+	latinWordRe  = regexp.MustCompile(`[A-Za-z]{5,}`)
+)
+
+// releasesOfOneFilm reports whether directories are copies of one film: they
+// name the same year and share a title word ("…回忆三部曲[中文字幕].Memories.1995…"
+// and "Memories _ Memorizu [Movie] [1995, BDRemux]"), and the first one holds
+// a film. Needs a peek.
+func releasesOfOneFilm(dirs []Entry, peek Peek) bool {
+	if peek == nil || len(dirs) < 2 {
+		return false
+	}
+	var common map[string]bool
+	year := ""
+	for _, d := range dirs {
+		m := yearInNameRe.FindStringSubmatch(d.Name)
+		if m == nil || (year != "" && m[1] != year) {
+			return false
+		}
+		year = m[1]
+		words := map[string]bool{}
+		for _, w := range latinWordRe.FindAllString(d.Name, -1) {
+			if lw := strings.ToLower(w); !scraper.IsNoiseToken(lw) {
+				words[lw] = true
+			}
+		}
+		if common == nil {
+			common = words
+			continue
+		}
+		for w := range common {
+			if !words[w] {
+				delete(common, w)
+			}
+		}
+	}
+	if len(common) == 0 {
+		return false
+	}
+	kids, err := peek(dirs[0].Name)
+	return err == nil && ClassifyEntries(kids).Kind == "movie"
+}
+
+// showDirBeside reports whether one of the directories next to a film holds a
+// show (the Gantz series folder beside the Gantz:O film): different works.
+func showDirBeside(dirs []Entry, peek Peek) bool {
+	return peek != nil && slices.Contains(peekKinds(dirs, peek), "tv")
+}
+
+// unrelatedFilmDir reports whether a directory next to the seasons holds a
+// film and does not carry the show's name (I Am Groot S01, S02 beside
+// 银河护卫队3): another work. A film folder named after the show is its
+// special (绝命D师电影 续命之徒), and a show kept under another name (Frieren)
+// is still the show.
+func unrelatedFilmDir(seasonNames []string, workDirs []Entry, peek Peek) bool {
+	if peek == nil {
+		return false
+	}
+	stems := make([]string, 0, len(seasonNames))
+	for _, n := range seasonNames {
+		if st := seasonStem(n); st != "" {
+			stems = append(stems, st)
+		}
+	}
+	if len(stems) == 0 {
+		return false
+	}
+	var others []Entry
+	for _, d := range workDirs {
+		if seasonDirRe.MatchString(d.Name) || specialDirRe.MatchString(d.Name) {
+			continue
+		}
+		o := seasonStem(d.Name)
+		related := o == ""
+		for _, st := range stems {
+			if strings.HasPrefix(o, st) || strings.HasPrefix(st, o) {
+				related = true
+			}
+		}
+		if !related {
+			others = append(others, d)
+		}
+	}
+	for i, d := range others {
+		if i >= maxPeek {
+			break
+		}
+		if _, ok := episodeOf(d.Name); ok {
+			continue // an episode kept in its own folder
+		}
+		kids, err := peek(d.Name)
+		if err != nil || ClassifyEntries(kids).Kind != "movie" {
+			continue
+		}
+		episode := false
+		for _, k := range kids {
+			if _, ok := episodeOf(k.Name); ok && IsVideo(k.Name) {
+				episode = true
+			}
+		}
+		if !episode {
+			return true
+		}
+	}
+	return false
 }
