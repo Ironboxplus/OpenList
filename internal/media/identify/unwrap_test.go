@@ -90,8 +90,8 @@ func TestEpisodeFilesOfWrappedEpisodesPointInsideTheWrapper(t *testing.T) {
 
 func TestEpisodeFileTitlesKeepQuotationsAndDropTheEpisodeNumber(t *testing.T) {
 	for name, want := range map[string]string{
-		"[ANi] 想結束這場「我愛你」的遊戲 - 03 [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4": "想結束這場「我愛你」的遊戲",
-		"[ANi] 婚姻劇毒 - 03 [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4":                  "婚姻劇毒",
+		"[ANi] 想結束這場「我愛你」的遊戲 - 03 [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4":     "想結束這場「我愛你」的遊戲",
+		"[ANi] 婚姻劇毒 - 03 [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4":              "婚姻劇毒",
 		"[ANi] Re：從零開始的異世界生活 第四季 - 19 [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4": "Re：從零開始的異世界生活",
 	} {
 		if got := ParseName(name, true).Title; got != want {

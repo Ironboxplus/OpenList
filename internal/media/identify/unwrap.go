@@ -13,7 +13,7 @@ const maxUnwrap = 64
 // directories; without it, or when it fails or finds anything but one video,
 // the entry stays as it was. At most maxUnwrap directories are opened.
 func UnwrapEntries(entries []Entry, peek Peek) []Entry {
-	if peek == nil {
+	if peek == nil || len(entries) == 0 {
 		return entries
 	}
 	out := make([]Entry, 0, len(entries))

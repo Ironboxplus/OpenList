@@ -113,6 +113,12 @@ func ClassifyWith(name string, isDir bool, entries []Entry, peek Peek) Result {
 		kind, conf, why = "ignore", 0.7, "soundtrack in the name"
 	}
 
+	// A music release (an album set, a live recording): its name tags an audio
+	// format and no video one, and no video file is in it.
+	if kind != "ignore" && audioTagRe.MatchString(name) && !videoTagRe.MatchString(name) && !hasVideoFile(entries) {
+		kind, conf, why = "ignore", 0.7, "audio format tag in the name and no video"
+	}
+
 	if kind == "ignore" {
 		r.Kind, r.Confidence, r.Why = kind, conf, why
 		return r

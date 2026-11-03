@@ -95,6 +95,13 @@ var (
 	westernGroup = regexp.MustCompile(`(?i)^(yts|yify|rarbg|evo|sparks|fgt|ettv|eztv|cmct|hds|mnhd|wiki|tlf|framestor|amiable|ntb|ntg|tigole|qxr|psa)(\.\w+)?$`)
 	// A Chinese fansub group ends in 组/屋/社 or joins two groups with &.
 	hanGroupRe = regexp.MustCompile(`字幕|汉化|工作室|制作组|压制组|发布组|组$|屋$|社$|&|\+`)
+	// dottedDateRe is the yy.mm.dd some release names start with.
+	dottedDateRe = regexp.MustCompile(`^\d{2}\.\d{2}\.\d{2}\.`)
+	// dottedSeasonRe is where a dotted name's title ends at its season/episode marker.
+	dottedSeasonRe = regexp.MustCompile(`(?i)\.S\d{1,3}(?:E\d{1,3})?(?:\.|$)`)
+	// audioTagRe / videoTagRe are format tags of a release name.
+	audioTagRe = regexp.MustCompile(`(?i)[\[(【]\s*(?:flac|mp3|ape|wav|dsd|alac|hi-?res)\b`)
+	videoTagRe = regexp.MustCompile(`(?i)\b(?:480p|720p|1080[pi]|2160p|4k|hevc|avc|x26[45]|h\.?26[45]|bdrip|bd-?box|web-?(?:rip|dl)|blu-?ray|remux|mkv|mp4|avi)\b`)
 	ostRe      = regexp.MustCompile(`(?i)\bOST\b|原声带|原声大碟|配乐|soundtrack`)
 	cnNumber   = map[rune]int{'一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10}
 )
@@ -258,7 +265,8 @@ func ParseName(name string, isFile bool) NameInfo {
 			}
 			continue
 		}
-		if titleBracket == "" && (hasHan(s.text) || hasLetter(s.text)) {
+		// a bracket that says "27部合集" describes the set; it is not its title
+		if titleBracket == "" && (hasHan(s.text) || hasLetter(s.text)) && !collRe.MatchString(s.text) {
 			titleBracket = s.text
 		}
 	}
@@ -307,6 +315,15 @@ func ParseName(name string, isFile bool) NameInfo {
 		}
 	}
 	core = strings.TrimSpace(core)
+
+	// A dotted release name starts at its title: a date in front (12.11.13.Hana.and.Alice)
+	// is not part of it, and the season/episode marker ends it (Itou.Junji.Maniac.S01.1080p).
+	if strings.Count(core, ".") >= 2 && !strings.Contains(core, " ") {
+		core = dottedDateRe.ReplaceAllString(core, "")
+		if loc := dottedSeasonRe.FindStringIndex(core); loc != nil && loc[0] > 0 {
+			core = core[:loc[0]]
+		}
+	}
 
 	// 6. years glued to Chinese titles: 傲慢与偏见2005, 三国演义94版
 	year := yearBracket

@@ -39,6 +39,9 @@ const maxSeasonDirs = 30
 // show itself). A file with no season of its own takes its directory's season,
 // else season 1. Files without an episode marker are left out.
 func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error) {
+	// 115 keeps every file in a directory of its own name: one level is unwrapped
+	// wherever a listing is read, from one budget of directories to open.
+	list = unwrapping(list)
 	top, err := list("")
 	if err != nil {
 		return nil, err

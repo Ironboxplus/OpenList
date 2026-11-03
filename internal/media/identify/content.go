@@ -330,7 +330,8 @@ func classifyEntries(entries []Entry, peek Peek) Shape {
 		for i, v := range videos {
 			names[i] = stem(v.Name)
 		}
-		if numberedSeries(names) {
+		// films of a series are numbered too, but each names its own year
+		if numberedSeries(names) && !eachNamesItsOwnYear(names) {
 			return Shape{Kind: "tv", Confidence: 0.8, Why: "files differ only by a number", Episodes: len(videos)}
 		}
 	}
@@ -368,6 +369,13 @@ func classifyEntries(entries []Entry, peek Peek) Shape {
 	}
 	if len(videos) >= 2 && sameWork(videos) {
 		return Shape{Kind: "movie", Confidence: 0.85, Why: "versions of one movie", Versions: versionOrder(videos), Year: videoYear(videos)}
+	}
+	// one video with an episode marker in its name is an episode, of a show whose
+	// other episodes are not here yet (a season being downloaded)
+	if len(videos) == 1 && len(workDirs) == 0 {
+		if loneEpisodeRe.MatchString(stem(videos[0].Name)) {
+			return Shape{Kind: "tv", Confidence: 0.6, Why: "one video with an episode marker", Episodes: 1}
+		}
 	}
 	if len(videos) == 1 || dominant(videos) {
 		return Shape{Kind: "movie", Confidence: 0.85, Why: "one main video", Year: videoYear(videos)}
@@ -536,4 +544,33 @@ func filmsNotShows(kinds []string) bool {
 		}
 	}
 	return films
+}
+
+// loneEpisodeRe is an episode marker that ends the title part of a name: S01E02,
+// "[09]", or " - 03" followed by a tag or the end (" - 01 Clockwork Girl" is a
+// film that is the first of a set, not an episode).
+var loneEpisodeRe = regexp.MustCompile(`(?i)\sS\d{1,2}E\d{1,3}\b|\[\d{1,3}(?:v\d)?\]|\s-\s\d{1,3}(?:v\d)?\s*(?:\[|$)`)
+
+// eachNamesItsOwnYear: every name carries a year and no two carry the same one
+// (死神来了1..5: 2000, 2003, 2006, 2009, 2011), which episodes of a show never do.
+func eachNamesItsOwnYear(names []string) bool {
+	seen := map[string]bool{}
+	for _, n := range names {
+		m := yearInNameRe.FindStringSubmatch(n)
+		if m == nil || seen[m[1]] {
+			return false
+		}
+		seen[m[1]] = true
+	}
+	return true
+}
+
+// hasVideoFile reports whether a listing holds a video file directly.
+func hasVideoFile(entries []Entry) bool {
+	for _, e := range entries {
+		if !e.IsDir && IsVideo(e.Name) {
+			return true
+		}
+	}
+	return false
 }

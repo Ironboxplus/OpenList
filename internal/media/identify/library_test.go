@@ -28,7 +28,9 @@ func (n *libNode) entries() []Entry {
 	return out
 }
 
-func loadLibrary(t testing.TB) map[string]*libNode { return loadLibraryFile(t, "testdata/mov_library.json.gz") }
+func loadLibrary(t testing.TB) map[string]*libNode {
+	return loadLibraryFile(t, "testdata/mov_library.json.gz")
+}
 
 func loadLibraryFile(t testing.TB, file string) map[string]*libNode {
 	t.Helper()
