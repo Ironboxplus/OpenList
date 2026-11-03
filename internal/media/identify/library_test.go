@@ -28,9 +28,11 @@ func (n *libNode) entries() []Entry {
 	return out
 }
 
-func loadLibrary(t testing.TB) map[string]*libNode {
+func loadLibrary(t testing.TB) map[string]*libNode { return loadLibraryFile(t, "testdata/mov_library.json.gz") }
+
+func loadLibraryFile(t testing.TB, file string) map[string]*libNode {
 	t.Helper()
-	f, err := os.Open("testdata/mov_library.json.gz")
+	f, err := os.Open(file)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +52,10 @@ func loadLibrary(t testing.TB) map[string]*libNode {
 // collections, as the scanner does, down to depth 3) the way the scanner does:
 // the name and the one-level listing. Keys are "Live/<work>[/<child>...]".
 func replay(t testing.TB) (keys []string, got map[string]Result) {
-	lib := loadLibrary(t)
+	return replayLibrary(t, loadLibrary(t), "Live", "Anime")
+}
+
+func replayLibrary(t testing.TB, lib map[string]*libNode, roots ...string) (keys []string, got map[string]Result) {
 	got = map[string]Result{}
 	var walk func(key, name string, isDir bool, n *libNode, depth int)
 	walk = func(key, name string, isDir bool, n *libNode, depth int) {
@@ -80,7 +85,7 @@ func replay(t testing.TB) (keys []string, got map[string]Result) {
 			}
 		}
 	}
-	for _, root := range []string{"Live", "Anime"} {
+	for _, root := range roots {
 		top := lib[root]
 		for _, e := range top.entries() {
 			walk(root+"/"+e.Name, e.Name, e.IsDir, top.C[e.Name], 1)
@@ -160,4 +165,62 @@ func TestLibraryReplay(t *testing.T) {
 		t.Errorf("table has %d top-level works, the library has 141", top)
 	}
 	t.Logf("top-level works with the wanted kind: %d of %d", topOK, top)
+}
+
+// TestYunxiazaiReplay is the same table for the second library (/115/云下载,
+// recorded 2026-11-03, round 4 of the findings). A fourth column, when present,
+// is the title the rules must give.
+func TestYunxiazaiReplay(t *testing.T) {
+	keys, got := replayLibrary(t, loadLibraryFile(t, "testdata/yxz_library.json.gz"), "云下载")
+	raw, err := os.ReadFile("testdata/yxz_expected.tsv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sb strings.Builder
+	for _, k := range keys {
+		r := got[k]
+		fmt.Fprintf(&sb, "%s\t%s\t%.2f\t%q y%d s%d\t%s\n", k, r.Kind, r.Confidence, r.Title, r.Year, r.Season, r.Why)
+	}
+	if os.Getenv("LIBRARY_DUMP") != "" {
+		_ = os.WriteFile(os.Getenv("LIBRARY_DUMP")+".yxz", []byte(sb.String()), 0o644)
+	}
+	top, topOK := 0, 0
+	for _, line := range strings.Split(string(raw), "\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		f := strings.Split(line, "\t")
+		key, want, status := f[0], f[1], f[2]
+		r, ok := got[key]
+		if !ok {
+			t.Errorf("%s: not in the replay", key)
+			continue
+		}
+		if strings.Count(key, "/") == 1 {
+			top++
+		}
+		have := wantedKind(r)
+		okRow := have == want && (len(f) < 4 || f[3] == "" || f[3] == r.Title)
+		if okRow {
+			if strings.Count(key, "/") == 1 {
+				topOK++
+			}
+			continue
+		}
+		msg := fmt.Sprintf("%s [%s]: kind %q title %q (%s), want %q %q", key, status, have, r.Title, r.Why, want, func() string {
+			if len(f) > 3 {
+				return f[3]
+			}
+			return ""
+		}())
+		if status == "rule" {
+			t.Error(msg)
+		} else {
+			t.Log(msg)
+		}
+	}
+	t.Logf("top-level works as wanted: %d of %d", topOK, top)
+	if os.Getenv("YXZ_PRINT") != "" || t.Failed() {
+		fmt.Print(sb.String())
+	}
 }
