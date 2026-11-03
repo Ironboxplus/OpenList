@@ -13,6 +13,9 @@ type Entry struct {
 	Name  string `json:"name"`
 	IsDir bool   `json:"is_dir"`
 	Size  int64  `json:"size"`
+	// Via is the directory a video was unwrapped from (see UnwrapEntries); the
+	// video is then at Via/Name.
+	Via string `json:"via,omitempty"`
 }
 
 var (
@@ -308,6 +311,11 @@ func classifyEntries(entries []Entry, peek Peek) Shape {
 		}
 	}
 	episodic := len(videos) >= 2 && epCount >= 2 && epCount*10 >= len(videos)*6
+	// Numbered files whose names start with different shows are not one show
+	// (re0 next to 杖與劍的魔劍譚): each file is its own work.
+	if episodic && seasons == 0 && !oneShow(epStems) {
+		return Shape{Kind: "collection", Confidence: 0.7, Why: "numbered files of several shows"}
+	}
 
 	switch {
 	case seasons >= 1 && (seasons >= 2 || len(videos) == 0 || episodic):

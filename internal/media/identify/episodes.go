@@ -52,7 +52,7 @@ func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error)
 				subdirs = append(subdirs, e)
 			}
 		case IsVideo(e.Name):
-			files = append(files, fileRef{rel: e.Name, name: e.Name})
+			files = append(files, fileRef{rel: e.Rel(), name: e.Name})
 		}
 	}
 	sort.Slice(subdirs, func(i, j int) bool { return subdirs[i].Name < subdirs[j].Name })
@@ -78,7 +78,7 @@ func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error)
 		}
 		for _, k := range kids {
 			if !k.IsDir && IsVideo(k.Name) {
-				files = append(files, fileRef{rel: path.Join(d.Name, k.Name), name: k.Name, dirSeason: seasonOfDirName(d.Name)})
+				files = append(files, fileRef{rel: path.Join(d.Name, k.Rel()), name: k.Name, dirSeason: seasonOfDirName(d.Name)})
 			}
 		}
 	}
@@ -186,7 +186,7 @@ func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error)
 			if vs = mainVideos(vs); len(vs) == 1 {
 				if _, _, marked := EpisodeOf(vs[0].Name); !marked {
 					specials++
-					files = append(files, fileRef{rel: path.Join(d.Name, vs[0].Name), name: vs[0].Name, special: specials})
+					files = append(files, fileRef{rel: path.Join(d.Name, vs[0].Rel()), name: vs[0].Name, special: specials})
 				}
 			}
 		}
@@ -240,7 +240,7 @@ func variantRefs(list func(rel string) ([]Entry, error), rel string, depth int) 
 			}
 		case IsVideo(k.Name):
 			if _, _, ok := EpisodeOf(k.Name); ok {
-				refs = append(refs, fileRef{rel: path.Join(rel, k.Name), name: k.Name})
+				refs = append(refs, fileRef{rel: path.Join(rel, k.Rel()), name: k.Name})
 			}
 		}
 	}
@@ -265,4 +265,23 @@ func variantRefs(list func(rel string) ([]Entry, error), rel string, depth int) 
 		}
 	}
 	return refs, nil
+}
+
+// unwrapping makes list return its entries with UnwrapEntries applied. The
+// budget of directories to open is shared by all the listings of one call.
+func unwrapping(list func(rel string) ([]Entry, error)) func(rel string) ([]Entry, error) {
+	budget := maxUnwrap
+	return func(rel string) ([]Entry, error) {
+		es, err := list(rel)
+		if err != nil || budget <= 0 {
+			return es, err
+		}
+		var opened int
+		out := UnwrapEntries(es, func(name string) ([]Entry, error) {
+			opened++
+			return list(path.Join(rel, name))
+		})
+		budget -= opened
+		return out, nil
+	}
 }

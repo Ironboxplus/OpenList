@@ -64,7 +64,13 @@ func Classify(name string, isDir bool, entries []Entry) Result {
 // ClassifyWith is Classify that may look into a few subdirectories (see
 // ClassifyEntriesWith).
 func ClassifyWith(name string, isDir bool, entries []Entry, peek Peek) Result {
-	ni := ParseName(name, !isDir)
+	if isDir {
+		entries = UnwrapEntries(entries, peek)
+	}
+	// A directory named like its video and holding only that video is the file
+	// (115 offline downloads): it is read by its name without the extension.
+	wrapper := isDir && IsVideo(name) && entries != nil && holdsOneVideo(entries)
+	ni := ParseName(name, !isDir || wrapper)
 	r := Result{
 		Title: ni.Title, English: ni.English, Year: ni.Year, Season: ni.Season,
 		Episodes: ni.Episodes, Parsed: ni.Parsed, Group: ni.Group, TMDBID: ni.TMDBID, IMDbID: ni.IMDbID,
@@ -72,7 +78,7 @@ func ClassifyWith(name string, isDir bool, entries []Entry, peek Peek) Result {
 
 	var shape Shape
 	switch {
-	case !isDir:
+	case !isDir || wrapper:
 		if ni.TVHint && !ni.Collection {
 			shape = Shape{Kind: "tv", Confidence: 0.6, Why: "episode marker in a file name"}
 		} else {

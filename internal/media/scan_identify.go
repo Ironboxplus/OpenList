@@ -63,6 +63,7 @@ func identifyScanItemChecked(ctx context.Context, vfsPath string, item *model.Me
 		note(err)
 		return es, err
 	}
+	entries = identify.UnwrapEntries(entries, peek)
 	r := identify.ClassifyWith(item.FileName, item.IsFolder, entries, peek)
 	applyIdentify(item, r)
 	if !item.IsFolder && model.IsEpisodicVideo(r.Kind) {
@@ -120,7 +121,7 @@ func collectionChildren(parent string, entries []identify.Entry) []string {
 		switch {
 		case e.IsDir && identify.IsExtraDir(e.Name):
 		case e.IsDir || identify.IsVideo(e.Name):
-			out = append(out, stdpath.Join(parent, e.Name))
+			out = append(out, stdpath.Join(parent, e.ItemName()))
 		}
 	}
 	return out

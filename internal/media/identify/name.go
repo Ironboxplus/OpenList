@@ -37,6 +37,9 @@ type segment struct {
 
 var closers = map[rune]rune{'[': ']', '【': '】', '(': ')', '（': '）', '「': '」', '『': '』', '《': '》', '<': '>'}
 
+// isQuote is a bracket that quotes a phrase of a title.
+func isQuote(r rune) bool { return r == '「' || r == '『' || r == '《' }
+
 func splitSegments(s string) []segment {
 	var segs []segment
 	var cur strings.Builder
@@ -52,6 +55,14 @@ func splitSegments(s string) []segment {
 			j := i + 1
 			for j < len(rs) && rs[j] != cl {
 				j++
+			}
+			// A quotation inside a title (想結束這場「我愛你」的遊戲) is part of it, as in
+			// anitomy, whose title runs on through balanced brackets; one that opens
+			// the name or follows a space is a tag and splits as before.
+			if j < len(rs) && isQuote(rs[i]) && cur.Len() > 0 && !unicode.IsSpace(rs[i-1]) {
+				cur.WriteString(string(rs[i : j+1]))
+				i = j
+				continue
 			}
 			if j < len(rs) {
 				flush()
@@ -381,6 +392,10 @@ func cutNoise(s string) string {
 	toks := strings.Fields(s)
 	var out []string
 	for i, t := range toks {
+		// "Title - 03": the number after a dash is the episode
+		if i > 1 && toks[i-1] == "-" && len(t) <= 3 && isAllDigits(t) {
+			break
+		}
 		if i > 0 && (techWordRe.MatchString(t) || scraper.IsNoiseToken(t) || techHanRe.MatchString(t)) {
 			if !(len(t) <= 2 && isAllDigits(t)) { // a short number can be part of a title: "Steins;Gate 0"
 				break

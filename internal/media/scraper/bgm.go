@@ -124,6 +124,10 @@ func (b *Bangumi) Identify(ctx context.Context, q IdentifyQuery) ([]Candidate, e
 	pool := map[string]Candidate{}
 	terms := append([]SearchTerm(nil), q.Terms...)
 	sort.SliceStable(terms, func(i, j int) bool { return terms[i].Confidence > terms[j].Confidence })
+	// the titles read from the files inside come after the name's own terms
+	for _, c := range q.Content {
+		terms = append(terms, SearchTerm{Name: c.Name, Confidence: 0.1})
+	}
 	year := q.Year
 	if year == 0 && len(terms) > 0 {
 		year = atoiSafe(terms[0].Year)

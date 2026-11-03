@@ -96,6 +96,21 @@ func contentNames(entries []Entry, peek Peek) []ContentName {
 		}
 		add(contentName(best.Name, true))
 	}
+	// Episodes of one release carry the show's own title; unlike a directory's
+	// English name it may be in Chinese or Japanese, which a provider searches too.
+	if len(videos) >= 2 {
+		best := videos[0]
+		for _, v := range videos[1:] {
+			if v.Size > best.Size {
+				best = v
+			}
+		}
+		if _, ok := episodeOf(best.Name); ok {
+			if t := strings.TrimSpace(ParseName(best.Name, true).Title); t != "" && !scraper.IsNoiseToken(t) && len([]rune(t)) >= 2 {
+				add(ContentName{Name: t}, true)
+			}
+		}
+	}
 	slices.SortFunc(dirs, func(a, b Entry) int { return strings.Compare(a.Name, b.Name) })
 	for _, d := range dirs {
 		add(contentName(d.Name, false))
