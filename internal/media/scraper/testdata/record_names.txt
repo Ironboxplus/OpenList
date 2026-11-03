@@ -1,0 +1,27 @@
+# kind<TAB>folder name (names only, no paths). kind: anime | tv | movie.
+anime	[VCB-Studio] Steins;Gate 0 [Ma10p_1080p]
+anime	[VCB-Studio] Another [Ma10p_1080p]
+anime	[Moozzi2] Campione - TV + SP
+anime	[Suzu-Kaze&LoliHouse] Sword Oratoria [BDRip 1080p HEVC-10bit FLAC]
+anime	[DBD-Raws][叹气的亡灵想隐退][01-13TV全集][1080P][BDRip][HEVC-10bit][简繁外挂][FLAC][MKV]
+anime	[桜都字幕组&冷番补完字幕组&漫猫字幕组][机动战士高达SEED FREEDOM][機動戦士ガンダムSEED FREEDOM][2024][Movie][1080p+2160p][内封简繁中字]
+anime	[Kamigami] Space Battleship Yamato 2199 [BD 1920x1080 x264 FLAC MKV Sub(Chs,Cht,Jap,Eng)]
+anime	[DBD-Raws][4K_HDR][超时空要塞 可曾记得爱][完全版+院线版][2160P][UHDBDRip][HEVC-10bit][简繁日双语外挂][FLAC][MKV]
+anime	[DBD-Raws][凉宫春日的弦奏 Revival][正片+特典映像][1080P][BDRip][HEVC-10bit][FLAC][MKV]
+anime	[Kamigami] Omohide Poro Poro(Only Yesterday) [BD x264 1920x1040 FLAC(CH1,CH2,JP,GE,KO) Sub(CH1,CH2,JP,EN,FR,GE,KO)].mkv
+anime	[VCB-Studio] Shokugeki no Souma
+anime	[VCB-Studio] Log Horizon
+anime	死神
+anime	无职转生
+anime	路人不友好
+anime	想结束
+anime	剧毒
+anime	re0
+anime	[Nemuri] MACROSS DELTA マクロスΔ & Walküre ワルキューレ (2016-2024) [FLAC]
+anime	[KRSUB][Kamen Rider Saber][BDBOX3][1080p][CHS][FIN]
+tv	Itou.Junji.Maniac.S01.1080p.NF.WEB-DL.DDP2.0.x264.MULTI-Emmid
+tv	JoJos.Bizarre.Adventure.S06E01.STEEL.BALL.RUN.1080p.NF.WEB-DL.MULTi.AAC2.0.H.264.MSubs-ToonsHub.mkv
+movie	12.11.13.Hana.and.Alice.2004.BD.REMUX.h264.1080p.DD20(Jpn).Mysilu
+movie	【高清影视之家发布 www.BBQDDQ.com】毒液：最后一舞[60帧率版本][高码版][国英多音轨+中文字幕].2024.2160p.HQ.WEB-DL.DDP5.1.H265.60fps.2Audio-ParkHD
+movie	Final.Destination.Bloodlines.2025.1080p.Blu-ray.Remux.AVC.TrueHD.7.1-HDT[PianYuan]
+movie	007系列[27部合集].BD1080P.H265.AC3.English&Mandarin.CHS-ENG.52ZYGX

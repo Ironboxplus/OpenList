@@ -46,7 +46,10 @@ func mediaStore() *store.Store {
 	return store.New(setting.GetStr(conf.MediaThumbnailMode, "runtime"), setting.GetStr(conf.MediaThumbnailPath, "/imgs"))
 }
 
-func mediaScraperSet() (*scraper.Set, error) {
+// MediaScraperConfig is the provider configuration the server scrapes with, built
+// from the media settings. `openlist media record` uses it too, so a recording
+// sees what a scrape sees.
+func MediaScraperConfig() scraper.Config {
 	cfg := scraper.Config{
 		TMDBToken:    strings.TrimSpace(setting.GetStr(conf.MediaTMDBKey)),
 		OMDbKeys:     scraper.SplitKeys(setting.GetStr(conf.MediaOMDbKeys)),
@@ -58,6 +61,11 @@ func mediaScraperSet() (*scraper.Set, error) {
 	if u := tmdbBaseURL(setting.GetStr(conf.MediaTMDBAPIURL)); u != "" {
 		cfg.BaseURLs = map[string]string{"tmdb": u}
 	}
+	return cfg
+}
+
+func mediaScraperSet() (*scraper.Set, error) {
+	cfg := MediaScraperConfig()
 	if mediaConfigHook != nil {
 		mediaConfigHook(&cfg)
 	}
