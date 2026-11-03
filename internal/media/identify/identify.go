@@ -27,6 +27,7 @@ type Result struct {
 	Group      string
 	TMDBID     string // inline id tag in the name (digits); wins over any search
 	IMDbID     string
+	Versions   []string // movie: the files that are versions of it, default first
 }
 
 // Terms are the queries to send to a provider, best first.
@@ -51,6 +52,12 @@ func (Rules) Classify(_ context.Context, name string, isDir bool, entries []Entr
 // nil when the directory was not listed: the kind then rests on the name and
 // the confidence says so.
 func Classify(name string, isDir bool, entries []Entry) Result {
+	return ClassifyWith(name, isDir, entries, nil)
+}
+
+// ClassifyWith is Classify that may look into a few subdirectories (see
+// ClassifyEntriesWith).
+func ClassifyWith(name string, isDir bool, entries []Entry, peek Peek) Result {
 	ni := ParseName(name, !isDir)
 	r := Result{
 		Title: ni.Title, English: ni.English, Year: ni.Year, Season: ni.Season,
@@ -66,7 +73,7 @@ func Classify(name string, isDir bool, entries []Entry) Result {
 			shape = Shape{Kind: "movie", Confidence: 0.85, Why: "a single video file"}
 		}
 	case entries != nil:
-		shape = ClassifyEntries(entries)
+		shape = ClassifyEntriesWith(entries, peek)
 	}
 
 	kind, conf, why := shape.Kind, shape.Confidence, shape.Why
@@ -106,9 +113,22 @@ func Classify(name string, isDir bool, entries []Entry) Result {
 		kind = "movie"
 	}
 	r.Kind, r.Confidence, r.Why = kind, conf, why
+	if kind == "movie" || kind == "anime" {
+		r.Versions = shape.Versions
+	}
 	if r.Title == "" {
 		r.Title = strings.TrimSpace(name)
 		r.Confidence = min(r.Confidence, 0.3)
 	}
 	return r
+}
+
+// PeekClassifier is a Classifier that can look into a few subdirectories.
+type PeekClassifier interface {
+	ClassifyWith(ctx context.Context, name string, isDir bool, entries []Entry, peek Peek) (Result, error)
+}
+
+// ClassifyWith implements PeekClassifier.
+func (Rules) ClassifyWith(_ context.Context, name string, isDir bool, entries []Entry, peek Peek) (Result, error) {
+	return ClassifyWith(name, isDir, entries, peek), nil
 }

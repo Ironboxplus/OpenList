@@ -41,14 +41,18 @@ func stem(name string) string {
 }
 
 // Directory names that hold extras, not works.
-var extraDirRe = regexp.MustCompile(`(?i)^(subs?|subtitles?|字幕|samples?([\s._-]*(videos?|clips?|files?))?|extras?|featurettes?|trailers?|behind[\s._-]*the[\s._-]*scenes|scans?|cds?\d*|bdmv|certificate|menu|screens?|screenshots?|covers?|artworks?|nced|ncop|sps?|bonus|special features?|cd\d+|disc\s*\d+|dvd\d*|\.?[a-z_]*(thumb|cache)[a-z_]*)$`)
+var extraDirRe = regexp.MustCompile(`(?i)^(subs?|subtitles?|字幕|samples?([\s._-]*(videos?|clips?|files?))?|extras?|featurettes?|trailers?|pictures?|photos?|posters?|behind[\s._-]*the[\s._-]*scenes|scans?|cds?\d*|bdmv|certificate|menu|screens?|screenshots?|covers?|artworks?|nced|ncop|sps?|bonus|special features?|cd\d+|disc\s*\d+|dvd\d*|\.?[a-z_]*(thumb|cache)[a-z_]*)$`)
 
 // bracketsRe strips the brackets some releases put around an extras directory
 // name ("[Subs]", "【字幕】").
 var bracketsRe = regexp.MustCompile(`[\[\]()（）【】]`)
 
+// orderPrefixRe is the "1. " some releases put before directory names to sort them.
+var orderPrefixRe = regexp.MustCompile(`^\s*\d{1,2}\s*[.\-_)]\s*`)
+
 func isExtraDirName(name string) bool {
-	return extraDirRe.MatchString(strings.TrimSpace(bracketsRe.ReplaceAllString(name, "")))
+	n := strings.TrimSpace(bracketsRe.ReplaceAllString(name, ""))
+	return extraDirRe.MatchString(n) || extraDirRe.MatchString(orderPrefixRe.ReplaceAllString(n, "")) || ostRe.MatchString(name)
 }
 
 // junkVideoRe names files that are never the work: samples, trailers, teasers.
@@ -84,7 +88,7 @@ func mainVideos(videos []Entry) []Entry {
 // name, because release folders carry the show name first ("Friends.S01.1080p",
 // "葬送的芙莉莲 S01", "BEASTARS 2nd Season") or are only a number ("1", "02").
 // Roman numerals are not numbering (无间道 I/II/III are different films).
-var seasonDirRe = regexp.MustCompile(`(?i)^(season|series|s)[\s._-]*\d{1,2}\b|^第\s*[\d一二三四五六七八九十百]+\s*[季部期]|^specials?$|^ova$|^oad$|^特典|^特别篇|^剧场版$|(?:^|[^a-z0-9])s\d{1,3}(?:[^a-z0-9]|$)|第\s*[\d一二三四五六七八九十百]+\s*[季部期]|(?:^|[^a-z0-9])season[\s._-]*\d{1,2}(?:[^0-9]|$)|\d{1,2}(?:st|nd|rd|th)[\s._-]*season|^0?\d{1,2}$`)
+var seasonDirRe = regexp.MustCompile(`(?i)^(season|series|s)[\s._-]*\d{1,2}\b|^第\s*[\d一二三四五六七八九十百]+\s*[季部期]|^specials?$|^ova$|^oad$|^特典|^特别篇|^剧场版$|(?:^|[^a-z0-9])s\d{1,3}(?:[^a-z0-9]|$)|第\s*[\d一二三四五六七八九十百]+\s*[季部期]|(?:^|[^a-z0-9])season[\s._-]*\d{1,2}(?:[^0-9]|$)|\d{1,2}(?:st|nd|rd|th)[\s._-]*season|^0?\d{1,2}$|^s\d{1,2}(?:\D|$)|^se\d{2}(?:\D|$)`)
 
 type epMatch struct {
 	Season, Episode int
@@ -168,14 +172,55 @@ type Shape struct {
 	Kind       string // movie | tv | collection | ignore | "" (can't tell)
 	Confidence float32
 	Why        string
-	Episodes   int // video files that look like episodes
+	Episodes   int      // video files that look like episodes
+	Versions   []string // movie: the files that are versions of it, default first
 }
+
+// Peek lists the subdirectory name of the directory being classified. It is
+// optional: the rules that need to look one level further down ask it, and
+// give the same answer as before without it.
+type Peek func(name string) ([]Entry, error)
+
+// maxPeek is how many subdirectories a verdict looks into.
+const maxPeek = 3
+
+// peekKinds is the shape of up to maxPeek of the subdirectories, "" for one
+// that cannot be listed; nil when there is no peek.
+func peekKinds(dirs []Entry, peek Peek) []string {
+	if peek == nil {
+		return nil
+	}
+	var out []string
+	for i, d := range dirs {
+		if i >= maxPeek {
+			break
+		}
+		kids, err := peek(d.Name)
+		if err != nil {
+			out = append(out, "")
+			continue
+		}
+		out = append(out, ClassifyEntries(kids).Kind)
+	}
+	return out
+}
+
+
+// specialDirRe are directory names that are extras of a show or a film rather
+// than seasons when nothing else says "show".
+var specialDirRe = regexp.MustCompile(`(?i)^specials?$|^ova$|^oad$|^特典|^特别篇|^剧场版$`)
 
 // ClassifyEntries decides a directory's role from one listing. It never needs
 // a second level: a "Season x" directory or a run of numbered episodes is
 // enough for tv, several directories that are not a numbered series are a
 // collection.
-func ClassifyEntries(entries []Entry) Shape {
+func ClassifyEntries(entries []Entry) Shape { return ClassifyEntriesWith(entries, nil) }
+
+// ClassifyEntriesWith is ClassifyEntries that may look into a few
+// subdirectories where one listing cannot tell: numbered directories that are
+// films ("死神来了1", "死神来了2") or seasons, and a directory that only wraps
+// another one.
+func ClassifyEntriesWith(entries []Entry, peek Peek) Shape {
 	var videos, dirs []Entry
 	var audio, other int
 	for _, e := range entries {
@@ -198,21 +243,47 @@ func ClassifyEntries(entries []Entry) Shape {
 		return Shape{Kind: "ignore", Confidence: 0.85, Why: "no video and no subdirectory"}
 	}
 
-	var workDirs []Entry
+	var workDirs, seasonDirs []Entry
 	var seasonNames []string
+	var specials []Entry
 	for _, d := range dirs {
 		switch {
+		case specialDirRe.MatchString(d.Name):
+			specials = append(specials, d)
 		case seasonDirRe.MatchString(d.Name):
 			seasonNames = append(seasonNames, d.Name)
+			seasonDirs = append(seasonDirs, d)
 			workDirs = append(workDirs, d)
 		case isExtraDirName(d.Name):
 		default:
 			workDirs = append(workDirs, d)
 		}
 	}
+	// "特典" / "Specials" next to a lone film are its extras; next to
+	// seasons, or alone, they are what they say.
+	if len(seasonNames) > 0 || len(videos) == 0 {
+		for _, d := range specials {
+			seasonNames = append(seasonNames, d.Name)
+			seasonDirs = append(seasonDirs, d)
+			workDirs = append(workDirs, d)
+		}
+	}
 	seasons := len(seasonNames)
 	if !oneShow(seasonNames) {
 		seasons = 0 // seasons of different shows: each directory is its own work
+	}
+	// A single season next to a directory whose name goes on from the show's
+	// ("FLCL S01", "FLCL Alternative & Progressive") is a sequel, a work of
+	// its own: a collection.
+	if seasons == 1 && extendsSeason(seasonNames[0], workDirs) {
+		seasons = 0
+	}
+	// Bare numbers ("1", "2") are seasons only when what they hold is a show:
+	// 与神同行's "1" and "2" are two films.
+	if seasons > 0 && allBareNumbers(seasonNames) {
+		if filmsNotShows(peekKinds(seasonDirs, peek)) {
+			return Shape{Kind: "collection", Confidence: 0.75, Why: "numbered directories that each hold one film"}
+		}
 	}
 
 	epCount := 0
@@ -249,10 +320,18 @@ func ClassifyEntries(entries []Entry) Shape {
 		}
 		switch {
 		case len(workDirs) >= 2 && numberedSeries(names):
+			// "死神来了1".."死神来了5" are five films, "蓝光原盘"-style parts one show
+			if filmsNotShows(peekKinds(workDirs, peek)) {
+				return Shape{Kind: "collection", Confidence: 0.75, Why: "numbered directories that each hold one film"}
+			}
 			return Shape{Kind: "tv", Confidence: 0.7, Why: "numbered subdirectories (parts of one show)"}
 		case len(workDirs) >= 2:
 			return Shape{Kind: "collection", Confidence: 0.8, Why: "several subdirectories, each its own work"}
 		case len(workDirs) == 1:
+			// a wrapper: what it holds is what this is
+			if k := peekKinds(workDirs, peek); len(k) == 1 && (k[0] == "movie" || k[0] == "tv") {
+				return Shape{Kind: k[0], Confidence: 0.7, Why: "the only subdirectory holds " + k[0]}
+			}
 			return Shape{Why: "single wrapper subdirectory"}
 		}
 		return Shape{Why: "only extra directories"}
@@ -260,6 +339,9 @@ func ClassifyEntries(entries []Entry) Shape {
 	// videos present, not episodic
 	if len(workDirs) >= 2 && len(videos) <= 1 {
 		return Shape{Kind: "collection", Confidence: 0.75, Why: "several subdirectories next to at most one video"}
+	}
+	if len(videos) >= 2 && sameWork(videos) {
+		return Shape{Kind: "movie", Confidence: 0.85, Why: "versions of one movie", Versions: versionOrder(videos)}
 	}
 	if len(videos) == 1 || dominant(videos) {
 		return Shape{Kind: "movie", Confidence: 0.85, Why: "one main video"}
@@ -269,6 +351,37 @@ func ClassifyEntries(entries []Entry) Shape {
 	}
 	return Shape{Kind: "collection", Confidence: 0.7, Why: "several unrelated videos"}
 }
+
+var bareNumberRe = regexp.MustCompile(`^\s*0*\d{1,2}\s*$`)
+
+func allBareNumbers(names []string) bool {
+	for _, n := range names {
+		if !bareNumberRe.MatchString(n) {
+			return false
+		}
+	}
+	return len(names) > 0
+}
+
+// extendsSeason reports whether another work directory's name is the season's
+// show name followed by more words ("flcl" -> "flclalternativeprogressive").
+func extendsSeason(season string, workDirs []Entry) bool {
+	st := seasonStem(season)
+	if st == "" {
+		return false
+	}
+	for _, d := range workDirs {
+		if d.Name == season || seasonDirRe.MatchString(d.Name) {
+			continue
+		}
+		o := seasonStem(d.Name)
+		if len(o) > len(st) && strings.HasPrefix(o, st) {
+			return true
+		}
+	}
+	return false
+}
+
 
 // dominant: one video is at least 80% of all video bytes (the rest are
 // trailers and samples).
@@ -383,4 +496,19 @@ func oneShow(names []string) bool {
 		}
 	}
 	return true
+}
+
+// filmsNotShows: among the peeked kinds there is a film and no show (a
+// directory that only wraps another one cannot say, and is not held against it).
+func filmsNotShows(kinds []string) bool {
+	films := false
+	for _, k := range kinds {
+		switch k {
+		case "tv":
+			return false
+		case "movie":
+			films = true
+		}
+	}
+	return films
 }
