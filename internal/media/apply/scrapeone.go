@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"path"
-	"slices"
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/media/identify"
@@ -19,6 +18,9 @@ type ScrapeOpts struct {
 	ID       string
 	Lock     bool // lock the item afterwards
 	Force    bool // overwrite a locked item
+	// Existing: the item was taken from the library to be scraped. If a rescan
+	// removed it meanwhile the scrape ends with ErrGone instead of creating it again.
+	Existing bool
 }
 
 // ScrapeResult is what ScrapeOne did.
@@ -80,7 +82,26 @@ func (o *Orchestrator) ScrapeOne(ctx context.Context, p string, opts ScrapeOpts)
 	}
 	res.Kind = r.Kind
 
+	// A member of a collection with no title of its own ("2", 纯英) is looked up
+	// under the collection's title.
+	if !explicit && r.Kind != "collection" && r.Kind != "ignore" && identify.HasNoTitle(name, !isDir) {
+		parent := path.Dir(p)
+		if pe, perr := o.Writer.Existing(ctx, parent); perr == nil && pe[parent].Kind == model.VideoTypeCollection {
+			r.InheritParentTitle(name, !isDir, path.Base(parent))
+		}
+	}
+
 	req := model.MediaSetReq{Path: p, Kind: &r.Kind, Locked: &lock}
+	put := func(req model.MediaSetReq) error {
+		if opts.Existing {
+			if now, err := o.Writer.Existing(ctx, p); err != nil {
+				return err
+			} else if _, ok := now[p]; !ok {
+				return ErrGone
+			}
+		}
+		return o.Writer.Set(ctx, req, opts.Force)
+	}
 
 	inline := false
 	if !explicit && r.Kind != "ignore" && r.Kind != "collection" && (r.TMDBID != "" || r.IMDbID != "") {
@@ -108,7 +129,7 @@ func (o *Orchestrator) ScrapeOne(ctx context.Context, p string, opts ScrapeOpts)
 		if r.Kind == "ignore" || r.Kind == "collection" {
 			src := model.MediaSourceRule
 			req.Title, req.Year, req.Source, req.Confidence = ptr(r.Title), ptr(r.Year), &src, ptr(r.Confidence)
-			if err := o.Writer.Set(ctx, req, opts.Force); err != nil {
+			if err := put(req); err != nil {
 				return nil, err
 			}
 			res.Title, res.Confidence, res.Matched = r.Title, r.Confidence, true
@@ -121,7 +142,7 @@ func (o *Orchestrator) ScrapeOne(ctx context.Context, p string, opts ScrapeOpts)
 		if len(cs) == 0 {
 			src := model.MediaSourceRule
 			req.Title, req.Year, req.Source, req.Confidence = ptr(r.Title), ptr(r.Year), &src, ptr(float32(0))
-			if err := o.Writer.Set(ctx, req, opts.Force); err != nil {
+			if err := put(req); err != nil {
 				return nil, err
 			}
 			res.Title = r.Title
@@ -138,7 +159,7 @@ func (o *Orchestrator) ScrapeOne(ctx context.Context, p string, opts ScrapeOpts)
 			req.Title, req.Year, req.Source = ptr(r.Title), ptr(r.Year), &src
 			req.Confidence = ptr(best.Score)
 			req.Candidates = toModelCandidates(top)
-			if err := o.Writer.Set(ctx, req, opts.Force); err != nil {
+			if err := put(req); err != nil {
 				return nil, err
 			}
 			res.Title, res.Confidence, res.Candidates = r.Title, best.Score, top
@@ -172,7 +193,7 @@ func (o *Orchestrator) ScrapeOne(ctx context.Context, p string, opts ScrapeOpts)
 	if err := o.fillRequest(ctx, &req, row, tg, &warns); err != nil {
 		return nil, err
 	}
-	if err := o.Writer.Set(ctx, req, opts.Force); err != nil {
+	if err := put(req); err != nil {
 		return nil, err
 	}
 	res.Matched, res.Provider, res.ID, res.Title, res.Warnings = true, opts.Provider, opts.ID, tg.Title, warns
@@ -197,7 +218,7 @@ func (o *Orchestrator) showBehindCollection(ctx context.Context, r identify.Resu
 	// only a collection the rules took for several works with nothing to say they are
 	// films, and whose subdirectories were seen to hold no film (与神同行, 杀戮都市
 	// are collections of films and stay so)
-	if r.Kind != "collection" || !r.FromContent || r.Firm || len(r.ChildKinds) == 0 || slices.Contains(r.ChildKinds, "movie") {
+	if !r.MaybeShow() {
 		return scraper.Candidate{}, false
 	}
 	q := scraper.IdentifyQuery{Terms: r.Terms(), Year: r.Year, English: r.English, Content: r.Content}

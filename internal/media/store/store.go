@@ -129,6 +129,10 @@ func (s *Store) Set(req model.MediaSetReq, opt SetOptions) (*model.MediaItem, er
 			return nil, fmt.Errorf("invalid source %q", *req.Source)
 		}
 		it.Source = *req.Source
+		if it.Source != model.MediaSourceManual {
+			// a rule or scraper result: this generation of the rules produced it
+			it.IdentifyVersion = model.MediaIdentifyVersion
+		}
 	}
 	if req.Confidence != nil {
 		it.Confidence = *req.Confidence

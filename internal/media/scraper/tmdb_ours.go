@@ -316,6 +316,7 @@ type tmdbDetail struct {
 	Name          string  `json:"name"`
 	OriginalTitle string  `json:"original_title"`
 	OriginalName  string  `json:"original_name"`
+	OriginalLang  string  `json:"original_language"`
 	Overview      string  `json:"overview"`
 	PosterPath    string  `json:"poster_path"`
 	BackdropPath  string  `json:"backdrop_path"`
@@ -332,6 +333,45 @@ type tmdbDetail struct {
 	Seasons []struct {
 		SeasonNumber int `json:"season_number"`
 	} `json:"seasons"`
+	// AlternativeTitles: a show lists them under "results", a film under "titles".
+	AlternativeTitles struct {
+		Results []tmdbAltTitle `json:"results"`
+		Titles  []tmdbAltTitle `json:"titles"`
+	} `json:"alternative_titles"`
+}
+
+type tmdbAltTitle struct {
+	Country string `json:"iso_3166_1"`
+	Title   string `json:"title"`
+}
+
+// regionTitle is the name people in the configured language's region know a
+// work by, for a work TMDB has no translation of: it then answers in the
+// original language ("Love, Death & Robots" for zh-CN) while its alternative
+// titles for CN hold "爱，死亡和机器人". title is what the detail came back
+// with. It returns "" when the answer is already localized or no alternative
+// fits.
+func (t *TMDB) regionTitle(d *tmdbDetail, title, original string) string {
+	primary, region, _ := strings.Cut(strings.ReplaceAll(t.lang, "_", "-"), "-")
+	if region == "" || strings.EqualFold(primary, "en") || strings.EqualFold(primary, d.OriginalLang) || title != original {
+		return ""
+	}
+	regions := []string{strings.ToUpper(region)}
+	switch strings.ToUpper(t.lang) {
+	case "ZH-CN":
+		regions = append(regions, "SG")
+	case "ZH-TW":
+		regions = append(regions, "HK")
+	}
+	alts := append(append([]tmdbAltTitle{}, d.AlternativeTitles.Results...), d.AlternativeTitles.Titles...)
+	for _, reg := range regions {
+		for _, a := range alts {
+			if a.Country == reg && a.Title != "" && a.Title != title {
+				return a.Title
+			}
+		}
+	}
+	return ""
 }
 
 // SplitID turns "tv/890" into ("tv", "890"); a bare id takes the hint kind.
@@ -358,7 +398,7 @@ func (t *TMDB) Fill(ctx context.Context, tg *ScrapeTarget) error {
 	}
 	v := url.Values{}
 	v.Set("language", t.lang)
-	v.Set("append_to_response", "external_ids")
+	v.Set("append_to_response", "external_ids,alternative_titles")
 	var d tmdbDetail
 	if err := t.get(ctx, "/"+kind+"/"+num, v, &d); err != nil {
 		return err
@@ -366,12 +406,18 @@ func (t *TMDB) Fill(ctx context.Context, tg *ScrapeTarget) error {
 	tg.setID(ProviderTMDB, kind+"/"+num)
 	if kind == "tv" {
 		tg.Title, tg.OriginalTitle = firstNonEmpty(d.Name, d.Title), firstNonEmpty(d.OriginalName, d.OriginalTitle)
+		if alt := t.regionTitle(&d, tg.Title, tg.OriginalTitle); alt != "" {
+			tg.Title = alt
+		}
 		tg.Year = yearOf(d.FirstAirDate)
 		if tg.Kind == "" {
 			tg.Kind = "tv"
 		}
 	} else {
 		tg.Title, tg.OriginalTitle = firstNonEmpty(d.Title, d.Name), firstNonEmpty(d.OriginalTitle, d.OriginalName)
+		if alt := t.regionTitle(&d, tg.Title, tg.OriginalTitle); alt != "" {
+			tg.Title = alt
+		}
 		tg.Year = yearOf(d.ReleaseDate)
 		if tg.Kind == "" {
 			tg.Kind = "movie"

@@ -320,7 +320,7 @@ func keepScraped(item, existing *model.MediaItem) {
 	item.VideoType = existing.VideoType
 	item.Season = existing.Season
 	item.Episode = existing.Episode
-	item.MediaCuration = existing.MediaCuration
+	item.MediaCuration = existing.MediaCuration // also keeps IdentifyVersion
 }
 
 // UpdateMediaItemEpisodes sets only the Episodes JSON of an item.

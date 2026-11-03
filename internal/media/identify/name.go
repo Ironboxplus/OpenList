@@ -186,6 +186,8 @@ func ParseName(name string, isFile bool) NameInfo {
 	if isFile && IsVideo(name) {
 		name = stem(name)
 	}
+	// A re-encode of a film is named after it: "AV1_Recode_GantzO.2016.…" is GantzO.
+	name = recodePrefixRe.ReplaceAllString(name, "")
 	name, ni.TMDBID, ni.IMDbID = ExtractIDTags(name)
 	ni.Collection = collRe.MatchString(name)
 	ni.Theatrical = theatreRe.MatchString(name)

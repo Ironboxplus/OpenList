@@ -48,6 +48,20 @@ const (
 // needs a human look.
 const MediaPendingConfidence = 0.6
 
+// MediaIdentifyVersion numbers the generation of the identification rules, the
+// name parsing and the provider search. A work records the number it was
+// scraped under (MediaCuration.IdentifyVersion); when a scan meets a scraped,
+// unlocked, non-manual work from an older generation it queues the work for a
+// new scrape, so a better rule reaches the works it would have read differently
+// and not only new ones. Raise it whenever a change to identify, name parsing,
+// scoring or search can change a verdict or a match.
+//
+//	1  first scan: kinds from content, versions, seasons
+//	2  content-name search, original titles in scoring, firm collections
+//	3  titles for members without one, recode names, nested release folders,
+//	   localized titles
+const MediaIdentifyVersion = 3
+
 // MediaCuration is what the rules, the scrapers and a human add to a MediaItem
 // beyond the upstream fields. It is embedded in MediaItem, so the columns sit
 // in media_items.
@@ -59,6 +73,8 @@ type MediaCuration struct {
 	Confidence    float32 `json:"confidence"`                          // how sure the rules or the match are
 	Locked        bool    `gorm:"default:false"   json:"locked"`       // true: scans and scrapes never overwrite the scraped fields
 	Candidates    string  `gorm:"type:text"       json:"candidates"`   // JSON: top candidates when the confidence is low
+	// IdentifyVersion is the MediaIdentifyVersion the work was last scraped under (0: never).
+	IdentifyVersion int `gorm:"default:0" json:"identify_version"`
 }
 
 // IsSeries reports whether a video item is a show: an episodic type, or, for an

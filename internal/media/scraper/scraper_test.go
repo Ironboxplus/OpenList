@@ -132,7 +132,7 @@ func TestTMDBFillFromRecordedAnswer(t *testing.T) {
 		t.Fatal(err)
 	}
 	q := seen[0].URL.Query()
-	if q.Get("language") != "zh-CN" || q.Get("append_to_response") != "external_ids" {
+	if q.Get("language") != "zh-CN" || q.Get("append_to_response") != "external_ids,alternative_titles" {
 		t.Fatalf("detail query = %v", q)
 	}
 	if tg.ExternalIDs["imdb"] != "tt0112159" || tg.ExternalIDs["tmdb"] != "tv/890" {

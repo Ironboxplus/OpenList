@@ -15,6 +15,13 @@ type EpisodeFile struct {
 	Episode int
 }
 
+// fileRef is a candidate episode file while the show is being read.
+type fileRef struct {
+	rel, name string
+	dirSeason int
+	special   int // 1-based number of a special (season 0), 0 for episodes
+}
+
 // MaxEpisodeFiles caps what EpisodeFiles returns.
 const MaxEpisodeFiles = 3000
 
@@ -27,11 +34,6 @@ const maxSeasonDirs = 30
 // show itself). A file with no season of its own takes its directory's season,
 // else season 1. Files without an episode marker are left out.
 func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error) {
-	type fileRef struct {
-		rel, name string
-		dirSeason int
-		special   int // 1-based number of a special (season 0), 0 for episodes
-	}
 	top, err := list("")
 	if err != nil {
 		return nil, err
@@ -76,9 +78,11 @@ func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error)
 		}
 	}
 	// No season folders and no episodes of its own: the subfolders are copies or
-	// seasons under other names (魔道祖师: two releases, 星蝶公主: two languages).
-	// A folder that names its season keeps it; of the others the one with most
-	// episodes is the show and the rest are taken for copies of it.
+	// seasons under other names (魔道祖师: two releases, 星蝶公主: two languages,
+	// each holding its seasons in folders of its own, one of them wrapped once
+	// more). A folder that names its season keeps it; of the others the one with
+	// most episodes is the show, and the rest only fill the episodes it lacks
+	// when their files name their own season.
 	if seasonDirs == 0 && len(files) == 0 {
 		type variant struct {
 			refs   []fileRef
@@ -89,14 +93,14 @@ func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error)
 			if i >= maxSeasonDirs {
 				break
 			}
-			kids, err := list(d.Name)
+			refs, err := variantRefs(list, d.Name, 0)
 			if err != nil {
-				return nil, fmt.Errorf("list %s: %w", d.Name, err)
+				return nil, err
 			}
-			v := variant{season: seasonOfDirName(d.Name)}
-			for _, k := range kids {
-				if _, _, ok := EpisodeOf(k.Name); ok && !k.IsDir && IsVideo(k.Name) {
-					v.refs = append(v.refs, fileRef{rel: path.Join(d.Name, k.Name), name: k.Name, dirSeason: v.season})
+			v := variant{refs: refs, season: seasonOfDirName(d.Name)}
+			for j := range v.refs {
+				if v.refs[j].dirSeason == 0 {
+					v.refs[j].dirSeason = v.season
 				}
 			}
 			switch {
@@ -107,24 +111,48 @@ func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error)
 				unnamed = append(unnamed, v)
 			}
 		}
-		taken := map[int]bool{}
-		for _, v := range named {
-			taken[v.season] = true
-			files = append(files, v.refs...)
+		sort.SliceStable(unnamed, func(i, j int) bool { return len(unnamed[i].refs) > len(unnamed[j].refs) })
+		taken := map[[2]int]bool{}
+		takenSeason := map[int]bool{}
+		keyOf := func(r fileRef, fallback int) (int, int, bool) {
+			s, e, ok := EpisodeOf(r.name)
+			if !ok {
+				return 0, 0, false
+			}
+			if s == 0 {
+				s = r.dirSeason
+			}
+			if s == 0 {
+				s = fallback
+			}
+			return s, e, s > 0
 		}
-		if len(unnamed) > 0 {
-			best := unnamed[0]
-			for _, v := range unnamed[1:] {
-				if len(v.refs) > len(best.refs) {
-					best = v
+		for _, v := range named {
+			takenSeason[v.season] = true
+			for _, r := range v.refs {
+				if s, e, ok := keyOf(r, 0); ok {
+					taken[[2]int{s, e}] = true
+				}
+				files = append(files, r)
+			}
+		}
+		for i, v := range unnamed {
+			fallback := 0
+			if i == 0 {
+				fallback = 1
+				for takenSeason[fallback] {
+					fallback++
 				}
 			}
-			s := 1
-			for taken[s] {
-				s++
-			}
-			for _, r := range best.refs {
-				r.dirSeason = s
+			for _, r := range v.refs {
+				s, e, ok := keyOf(r, fallback)
+				if !ok || taken[[2]int{s, e}] {
+					continue
+				}
+				taken[[2]int{s, e}] = true
+				if r.dirSeason == 0 {
+					r.dirSeason = s
+				}
 				files = append(files, r)
 			}
 		}
@@ -180,4 +208,54 @@ func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error)
 		}
 	}
 	return out, nil
+}
+
+// maxVariantDepth is how many levels below a release folder are read for
+// episodes (the folder, a wrapper, the season folders in it).
+const maxVariantDepth = 2
+
+// variantRefs collects the episode-marked videos under one release folder of a
+// show: those in it and in the folders below it, down to maxVariantDepth. A
+// file takes the season of the nearest folder that names one, else 0 (its own
+// name may carry it).
+func variantRefs(list func(rel string) ([]Entry, error), rel string, depth int) ([]fileRef, error) {
+	kids, err := list(rel)
+	if err != nil {
+		return nil, fmt.Errorf("list %s: %w", rel, err)
+	}
+	var refs []fileRef
+	var dirs []Entry
+	for _, k := range kids {
+		switch {
+		case k.IsDir:
+			if !IsExtraDir(k.Name) {
+				dirs = append(dirs, k)
+			}
+		case IsVideo(k.Name):
+			if _, _, ok := EpisodeOf(k.Name); ok {
+				refs = append(refs, fileRef{rel: path.Join(rel, k.Name), name: k.Name})
+			}
+		}
+	}
+	if depth >= maxVariantDepth {
+		return refs, nil
+	}
+	sort.Slice(dirs, func(i, j int) bool { return dirs[i].Name < dirs[j].Name })
+	for i, d := range dirs {
+		if i >= maxSeasonDirs {
+			break
+		}
+		sub, err := variantRefs(list, path.Join(rel, d.Name), depth+1)
+		if err != nil {
+			return nil, err
+		}
+		season := seasonOfDirName(d.Name)
+		for _, r := range sub {
+			if r.dirSeason == 0 {
+				r.dirSeason = season
+			}
+			refs = append(refs, r)
+		}
+	}
+	return refs, nil
 }

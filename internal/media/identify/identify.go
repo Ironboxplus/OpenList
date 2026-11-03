@@ -7,6 +7,7 @@ package identify
 
 import (
 	"context"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -145,4 +146,82 @@ type PeekClassifier interface {
 // ClassifyWith implements PeekClassifier.
 func (Rules) ClassifyWith(_ context.Context, name string, isDir bool, entries []Entry, peek Peek) (Result, error) {
 	return ClassifyWith(name, isDir, entries, peek), nil
+}
+
+// MaybeShow reports whether a collection verdict may be one show whose
+// subdirectories are its seasons or releases (魔道祖师, 星蝶公主): the rules took
+// it for several works only because nothing said otherwise, and no
+// subdirectory was seen to hold a film. Only a provider can say more.
+func (r Result) MaybeShow() bool {
+	return r.Kind == "collection" && r.FromContent && !r.Firm && len(r.ChildKinds) > 0 && !slices.Contains(r.ChildKinds, "movie")
+}
+
+// bareName reports whether a file or directory name has no title of its own:
+// a number of one or two digits ("1", "02", the second film of 与神同行), or
+// nothing but release and language tags (纯英, 中英, 1080p). num is the number
+// without leading zeros, "" for tags.
+func bareName(name string, isFile bool) (num string, ok bool) {
+	st := name
+	if isFile {
+		st = stem(name)
+	}
+	st = strings.TrimSpace(st)
+	switch {
+	case st == "":
+		return "", false
+	case isAllDigits(st):
+		if len(st) > 2 {
+			return "", false // "300", "1917" are titles
+		}
+		n, _ := strconv.Atoi(st)
+		return strconv.Itoa(n), true
+	case isTechBracket(st):
+		return "", true
+	}
+	return "", false
+}
+
+// HasNoTitle reports whether a file or directory name carries no title of its
+// own: a number of one or two digits, or nothing but release and language tags.
+func HasNoTitle(name string, isFile bool) bool {
+	_, ok := bareName(name, isFile)
+	return ok
+}
+
+// InheritParentTitle gives a member of a collection that has no title of its
+// own (a directory "2", a release tag) the title of the collection and its
+// number, so it is looked up as "与神同行 2" and not as "2". The year and the
+// names found inside the member stay its own: they say which work of the
+// collection it is. It reports whether the member took the title.
+func (r *Result) InheritParentTitle(name string, isFile bool, parentName string) bool {
+	if r.Kind == "collection" || r.Kind == "ignore" {
+		return false
+	}
+	num, ok := bareName(name, isFile)
+	if !ok {
+		return false
+	}
+	pi := ParseName(parentName, false)
+	if pi.Title == "" {
+		return false
+	}
+	if _, bare := bareName(parentName, false); bare {
+		return false
+	}
+	title := pi.Title
+	parsed := pi.Parsed
+	if num != "" {
+		title += " " + num
+		switch {
+		case parsed.Chinese != "":
+			parsed.Chinese += " " + num
+		case parsed.English != "":
+			parsed.English += " " + num
+		}
+	}
+	if r.Year > 0 {
+		parsed.Year = strconv.Itoa(r.Year)
+	}
+	r.Title, r.Parsed, r.English = title, parsed, pi.English
+	return true
 }

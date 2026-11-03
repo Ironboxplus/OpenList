@@ -6,6 +6,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	log "github.com/sirupsen/logrus"
 	"gorm.io/gorm"
 )
 
@@ -35,6 +36,12 @@ func videoClass(videoType string) string {
 // "movie/123" is the wrong type now), the candidates, and the confidence and
 // source, which become the scan's. A work that stops being a show loses its
 // episode rows. Same class (tv to anime): only video_type changes.
+//
+// A scraped, unlocked, non-manual work that was scraped under an older
+// model.MediaIdentifyVersion is queued for a new scrape too (scraped_at NULL),
+// whatever the scan says about its kind: a better rule or search then reaches
+// the matches the old one got wrong. Nothing else is dropped, so the cover and
+// the data stay until the new scrape replaces them.
 func SaveScannedMediaItem(item *model.MediaItem, trusted bool) error {
 	if utf8.RuneCountInString(item.FolderPath) > model.MediaIndexColumnMax ||
 		utf8.RuneCountInString(item.FileName) > model.MediaIndexColumnMax ||
@@ -50,11 +57,18 @@ func SaveScannedMediaItem(item *model.MediaItem, trusted bool) error {
 	if err := CreateOrUpdateMediaItem(item); err != nil {
 		return err
 	}
+	stale := item.MediaType == model.MediaTypeVideo && existing.IdentifyVersion < model.MediaIdentifyVersion
 	if !trusted || item.MediaType != model.MediaTypeVideo || scan.VideoType == "" || scan.VideoType == existing.VideoType {
+		if stale {
+			return db.Unscoped().Model(&model.MediaItem{}).Where("id = ?", item.ID).Update("scraped_at", nil).Error
+		}
 		return nil
 	}
 	oldClass, newClass := videoClass(existing.VideoType), videoClass(scan.VideoType)
 	upd := map[string]any{"video_type": scan.VideoType}
+	if stale {
+		upd["scraped_at"] = nil
+	}
 	if oldClass != newClass {
 		upd["season"], upd["episode"] = scan.Season, scan.Episode
 		upd["scraped_at"] = nil
@@ -98,8 +112,12 @@ func PruneMediaItems(scanPathID uint, produced map[uint]bool, failed []string) (
 	var gone []uint
 	for i := range rows {
 		r := &rows[i]
-		if produced[r.ID] || underAny(stdpath.Join(r.FolderPath, r.FileName), failed) {
+		p := stdpath.Join(r.FolderPath, r.FileName)
+		if produced[r.ID] || underAny(p, failed) {
 			continue
+		}
+		if len(gone) < 20 {
+			log.Infof("media prune [scan path %d]: removing id %d %s", scanPathID, r.ID, p)
 		}
 		gone = append(gone, r.ID)
 	}
@@ -123,4 +141,19 @@ func underAny(p string, paths []string) bool {
 		}
 	}
 	return false
+}
+
+// DecidedShowKind returns the video type of the stored work at folderPath and
+// fileName when it is a show that a scraper or a person decided (source not
+// "rule"), "" otherwise. A scan whose rules read such a folder as a collection
+// of seasons or releases (星蝶公主: 纯英 and 中英) keeps the decision and does not
+// open the folder into member rows again.
+func DecidedShowKind(folderPath, fileName string) string {
+	var it model.MediaItem
+	err := db.Select("video_type", "source").
+		Where("folder_path = ? AND file_name = ? AND album_name = ''", folderPath, fileName).First(&it).Error
+	if err != nil || it.Source == model.MediaSourceRule || it.Source == "" || !model.IsEpisodicVideo(it.VideoType) {
+		return ""
+	}
+	return it.VideoType
 }

@@ -658,9 +658,9 @@ func StartMediaScrape(c *gin.Context) {
 						continue
 					}
 					began := time.Now()
-					res, e := videoOrch.ScrapeOne(context.Background(), db.MediaItemPath(item), apply.ScrapeOpts{})
+					res, e := videoOrch.ScrapeOne(context.Background(), db.MediaItemPath(item), apply.ScrapeOpts{Existing: true})
 					videoScrapeStats.record(res, time.Since(began))
-					if e != nil && !errors.Is(e, apply.ErrLocked) {
+					if e != nil && !errors.Is(e, apply.ErrLocked) && !errors.Is(e, apply.ErrGone) {
 						log.Warnf("刮削失败 [%s] %s: %v", req.MediaType, item.FolderPath, e)
 					}
 					continue

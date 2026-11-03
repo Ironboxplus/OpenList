@@ -94,6 +94,24 @@ func applyIdentify(item *model.MediaItem, r identify.Result) {
 	}
 }
 
+// settleVerdict applies what a scan knows beyond the rules of one folder.
+// A member of a collection with no title of its own ("2", 纯英) takes the
+// collection's. A folder the rules took for several works, but that a scraper or
+// a person has since made one show, stays that show (decided gives the stored
+// kind): the scan then reads its episodes and no longer opens it into member
+// rows, which the prune removes.
+func settleVerdict(item *model.MediaItem, r *identify.Result, member bool, decided func(folder, name string) string) {
+	if member && r.InheritParentTitle(item.FileName, !item.IsFolder, stdpath.Base(item.FolderPath)) {
+		applyIdentify(item, *r)
+	}
+	if item.IsFolder && r.MaybeShow() {
+		if kind := decided(item.FolderPath, item.FileName); kind != "" {
+			r.Kind = kind
+			applyIdentify(item, *r)
+		}
+	}
+}
+
 // collectionChildren lists what to scan inside a collection folder: its video
 // files and its directories, minus the directories that hold extras.
 func collectionChildren(parent string, entries []identify.Entry) []string {

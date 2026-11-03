@@ -142,6 +142,7 @@ func scrapedRow(t *testing.T, kind string) *model.MediaItem {
 	it.ScrapedAt, it.Cover, it.Plot, it.ScrapedName, it.ReleaseDate = &now, "thumb:/c.jpg", "plot", "The Work", "2010-01-01"
 	it.ExternalIDs, it.Candidates = `{"tmdb":"tv/9"}`, `[{"id":"x"}]`
 	it.Source, it.Confidence = model.MediaSourceScraper, 0.9
+	it.IdentifyVersion = model.MediaIdentifyVersion
 	if err := UpdateMediaItem(it); err != nil {
 		t.Fatal(err)
 	}
@@ -211,5 +212,137 @@ func TestRescanKeepsWhatItMustNotTouch(t *testing.T) {
 		if got := rescan(t, model.VideoTypeMovie, true); got.VideoType != model.VideoTypeTV || got.ScrapedAt == nil || got.ExternalIDs == "" {
 			t.Errorf("%s row was reclassified: %q scraped_at %v", name, got.VideoType, got.ScrapedAt)
 		}
+	}
+}
+
+// A work scraped under older rules is queued for a new scrape by the next scan,
+// whatever the scan says about its kind, and keeps everything it had until that
+// scrape replaces it.
+func TestRescanQueuesWorksScrapedUnderOlderRules(t *testing.T) {
+	old := func(i *model.MediaItem) { i.IdentifyVersion = model.MediaIdentifyVersion - 1 }
+	check := func(name string, got *model.MediaItem, wantQueued bool) {
+		t.Helper()
+		if queued := got.ScrapedAt == nil; queued != wantQueued {
+			t.Errorf("%s: scraped_at %v, queued want %v", name, got.ScrapedAt, wantQueued)
+		}
+		if got.Cover != "thumb:/c.jpg" || got.Plot != "plot" || got.ScrapedName != "The Work" {
+			t.Errorf("%s: scraped data was dropped: %+v", name, got)
+		}
+	}
+
+	rescanDB(t)
+	it := scrapedRow(t, model.VideoTypeTV)
+	old(it)
+	if err := UpdateMediaItem(it); err != nil {
+		t.Fatal(err)
+	}
+	check("same kind, older rules", rescan(t, model.VideoTypeTV, true), true)
+
+	// the generation is current: nothing is queued
+	rescanDB(t)
+	scrapedRow(t, model.VideoTypeTV)
+	check("same kind, current rules", rescan(t, model.VideoTypeTV, true), false)
+
+	// a scan that could not trust its listings still queues (the rule change is not about the listing)
+	rescanDB(t)
+	it = scrapedRow(t, model.VideoTypeTV)
+	old(it)
+	if err := UpdateMediaItem(it); err != nil {
+		t.Fatal(err)
+	}
+	got := rescan(t, model.VideoTypeTV, false)
+	check("untrusted scan", got, true)
+	if got.VideoType != model.VideoTypeTV {
+		t.Errorf("untrusted scan changed the kind to %q", got.VideoType)
+	}
+
+	// tv to anime is the same class: the kind follows and the older generation queues it
+	rescanDB(t)
+	it = scrapedRow(t, model.VideoTypeTV)
+	old(it)
+	if err := UpdateMediaItem(it); err != nil {
+		t.Fatal(err)
+	}
+	got = rescan(t, model.VideoTypeAnime, true)
+	if got.VideoType != model.VideoTypeAnime || got.ScrapedAt != nil || got.Cover != "thumb:/c.jpg" {
+		t.Errorf("tv to anime: %q scraped_at %v cover %q", got.VideoType, got.ScrapedAt, got.Cover)
+	}
+
+	// locked and manual works are never queued
+	for name, mark := range map[string]func(*model.MediaItem){
+		"locked": func(i *model.MediaItem) { i.Locked = true },
+		"manual": func(i *model.MediaItem) { i.Source = model.MediaSourceManual },
+	} {
+		rescanDB(t)
+		it = scrapedRow(t, model.VideoTypeTV)
+		old(it)
+		mark(it)
+		if err := UpdateMediaItem(it); err != nil {
+			t.Fatal(err)
+		}
+		got := rescan(t, model.VideoTypeTV, true)
+		if got.ScrapedAt == nil || got.IdentifyVersion != model.MediaIdentifyVersion-1 {
+			t.Errorf("%s work was queued or restamped: scraped_at %v version %d", name, got.ScrapedAt, got.IdentifyVersion)
+		}
+	}
+
+	// an unscraped row has nothing to queue and keeps its version at 0
+	rescanDB(t)
+	row(t, "/lib", "Work", model.VideoTypeTV)
+	if got := rescan(t, model.VideoTypeTV, true); got.ScrapedAt != nil || got.IdentifyVersion != 0 {
+		t.Errorf("unscraped row: %+v", got)
+	}
+}
+
+// Pruning soft-deletes: the row stays in the table with deleted_at set, and a
+// later scan that produces it again restores it under its id.
+func TestPruneSoftDeletesAndAScanRestores(t *testing.T) {
+	rescanDB(t)
+	a := row(t, "/lib", "A", model.VideoTypeMovie)
+	b := row(t, "/lib", "B", model.VideoTypeMovie)
+	n, err := PruneMediaItems(7, map[uint]bool{a.ID: true}, nil)
+	if err != nil || n != 1 {
+		t.Fatalf("pruned %d (%v)", n, err)
+	}
+	var raw model.MediaItem
+	if err := db.Unscoped().First(&raw, b.ID).Error; err != nil || !raw.DeletedAt.Valid {
+		t.Fatalf("pruned row: deleted_at valid %v (%v)", raw.DeletedAt.Valid, err)
+	}
+	if alive(t, b.ID) {
+		t.Fatal("pruned row is still visible")
+	}
+	if again := row(t, "/lib", "B", model.VideoTypeMovie); again.ID != b.ID || !alive(t, b.ID) {
+		t.Fatalf("restored as id %d, want %d", again.ID, b.ID)
+	}
+}
+
+func TestDecidedShowKind(t *testing.T) {
+	rescanDB(t)
+	it := scrapedRow(t, model.VideoTypeTV)
+	if got := DecidedShowKind("/lib", "Work"); got != model.VideoTypeTV {
+		t.Errorf("scraped show: %q", got)
+	}
+	it.VideoType = model.VideoTypeAnime
+	it.Source = model.MediaSourceManual
+	if err := UpdateMediaItem(it); err != nil {
+		t.Fatal(err)
+	}
+	if got := DecidedShowKind("/lib", "Work"); got != model.VideoTypeAnime {
+		t.Errorf("manual show: %q", got)
+	}
+	it.Source = model.MediaSourceRule
+	if err := UpdateMediaItem(it); err != nil {
+		t.Fatal(err)
+	}
+	if got := DecidedShowKind("/lib", "Work"); got != "" {
+		t.Errorf("a rule's show is not a decision: %q", got)
+	}
+	rescanDB(t)
+	scrapedRow(t, model.VideoTypeMovie)
+	if got := DecidedShowKind("/lib", "Work"); got != "" {
+		t.Errorf("a film: %q", got)
+	}
+	if got := DecidedShowKind("/lib", "Nothing"); got != "" {
+		t.Errorf("no row: %q", got)
 	}
 }

@@ -95,3 +95,50 @@ func TestIdentifyScanItemCheckedReportsAFailedListing(t *testing.T) {
 		t.Fatalf("a file has no listing to fail: %v", err)
 	}
 }
+
+func TestSettleVerdictKeepsADecidedShowAndTitlesMembers(t *testing.T) {
+	// 星蝶公主: the rules say several works, the scraper has said one show
+	show := func() (*model.MediaItem, identify.Result) {
+		item := &model.MediaItem{FolderPath: "/lib/Anime", FileName: "星蝶公主", IsFolder: true}
+		r := identify.Result{Kind: "collection", Title: "星蝶公主", FromContent: true, ChildKinds: []string{"tv", "tv"}, Confidence: 0.6}
+		applyIdentify(item, r)
+		return item, r
+	}
+	item, r := show()
+	settleVerdict(item, &r, false, func(folder, name string) string {
+		if folder != "/lib/Anime" || name != "星蝶公主" {
+			t.Errorf("asked about %s/%s", folder, name)
+		}
+		return model.VideoTypeTV
+	})
+	if r.Kind != "tv" || item.VideoType != "tv" {
+		t.Errorf("kind %q / %q, want the decided show", r.Kind, item.VideoType)
+	}
+	// no decision, or the rules' own: still a collection
+	item, r = show()
+	settleVerdict(item, &r, false, func(string, string) string { return "" })
+	if r.Kind != "collection" || item.VideoType != "collection" {
+		t.Errorf("undecided: %q", r.Kind)
+	}
+	// a firm collection is never asked
+	item, r = show()
+	r.Firm = true
+	settleVerdict(item, &r, false, func(string, string) string { t.Error("asked about a firm collection"); return "tv" })
+
+	// a member named by a number takes the collection's title and keeps its year
+	item = &model.MediaItem{FolderPath: "/lib/Live/与神同行", FileName: "2", IsFolder: true}
+	r = identify.Classify("2", true, []identify.Entry{{Name: "Along.with.the.Gods.The.Last.49.Days.2018.BluRay.mkv", Size: 12 * gb}})
+	applyIdentify(item, r)
+	settleVerdict(item, &r, true, func(string, string) string { return "" })
+	if item.ScrapedName != "与神同行 2" || item.ReleaseDate != "2018-01-01" {
+		t.Errorf("member: %q %q", item.ScrapedName, item.ReleaseDate)
+	}
+	// a top-level work is not a member
+	item = &model.MediaItem{FolderPath: "/lib/Live", FileName: "2", IsFolder: true}
+	r = identify.Classify("2", true, nil)
+	applyIdentify(item, r)
+	settleVerdict(item, &r, false, func(string, string) string { return "" })
+	if item.ScrapedName != "2" {
+		t.Errorf("top-level work retitled: %q", item.ScrapedName)
+	}
+}

@@ -277,6 +277,7 @@ func doScanPath(sp *model.MediaScanPath, p *ScanProgress) error {
 				trusted = false
 				log.Warnf("media scan: listing under [%s] failed: %v", target, lerr)
 			}
+			settleVerdict(item, &r, depth[target] > 0, db.DecidedShowKind)
 			switch {
 			case item.IsFolder && model.IsEpisodicVideo(r.Kind):
 				if eps, err := scanEpisodes(ctx, target); err == nil {

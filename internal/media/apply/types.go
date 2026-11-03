@@ -18,6 +18,11 @@ import (
 // ErrLocked is returned when a locked item would be overwritten.
 var ErrLocked = errors.New("media item is locked")
 
+// ErrGone is returned when a scrape finds its item no longer in the library
+// (a rescan removed what it no longer produces while the scrape was running):
+// the scrape must not bring the row back.
+var ErrGone = errors.New("media item is no longer in the library")
+
 // ErrNotDir is returned by a Lister for a path that is a file.
 var ErrNotDir = errors.New("not a directory")
 

@@ -216,3 +216,18 @@ func TestDeleteAndDeletePrefix(t *testing.T) {
 		t.Fatalf("deleting twice = %d", n)
 	}
 }
+
+// A rule or scraper result records the generation of the rules that made it,
+// so a scan can queue works from an older one; a person's edit does not.
+func TestSetStampsTheIdentifyGeneration(t *testing.T) {
+	s := newStore(t)
+	for src, want := range map[string]int{"scraper": model.MediaIdentifyVersion, "rule": model.MediaIdentifyVersion, "manual": 0} {
+		got, err := s.Set(model.MediaSetReq{Path: "/lib/" + src, Kind: ptr("movie"), Title: ptr("T"), Source: ptr(src)}, SetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.IdentifyVersion != want {
+			t.Errorf("%s: identify_version %d, want %d", src, got.IdentifyVersion, want)
+		}
+	}
+}
