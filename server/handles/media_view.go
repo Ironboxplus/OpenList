@@ -28,6 +28,10 @@ type MediaItemView struct {
 	ChildPosters *[]string `json:"child_posters,omitempty"`
 	// EpisodeList is set on the detail only.
 	EpisodeList *[]MediaEpisodeView `json:"episode_list,omitempty"`
+	// Versions is how many versions of the film the folder holds (set when more
+	// than one): clients show a version picker, not an episode list, and the
+	// entries of episode_list are marked version.
+	Versions int `json:"versions,omitempty"`
 }
 
 // MediaEpisodeView is one episode of a show.
@@ -38,6 +42,8 @@ type MediaEpisodeView struct {
 	Title    string `json:"title"`
 	Overview string `json:"overview"`
 	StillURL string `json:"still_url,omitempty"`
+	// Version marks a version of the film, not an episode of a show.
+	Version bool `json:"version,omitempty"`
 }
 
 // mediaViewer builds the views of one response for one user.
@@ -79,12 +85,24 @@ func (v *mediaViewer) view(it *model.MediaItem) MediaItemView {
 		posters := v.childPosters(it)
 		out.ChildPosters = &posters
 	}
+	if vs := model.ItemVersions(it.Episodes); len(vs) > 1 {
+		out.Versions = len(vs)
+	}
 	return out
 }
 
 // detail is view plus the episode list.
 func (v *mediaViewer) detail(it *model.MediaItem) (MediaItemView, error) {
 	out := v.view(it)
+	if vs := model.ItemVersions(it.Episodes); len(vs) > 1 {
+		// a film kept in several versions: the entries are the files, not episodes
+		list := make([]MediaEpisodeView, 0, len(vs))
+		for _, e := range vs {
+			list = append(list, MediaEpisodeView{FileName: e.FileName, Episode: e.Index, Title: e.Title, Version: true})
+		}
+		out.EpisodeList = &list
+		return out, nil
+	}
 	eps, err := db.ListMediaEpisodes(it.ID)
 	if err != nil {
 		return out, err

@@ -73,7 +73,7 @@ func (o *Orchestrator) ScrapeOne(ctx context.Context, p string, opts ScrapeOpts)
 			return nil, fmt.Errorf("list %s: %w", p, lerr)
 		}
 	}
-	r, err := o.classifier().Classify(ctx, name, isDir, entries)
+	r, err := o.classify(ctx, p, name, isDir, entries)
 	if err != nil {
 		return nil, err
 	}

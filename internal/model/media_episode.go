@@ -2,7 +2,9 @@ package model
 
 import (
 	"encoding/json"
+	"path"
 	"sort"
+	"strings"
 )
 
 // MediaEpisode maps one video file inside a series work (tv or anime) to its
@@ -65,4 +67,37 @@ func EpisodesJSON(eps []MediaEpisode) string {
 		return ""
 	}
 	return string(b)
+}
+
+// VersionsJSON is the Episodes JSON of a movie folder that holds several
+// versions of the film: one entry per file, default first, each marked
+// "version" so that clients show a version picker instead of an episode list.
+// Index is 1-based, so ?episode=N picks the N-th version. "" for fewer than two.
+func VersionsJSON(files []string) string {
+	if len(files) < 2 {
+		return ""
+	}
+	out := make([]EpisodeInfo, 0, len(files))
+	for i, f := range files {
+		title := strings.TrimSuffix(f, path.Ext(f))
+		out = append(out, EpisodeInfo{FileName: f, Index: i + 1, Title: title, Version: true})
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// ItemVersions returns the version entries of an Episodes JSON; nil for
+// episodes or when there are none.
+func ItemVersions(episodes string) []EpisodeInfo {
+	if !strings.Contains(episodes, `"version":true`) {
+		return nil
+	}
+	var eps []EpisodeInfo
+	if err := json.Unmarshal([]byte(episodes), &eps); err != nil || len(eps) == 0 || !eps[0].Version {
+		return nil
+	}
+	return eps
 }

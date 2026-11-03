@@ -118,6 +118,10 @@ type EpisodeInfo struct {
 	FileName string `json:"file_name"` // 原始文件名（含扩展名）
 	Index    int    `json:"index"`     // 序号，默认0，文件名开头有数字则取该数字
 	Title    string `json:"title"`     // 选集标题（去掉序号后的文件名，不含扩展名）
+	// Version marks an entry that is another version of the same film (the
+	// original and its re-encode), not another episode; the first one is the
+	// default. Episodes JSON of a movie folder holds such entries only.
+	Version bool `json:"version,omitempty"`
 }
 
 // MediaScanProgress 扫描进度（内存中维护，不持久化）

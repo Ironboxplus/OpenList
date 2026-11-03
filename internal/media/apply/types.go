@@ -8,6 +8,7 @@ package apply
 import (
 	"context"
 	"errors"
+	"path"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/media/identify"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/scraper"
@@ -112,4 +113,16 @@ func (o *Orchestrator) classifier() identify.Classifier {
 		return o.Classifier
 	}
 	return identify.Rules{}
+}
+
+// classify identifies one path; a classifier that can look into
+// subdirectories is given the lister for that.
+func (o *Orchestrator) classify(ctx context.Context, p, name string, isDir bool, entries []identify.Entry) (identify.Result, error) {
+	cl := o.classifier()
+	if pc, ok := cl.(identify.PeekClassifier); ok && isDir && o.Lister != nil {
+		return pc.ClassifyWith(ctx, name, isDir, entries, func(child string) ([]identify.Entry, error) {
+			return o.Lister.List(ctx, path.Join(p, child))
+		})
+	}
+	return cl.Classify(ctx, name, isDir, entries)
 }

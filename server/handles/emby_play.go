@@ -46,7 +46,7 @@ func (l *embyLibrary) playTarget(id string) (*embyPlayTarget, bool) {
 			if l.videos[i].ID == uint(n) {
 				it := &l.videos[i]
 				return &embyPlayTarget{
-					Item: it, RawPath: MediaItemFilePath(it), Container: embyExt(it.FileName),
+					Item: it, RawPath: MediaItemPlayPath(it), Container: embyExt(MediaItemPlayPath(it)),
 					Size: it.FileSize, Name: it.FileName, Duration: it.Duration, ItemID: it.ID,
 				}, true
 			}

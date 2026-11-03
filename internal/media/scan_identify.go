@@ -33,14 +33,17 @@ func listEntries(ctx context.Context, p string) ([]identify.Entry, error) {
 // writes the verdict into item. It returns the folder's entries (nil for a
 // file, or when the folder could not be listed) and the verdict.
 //
-// Nothing here searches a provider: the title and year it writes are the
-// query a later scrape starts from, and a scrape replaces them.
+// A few ambiguous verdicts look one level further down (numbered directories,
+// a wrapper directory); nothing else is listed. Nothing here searches a
+// provider: the title and year it writes are the query a later scrape starts
+// from, and a scrape replaces them.
 func identifyScanItem(ctx context.Context, vfsPath string, item *model.MediaItem) ([]identify.Entry, identify.Result) {
 	var entries []identify.Entry
 	if item.IsFolder {
 		entries, _ = listEntries(ctx, vfsPath)
 	}
-	r := identify.Classify(item.FileName, item.IsFolder, entries)
+	peek := func(name string) ([]identify.Entry, error) { return listEntries(ctx, stdpath.Join(vfsPath, name)) }
+	r := identify.ClassifyWith(item.FileName, item.IsFolder, entries, peek)
 	applyIdentify(item, r)
 	if !item.IsFolder && model.IsEpisodicVideo(r.Kind) {
 		if s, e, ok := identify.EpisodeOf(item.FileName); ok {

@@ -275,6 +275,9 @@ func doScanPath(sp *model.MediaScanPath, p *ScanProgress) error {
 				} else {
 					log.Warnf("scan episodes error [%s]: %v", target, err)
 				}
+			case item.IsFolder && len(r.Versions) > 1:
+				// one film kept in several versions: the files are the choices
+				item.Episodes = model.VersionsJSON(r.Versions)
 			case item.IsFolder && sp.PathMerge:
 				if episodes, err := buildEpisodesFromFolder(ctx, target, sp.MediaType); err == nil {
 					item.Episodes = episodes

@@ -192,7 +192,7 @@ func GetMediaStreamURL(c *gin.Context) {
 		return
 	}
 	episodeIndex, _ := strconv.Atoi(c.DefaultQuery("episode", "0"))
-	rawPath := MediaItemFilePath(item)
+	rawPath := MediaItemPlayPath(item)
 	if episodeIndex > 0 {
 		var eps []model.EpisodeInfo
 		if err := json.Unmarshal([]byte(item.Episodes), &eps); err == nil {
