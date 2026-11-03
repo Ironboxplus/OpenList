@@ -143,7 +143,8 @@ func (l *embyLibrary) userDataOf(itemID uint, episodeIndex int) *embyUserData {
 
 type embySeries struct {
 	Key      string
-	Name     string
+	Name     string // shown to clients (media_title_source)
+	KeyName  string // the name the key is derived from; never follows the setting
 	Items    []model.MediaItem
 	Year     int
 	Overview string
@@ -163,6 +164,20 @@ func seriesKeyOf(item *model.MediaItem) string {
 		name = strings.TrimSuffix(stdpath.Base(mediaFolderOf(item)), "/")
 	}
 	return embyHash("series:" + strings.ToLower(name))
+}
+
+// embyShownName is the name clients are shown for a work: the title of the
+// media_title_source setting. old is what the name was before the setting existed
+// (the scraped title or a name made from the file); it is kept for the scraped
+// source and for a title a person fixed. Ids and series keys never use this.
+func embyShownName(it *model.MediaItem, old string) string {
+	if mediaTitleSource() != model.TitleSourceFile {
+		return old
+	}
+	if d, _ := it.DisplayTitles(model.TitleSourceFile); it.FileTitle != "" || (it.Locked || it.Source == model.MediaSourceManual) {
+		return d
+	}
+	return old
 }
 
 func seriesNameOf(item *model.MediaItem) string {
@@ -187,7 +202,7 @@ func (l *embyLibrary) seriesList() []*embySeries {
 		key := seriesKeyOf(it)
 		s, ok := index[key]
 		if !ok {
-			s = &embySeries{Key: key, Name: seriesNameOf(it), Cover: it.Cover}
+			s = &embySeries{Key: key, Name: embyShownName(it, seriesNameOf(it)), KeyName: seriesNameOf(it), Cover: it.Cover}
 			if len(it.ReleaseDate) >= 4 {
 				s.Year, _ = strconv.Atoi(it.ReleaseDate[:4])
 			}
@@ -268,7 +283,7 @@ func (l *embyLibrary) episodesOf(seriesKey string, season int) []*embyEpisode {
 					Index:      num,
 					Season:     s,
 					SeriesKey:  seriesKey,
-					SeriesName: seriesNameOf(it),
+					SeriesName: embyShownName(it, seriesNameOf(it)),
 				})
 			}
 			continue
@@ -283,7 +298,7 @@ func (l *embyLibrary) episodesOf(seriesKey string, season int) []*embyEpisode {
 			Index:      num,
 			Season:     s,
 			SeriesKey:  seriesKey,
-			SeriesName: seriesNameOf(it),
+			SeriesName: embyShownName(it, seriesNameOf(it)),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -322,13 +337,13 @@ func (l *embyLibrary) findEpisode(id string) *embyEpisode {
 			}
 			if n == num {
 				return &embyEpisode{ID: id, Item: item, Episode: ep, Index: n, Season: season,
-					SeriesKey: seriesKeyOf(item), SeriesName: seriesNameOf(item)}
+					SeriesKey: seriesKeyOf(item), SeriesName: embyShownName(item, seriesNameOf(item))}
 			}
 		}
 		return nil
 	}
 	return &embyEpisode{ID: id, Item: item, Index: num, Season: season,
-		SeriesKey: seriesKeyOf(item), SeriesName: seriesNameOf(item)}
+		SeriesKey: seriesKeyOf(item), SeriesName: embyShownName(item, seriesNameOf(item))}
 }
 
 // music 索引
@@ -416,6 +431,7 @@ func (l *embyLibrary) movieItem(it *model.MediaItem) *embyItem {
 	if name == "" {
 		name = strings.TrimSuffix(it.FileName, stdpath.Ext(it.FileName))
 	}
+	name = embyShownName(it, name)
 	e := &embyItem{
 		Name:            name,
 		SortName:        name,
@@ -1493,7 +1509,7 @@ func embyNextUp(c *gin.Context, lib *embyLibrary) {
 			if rows, err := db.ListMediaResume(lib.user.ID, 200); err == nil {
 				nextIdx := -1
 				for _, row := range rows {
-					if seriesKeyOf(&model.MediaItem{ScrapedName: s.Name}) == s.Key &&
+					if seriesKeyOf(&model.MediaItem{ScrapedName: s.KeyName}) == s.Key &&
 						row.ItemID == s.Items[0].ID && row.EpisodeIndex > 0 {
 						nextIdx = row.EpisodeIndex + 1
 						break

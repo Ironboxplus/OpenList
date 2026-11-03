@@ -187,6 +187,17 @@ func TestMediaNameOrderFollowsTheTitleSource(t *testing.T) {
 		}
 		return fmt.Sprint(out)
 	}
+	// keyword search finds a work by the title of either kind
+	for kw, want := range map[string]string{"Yankee": "[b]", "Bravo": "[b]", "Zulu": "[a]", "Alpha": "[a]"} {
+		items, _, err := ListMediaItems(MediaItemQuery{MediaType: model.MediaTypeVideo, Keyword: kw, PageSize: 10})
+		var got []string
+		for _, it := range items {
+			got = append(got, it.FileName)
+		}
+		if err != nil || fmt.Sprint(got) != want {
+			t.Errorf("keyword %s: %v %v, want %s", kw, got, err, want)
+		}
+	}
 	// file: Alpha, Mike (locked: as set), Yankee; scraped: Bravo, Mike, Zulu
 	if got := order(model.TitleSourceFile); got != "[a c b]" {
 		t.Errorf("file order %s", got)

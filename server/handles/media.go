@@ -1253,7 +1253,13 @@ func listsTopLevel(mediaType model.MediaType, folderPath, keyword, path, flat st
 }
 
 // mediaTitleSource is the media_title_source setting: "file" (default) or "scraped".
+// mediaTitleSourceHook lets tests set the source without a settings table.
+var mediaTitleSourceHook string
+
 func mediaTitleSource() string {
+	if mediaTitleSourceHook != "" {
+		return mediaTitleSourceHook
+	}
 	if setting.GetStr(conf.MediaTitleSource, model.TitleSourceFile) == model.TitleSourceScraped {
 		return model.TitleSourceScraped
 	}

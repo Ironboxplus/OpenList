@@ -157,7 +157,8 @@ func mediaItemsWhere(tx *gorm.DB, q MediaItemQuery) *gorm.DB {
 	}
 	if q.Keyword != "" {
 		like := "%" + q.Keyword + "%"
-		tx = tx.Where(mediaItemCol("file_name")+" LIKE ? OR "+mediaItemCol("scraped_name")+" LIKE ?", like, like)
+		// the file title too: users search what they see (media_title_source)
+		tx = tx.Where(mediaItemCol("file_name")+" LIKE ? OR "+mediaItemCol("scraped_name")+" LIKE ? OR "+mediaItemCol("file_title")+" LIKE ?", like, like, like)
 	}
 	if q.TypeTag != "" || q.ContentTag != "" {
 		items := quoteIdent(tableOf(&model.MediaItem{}))
