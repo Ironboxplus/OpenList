@@ -42,6 +42,7 @@ const (
 	MediaSourceManual  = "manual"
 	MediaSourceRule    = "rule"
 	MediaSourceScraper = "scraper"
+	MediaSourceNFO     = "nfo" // an id read from the NFO file next to the work
 )
 
 // MediaPendingConfidence is the confidence below which an unlocked work still

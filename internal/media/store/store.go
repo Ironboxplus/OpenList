@@ -124,7 +124,7 @@ func (s *Store) Set(req model.MediaSetReq, opt SetOptions) (*model.MediaItem, er
 	}
 	if req.Source != nil {
 		switch *req.Source {
-		case model.MediaSourceManual, model.MediaSourceRule, model.MediaSourceScraper:
+		case model.MediaSourceManual, model.MediaSourceRule, model.MediaSourceScraper, model.MediaSourceNFO:
 		default:
 			return nil, fmt.Errorf("invalid source %q", *req.Source)
 		}
@@ -143,7 +143,7 @@ func (s *Store) Set(req model.MediaSetReq, opt SetOptions) (*model.MediaItem, er
 	if req.Candidates != nil {
 		it.Candidates = mustJSON(req.Candidates)
 	}
-	if it.Source == model.MediaSourceScraper && (req.Title != nil || req.ExternalIDs != nil) {
+	if (it.Source == model.MediaSourceScraper || it.Source == model.MediaSourceNFO) && (req.Title != nil || req.ExternalIDs != nil) {
 		now := time.Now()
 		it.ScrapedAt = &now
 	}

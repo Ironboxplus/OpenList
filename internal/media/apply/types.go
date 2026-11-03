@@ -31,6 +31,12 @@ type Lister interface {
 	List(ctx context.Context, path string) ([]identify.Entry, error)
 }
 
+// FileReader is implemented by Listers that can also read the start of a file
+// (the NFO next to a work). Remote listers cannot, and then NFOs are not read.
+type FileReader interface {
+	ReadFile(ctx context.Context, path string, max int64) ([]byte, error)
+}
+
 // Existing is what the store already knows about a path.
 type Existing struct {
 	Path       string  `json:"path"`

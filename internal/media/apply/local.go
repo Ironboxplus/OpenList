@@ -3,11 +3,14 @@ package apply
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"path"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
+	"github.com/OpenListTeam/OpenList/v4/internal/media"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/identify"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/store"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -32,6 +35,16 @@ func (LocalLister) List(ctx context.Context, p string) ([]identify.Entry, error)
 		out = append(out, identify.Entry{Name: o.GetName(), IsDir: o.IsDir(), Size: o.GetSize()})
 	}
 	return out, nil
+}
+
+// ReadFile reads at most max bytes from the start of the file at p.
+func (LocalLister) ReadFile(ctx context.Context, p string, max int64) ([]byte, error) {
+	rc := media.FetchFileReader(ctx, p)
+	if rc == nil {
+		return nil, errors.New("cannot open " + p)
+	}
+	defer rc.Close()
+	return io.ReadAll(io.LimitReader(rc, max))
 }
 
 // LocalWriter writes through the store inside the server.

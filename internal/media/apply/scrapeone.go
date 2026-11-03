@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/media/identify"
+	"github.com/OpenListTeam/OpenList/v4/internal/media/nfo"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/scraper"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 )
@@ -103,8 +104,15 @@ func (o *Orchestrator) ScrapeOne(ctx context.Context, p string, opts ScrapeOpts)
 		return o.Writer.Set(ctx, req, opts.Force)
 	}
 
-	inline := false
-	if !explicit && r.Kind != "ignore" && r.Kind != "collection" && (r.TMDBID != "" || r.IMDbID != "") {
+	inline, fromNFO := false, false
+	if !explicit && r.Kind != "ignore" && r.Kind != "collection" {
+		// an NFO next to the work names it: that outranks anything the name says
+		if id, ok := o.idFromNFO(ctx, p, name, isDir, entries, r); ok {
+			opts.Provider, opts.ID, inline, fromNFO = scraper.ProviderTMDB, id, true, true
+			res.Confidence = 1
+		}
+	}
+	if !explicit && !inline && r.Kind != "ignore" && r.Kind != "collection" && (r.TMDBID != "" || r.IMDbID != "") {
 		id, rerr := o.Providers.ResolveTMDB(ctx, tmdbHint(r.Kind, r.Theatrical), r.TMDBID, r.IMDbID)
 		switch {
 		case rerr == nil:
@@ -186,6 +194,9 @@ func (o *Orchestrator) ScrapeOne(ctx context.Context, p string, opts ScrapeOpts)
 	row := Row{Path: p, Kind: r.Kind, Provider: opts.Provider, ID: opts.ID}
 	src := model.MediaSourceScraper
 	conf := res.Confidence
+	if fromNFO {
+		src = model.MediaSourceNFO
+	}
 	if explicit {
 		src = model.MediaSourceManual
 	}
@@ -231,4 +242,56 @@ func (o *Orchestrator) showBehindCollection(ctx context.Context, r identify.Resu
 		return scraper.Candidate{}, false
 	}
 	return tv[0], true
+}
+
+// idFromNFO looks for the NFO of the work in the listing it already has (a
+// folder's own entries; for a loose file the folder it sits in, which the scan
+// listed a moment ago), reads it, and turns the ids in it into a typed TMDB id.
+// It reads one small file, and only when there is one. ok is false when there is
+// no NFO, it names nothing, or TMDB does not know the id.
+func (o *Orchestrator) idFromNFO(ctx context.Context, p, name string, isDir bool, entries []identify.Entry, r identify.Result) (string, bool) {
+	reader, canRead := o.Lister.(FileReader)
+	if !canRead || o.Providers == nil {
+		return "", false
+	}
+	dir := p
+	if !isDir {
+		dir = path.Dir(p)
+		var err error
+		if entries, err = o.Lister.List(ctx, dir); err != nil {
+			return "", false
+		}
+	}
+	names := make([]string, 0, len(entries))
+	video := ""
+	var best int64 = -1
+	for _, e := range entries {
+		names = append(names, e.Rel())
+		if isDir && !e.IsDir && identify.IsVideo(e.Name) && e.Size > best {
+			video, best = e.Name, e.Size
+		}
+	}
+	hint := tmdbHint(r.Kind, r.Theatrical)
+	file := nfo.Find(names, nfo.Candidates(isDir, name, video, hint))
+	if file == "" {
+		return "", false
+	}
+	data, err := reader.ReadFile(ctx, path.Join(dir, file), nfo.MaxSize)
+	if err != nil {
+		o.logf("nfo %s: %v", file, err)
+		return "", false
+	}
+	info, err := nfo.Parse(data)
+	if err != nil || !info.HasID() {
+		return "", false
+	}
+	if info.Kind != "" {
+		hint = info.Kind
+	}
+	id, err := o.Providers.ResolveTMDB(ctx, hint, info.TMDB, info.IMDb)
+	if err != nil {
+		o.logf("nfo %s names %s%s, not usable: %v", file, info.TMDB, info.IMDb, err)
+		return "", false
+	}
+	return id, true
 }
