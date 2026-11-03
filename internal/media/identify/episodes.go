@@ -30,6 +30,7 @@ func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error)
 	type fileRef struct {
 		rel, name string
 		dirSeason int
+		special   int // 1-based number of a special (season 0), 0 for episodes
 	}
 	top, err := list("")
 	if err != nil {
@@ -48,6 +49,15 @@ func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error)
 		}
 	}
 	sort.Slice(subdirs, func(i, j int) bool { return subdirs[i].Name < subdirs[j].Name })
+	var specialDirs []Entry
+	seasonDirs := 0
+	for _, d := range subdirs {
+		if IsSeasonDir(d.Name) {
+			seasonDirs++
+		} else {
+			specialDirs = append(specialDirs, d)
+		}
+	}
 	for i, d := range subdirs {
 		if i >= maxSeasonDirs {
 			break
@@ -61,7 +71,34 @@ func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error)
 		}
 		for _, k := range kids {
 			if !k.IsDir && IsVideo(k.Name) {
-				files = append(files, fileRef{rel: path.Join(d.Name, k.Name), name: k.Name, dirSeason: SeasonOfDir(d.Name)})
+				files = append(files, fileRef{rel: path.Join(d.Name, k.Name), name: k.Name, dirSeason: seasonOfDirName(d.Name)})
+			}
+		}
+	}
+	// A directory next to the seasons holding one video without an episode
+	// marker is a film of the show (续命之徒 beside 绝命毒师's five seasons): a
+	// special, season 0, as Jellyfin files it.
+	specials := 0
+	if seasonDirs > 0 {
+		for i, d := range specialDirs {
+			if i >= maxSeasonDirs {
+				break
+			}
+			kids, err := list(d.Name)
+			if err != nil {
+				return nil, fmt.Errorf("list %s: %w", d.Name, err)
+			}
+			var vs []Entry
+			for _, k := range kids {
+				if !k.IsDir && IsVideo(k.Name) {
+					vs = append(vs, k)
+				}
+			}
+			if vs = mainVideos(vs); len(vs) == 1 {
+				if _, _, marked := EpisodeOf(vs[0].Name); !marked {
+					specials++
+					files = append(files, fileRef{rel: path.Join(d.Name, vs[0].Name), name: vs[0].Name, special: specials})
+				}
 			}
 		}
 	}
@@ -69,6 +106,10 @@ func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error)
 
 	var out []EpisodeFile
 	for _, f := range files {
+		if f.special > 0 {
+			out = append(out, EpisodeFile{Rel: f.rel, Name: f.name, Season: 0, Episode: f.special})
+			continue
+		}
 		s, e, ok := EpisodeOf(f.name)
 		if !ok {
 			continue

@@ -79,8 +79,12 @@ func mainVideos(videos []Entry) []Entry {
 }
 
 
-// Directory names that are seasons of one show.
-var seasonDirRe = regexp.MustCompile(`(?i)^(season|series|s)[\s._-]*\d{1,2}\b|^第\s*[\d一二三四五六七八九十百]+\s*[季部期]|^specials?$|^ova$|^oad$|^特典|^特别篇|^剧场版$`)
+// Directory names that are seasons of one show: the keyword forms at the
+// start ("Season 2", "第3季", "Specials"), and a season marker anywhere in the
+// name, because release folders carry the show name first ("Friends.S01.1080p",
+// "葬送的芙莉莲 S01", "BEASTARS 2nd Season") or are only a number ("1", "02").
+// Roman numerals are not numbering (无间道 I/II/III are different films).
+var seasonDirRe = regexp.MustCompile(`(?i)^(season|series|s)[\s._-]*\d{1,2}\b|^第\s*[\d一二三四五六七八九十百]+\s*[季部期]|^specials?$|^ova$|^oad$|^特典|^特别篇|^剧场版$|(?:^|[^a-z0-9])s\d{1,3}(?:[^a-z0-9]|$)|第\s*[\d一二三四五六七八九十百]+\s*[季部期]|(?:^|[^a-z0-9])season[\s._-]*\d{1,2}(?:[^0-9]|$)|\d{1,2}(?:st|nd|rd|th)[\s._-]*season|^0?\d{1,2}$`)
 
 type epMatch struct {
 	Season, Episode int
@@ -195,16 +199,20 @@ func ClassifyEntries(entries []Entry) Shape {
 	}
 
 	var workDirs []Entry
-	seasons := 0
+	var seasonNames []string
 	for _, d := range dirs {
 		switch {
 		case seasonDirRe.MatchString(d.Name):
-			seasons++
+			seasonNames = append(seasonNames, d.Name)
 			workDirs = append(workDirs, d)
 		case isExtraDirName(d.Name):
 		default:
 			workDirs = append(workDirs, d)
 		}
+	}
+	seasons := len(seasonNames)
+	if !oneShow(seasonNames) {
+		seasons = 0 // seasons of different shows: each directory is its own work
 	}
 
 	epCount := 0
@@ -316,4 +324,63 @@ func SeasonOfDir(name string) int {
 		}
 	}
 	return 0
+}
+
+var (
+	ordinalSeasonRe = regexp.MustCompile(`(?i)(\d{1,2})(?:st|nd|rd|th)[\s._-]*season`)
+	bareSeasonRe    = regexp.MustCompile(`^0*(\d{1,2})$`)
+	bracketGroupRe  = regexp.MustCompile(`[\[【(（][^\]】)）]*[\]】)）]`)
+)
+
+// seasonOfDirName is SeasonOfDir plus the forms only a directory next to its
+// sibling seasons can be trusted with: "2nd Season" and a bare "02".
+func seasonOfDirName(name string) int {
+	if n := SeasonOfDir(name); n > 0 {
+		return n
+	}
+	if m := ordinalSeasonRe.FindStringSubmatch(name); m != nil {
+		n, _ := strconv.Atoi(m[1])
+		return n
+	}
+	if m := bareSeasonRe.FindStringSubmatch(strings.TrimSpace(name)); m != nil {
+		n, _ := strconv.Atoi(m[1])
+		return n
+	}
+	return 0
+}
+
+// seasonStem is the show name a season directory starts with: the text before
+// its season marker, without release-group brackets, case, punctuation and
+// "&"/"and" differences. Empty when the name is only a marker ("Season 1", "1").
+func seasonStem(name string) string {
+	s := bracketGroupRe.ReplaceAllString(name, " ")
+	if loc := seasonDirRe.FindStringIndex(s); loc != nil {
+		s = s[:loc[0]]
+	}
+	s = strings.ReplaceAll(strings.ToLower(s), "&", " and ")
+	var b strings.Builder
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// oneShow reports whether season directories belong to one show: their stems
+// agree (equal, one a prefix of the other, or empty). Season directories of
+// different shows ("Daredevil S01", "Jessica Jones S01") are a collection.
+func oneShow(names []string) bool {
+	ref := ""
+	for _, n := range names {
+		st := seasonStem(n)
+		switch {
+		case st == "":
+		case ref == "":
+			ref = st
+		case !strings.HasPrefix(st, ref) && !strings.HasPrefix(ref, st):
+			return false
+		}
+	}
+	return true
 }
