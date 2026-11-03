@@ -845,8 +845,10 @@ func PublicListMedia(c *gin.Context) {
 	hidden := false
 	user := mediaUser(c)
 	// The video library lists its top-level works; what sits inside a collection or
-	// a show is listed under it (path=) or found by keyword. flat=1 lists every work.
-	topLevel := mediaType == model.MediaTypeVideo && folderPath == "" && keyword == "" && c.Query("path") == "" && c.Query("flat") == ""
+	// a show is listed under it (path=) or found by keyword. flat=1 lists every work,
+	// and so does a kind filter: kind=movie must list the films inside collections too
+	// (Jellyfin lists movies individually unless boxsets are grouped).
+	topLevel := listsTopLevel(mediaType, folderPath, keyword, c.Query("path"), c.Query("flat"), kinds)
 	if p := c.Query("path"); p != "" {
 		if user == nil {
 			common.SuccessResp(c, common.PageResp{Content: []MediaItemView{}, Total: 0})
@@ -1239,4 +1241,11 @@ func ImportMediaDB(c *gin.Context) {
 		"items_created":      itemCreated,
 		"items_updated":      itemUpdated,
 	})
+}
+
+// listsTopLevel reports whether a library listing shows only the top-level
+// works: the unfiltered video view. A search, a folder, a flat request or a kind
+// filter lists every matching work.
+func listsTopLevel(mediaType model.MediaType, folderPath, keyword, path, flat string, kinds []string) bool {
+	return mediaType == model.MediaTypeVideo && folderPath == "" && keyword == "" && path == "" && flat == "" && len(kinds) == 0
 }
