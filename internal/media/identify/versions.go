@@ -96,3 +96,19 @@ func versionOrder(videos []Entry) []string {
 	}
 	return out
 }
+
+// videoYear is the year the largest of the videos names ("1917.2019.2160p.mkv"
+// -> 2019), 0 when none does.
+func videoYear(videos []Entry) int {
+	best := -1
+	for i, v := range videos {
+		if best < 0 || v.Size > videos[best].Size {
+			best = i
+		}
+	}
+	if best < 0 {
+		return 0
+	}
+	_, y := workKey(videos[best].Name)
+	return y
+}

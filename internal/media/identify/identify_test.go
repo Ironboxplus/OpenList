@@ -71,19 +71,19 @@ var samples = []struct {
 	{name: "Inception.2010.盗梦空间.双语字幕.HR-HDTV.AC3.1024X576.X264-CMCT.mkv", kind: "movie", title: "盗梦空间", year: 2010},
 	{name: "Iron.Man.3.2013.钢铁侠3.国英音轨.双语字幕.HR-HDTV.AC3.x264-CMCT.mkv", kind: "movie", title: "钢铁侠3", year: 2013},
 	{name: "19 [复仇者联盟3：无限战争]Avengers.Infinity.War.2018.2160p.BluRay.mkv", kind: "movie", title: "复仇者联盟3：无限战争", year: 2018},
-	{name: "169.谍影重重3", isDir: true, entries: one("The.Bourne.Ultimatum.2007.mkv"), kind: "movie", title: "谍影重重3"},
+	{name: "169.谍影重重3", isDir: true, entries: one("The.Bourne.Ultimatum.2007.mkv"), kind: "movie", title: "谍影重重3", year: 2007},
 	{name: "1.漫威短片.47号物品.mkv", kind: "movie", title: "漫威短片"},
-	{name: "300.斯巴达勇士", isDir: true, entries: one("300.2006.1080p.mkv"), kind: "movie", title: "斯巴达勇士"},
+	{name: "300.斯巴达勇士", isDir: true, entries: one("300.2006.1080p.mkv"), kind: "movie", title: "斯巴达勇士", year: 2006},
 	{name: "30.Days.of.Night.2007.1080p.BluRay.x264.mkv", kind: "movie", title: "30 Days of Night", year: 2007},
 
 	// --- movies, one main file ---
 	{name: "Lock, Stock and Two Smoking Barrels (1998).mkv", kind: "movie", title: "Lock, Stock and Two Smoking Barrels", year: 1998},
-	{name: "盗梦空间", isDir: true, entries: cat(one("Inception.2010.mkv"), []Entry{{Name: "sample.mkv", Size: 40 << 20}, {Name: "poster.jpg", Size: 1 << 20}}), kind: "movie", title: "盗梦空间"},
+	{name: "盗梦空间", isDir: true, entries: cat(one("Inception.2010.mkv"), []Entry{{Name: "sample.mkv", Size: 40 << 20}, {Name: "poster.jpg", Size: 1 << 20}}), kind: "movie", title: "盗梦空间", year: 2010},
 	{name: "傲慢与偏见2005", isDir: true, entries: one("Pride.and.Prejudice.2005.mkv"), kind: "movie", title: "傲慢与偏见", year: 2005},
-	{name: "流浪地球2", isDir: true, entries: one("The.Wandering.Earth.II.2023.mkv"), kind: "movie", title: "流浪地球2"},
-	{name: "1917", isDir: true, entries: one("1917.2019.2160p.mkv"), kind: "movie", title: "1917"},
-	{name: "铁血战士：杀戮之地", isDir: true, entries: one("Predator.Badlands.2025.mkv"), kind: "movie", title: "铁血战士：杀戮之地"},
-	{name: "冰河时代1", isDir: true, entries: one("Ice.Age.2002.mkv"), kind: "movie", title: "冰河时代1"},
+	{name: "流浪地球2", isDir: true, entries: one("The.Wandering.Earth.II.2023.mkv"), kind: "movie", title: "流浪地球2", year: 2023},
+	{name: "1917", isDir: true, entries: one("1917.2019.2160p.mkv"), kind: "movie", title: "1917", year: 2019},
+	{name: "铁血战士：杀戮之地", isDir: true, entries: one("Predator.Badlands.2025.mkv"), kind: "movie", title: "铁血战士：杀戮之地", year: 2025},
+	{name: "冰河时代1", isDir: true, entries: one("Ice.Age.2002.mkv"), kind: "movie", title: "冰河时代1", year: 2002},
 	{name: "Spirited Away (2001)", isDir: true, entries: cat(one("Spirited.Away.2001.mkv"), dirs("Subs")), kind: "movie", title: "Spirited Away", year: 2001},
 
 	// --- shows ---

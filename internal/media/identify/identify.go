@@ -7,6 +7,7 @@ package identify
 
 import (
 	"context"
+	"strconv"
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/media/scraper"
@@ -115,6 +116,12 @@ func ClassifyWith(name string, isDir bool, entries []Entry, peek Peek) Result {
 	r.Kind, r.Confidence, r.Why = kind, conf, why
 	if kind == "movie" || kind == "anime" {
 		r.Versions = shape.Versions
+	}
+	// A directory name without a year takes the year its video file names:
+	// "1917" holding 1917.2019.2160p.mkv is the film of 2019.
+	if r.Year == 0 && shape.Year > 0 {
+		r.Year = shape.Year
+		r.Parsed.Year = strconv.Itoa(shape.Year)
 	}
 	if r.Title == "" {
 		r.Title = strings.TrimSpace(name)

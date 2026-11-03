@@ -174,6 +174,7 @@ type Shape struct {
 	Why        string
 	Episodes   int      // video files that look like episodes
 	Versions   []string // movie: the files that are versions of it, default first
+	Year       int      // movie: the year its main video file names, 0 = none
 }
 
 // Peek lists the subdirectory name of the directory being classified. It is
@@ -341,10 +342,10 @@ func ClassifyEntriesWith(entries []Entry, peek Peek) Shape {
 		return Shape{Kind: "collection", Confidence: 0.75, Why: "several subdirectories next to at most one video"}
 	}
 	if len(videos) >= 2 && sameWork(videos) {
-		return Shape{Kind: "movie", Confidence: 0.85, Why: "versions of one movie", Versions: versionOrder(videos)}
+		return Shape{Kind: "movie", Confidence: 0.85, Why: "versions of one movie", Versions: versionOrder(videos), Year: videoYear(videos)}
 	}
 	if len(videos) == 1 || dominant(videos) {
-		return Shape{Kind: "movie", Confidence: 0.85, Why: "one main video"}
+		return Shape{Kind: "movie", Confidence: 0.85, Why: "one main video", Year: videoYear(videos)}
 	}
 	if multiPart(videos) {
 		return Shape{Kind: "movie", Confidence: 0.8, Why: "parts of one movie"}

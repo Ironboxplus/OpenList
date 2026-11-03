@@ -63,3 +63,19 @@ func TestBareYearTitleIsNotSearchedAsYear(t *testing.T) {
 		}
 	}
 }
+
+func TestYearFromTheMainVideoWhenTheFolderHasNone(t *testing.T) {
+	r := Classify("1917", true, one("1917.2019.2160p.UHD.Bluray.x265.mkv"))
+	if r.Year != 2019 || r.Parsed.Year != "2019" {
+		t.Fatalf("year %d parsed %q, want 2019", r.Year, r.Parsed.Year)
+	}
+	// the folder's own year wins
+	r = Classify("傲慢与偏见2005", true, vids("Pride.And.Prejudice.2006.mkv"))
+	if r.Year != 2005 {
+		t.Fatalf("year %d, want 2005", r.Year)
+	}
+	// no year anywhere stays none
+	if r = Classify("鬼子来了", true, one("x.mkv")); r.Year != 0 {
+		t.Fatalf("year %d", r.Year)
+	}
+}

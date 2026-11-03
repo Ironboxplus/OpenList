@@ -3,7 +3,10 @@ package scraper
 import (
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf8"
+
+	"golang.org/x/text/unicode/norm"
 )
 
 // 年份正则（匹配 1900-2099）
@@ -570,7 +573,7 @@ func isAllDigits(s string) bool {
 // titleSimilarity 简易标题相似度（0-1）
 // 规则：
 //   - 完全相等 -> 1.0
-//   - 一个字符串包含另一个 -> 0.85
+//   - 一个字符串包含另一个 -> 0.5+0.35*短/长（按整词；拉丁文不匹配词内子串）；重音符号先折叠
 //   - 归一化（去空格、大小写）后相等 -> 0.95
 //   - 归一化后一个包含另一个 -> 0.7
 //   - 否则用「公共字符占比」粗算（避免引入完整编辑距离的开销）
@@ -581,13 +584,20 @@ func titleSimilarity(a, b string) float32 {
 	if a == b {
 		return 1.0
 	}
-	la := strings.ToLower(strings.TrimSpace(a))
-	lb := strings.ToLower(strings.TrimSpace(b))
+	la := foldTitle(strings.ToLower(strings.TrimSpace(a)))
+	lb := foldTitle(strings.ToLower(strings.TrimSpace(b)))
 	if la == lb {
 		return 0.95
 	}
-	if strings.Contains(la, lb) || strings.Contains(lb, la) {
-		return 0.85
+	// One title inside the other counts by how much of the longer it is
+	// ("1917" inside "Kvinnlig fotboll i Gävle 1917" is not the film 1917), and
+	// Latin text must match whole words ("leon" is not inside "leoncavallo").
+	if containsTitle(la, lb) || containsTitle(lb, la) {
+		short, long := utf8.RuneCountInString(la), utf8.RuneCountInString(lb)
+		if short > long {
+			short, long = long, short
+		}
+		return 0.5 + 0.35*float32(short)/float32(long)
 	}
 	// 进一步归一化：去掉所有空白与标点，再比一次包含关系
 	normA := normalizeForCompare(la)
@@ -596,7 +606,12 @@ func titleSimilarity(a, b string) float32 {
 		return 0.92
 	}
 	if normA != "" && normB != "" && (strings.Contains(normA, normB) || strings.Contains(normB, normA)) {
-		return 0.7
+		// inside a word or across punctuation: weaker than whole-word containment
+		short, long := utf8.RuneCountInString(normA), utf8.RuneCountInString(normB)
+		if short > long {
+			short, long = long, short
+		}
+		return 0.3 + 0.25*float32(short)/float32(long)
 	}
 	// 兜底：公共字符比例（仅取较短字符串里的字符在较长字符串中出现的比例）
 	short, long := normA, normB
@@ -938,4 +953,34 @@ func extractCandidates(parsed parsedVideoTitle, bracketChinese []string) []Title
 	addDegenerate(parsed.EnglishTitle, "en-US", "degenerate-en")
 
 	return list
+}
+
+// foldTitle removes diacritics ("Léon" -> "Leon") so accented and plain
+// spellings compare equal.
+func foldTitle(s string) string {
+	d := norm.NFD.String(s)
+	var b strings.Builder
+	for _, r := range d {
+		if !unicode.Is(unicode.Mn, r) {
+			b.WriteRune(r)
+		}
+	}
+	return norm.NFC.String(b.String())
+}
+
+// containsTitle reports whether short is inside long: as a plain substring
+// when it holds Han characters, else as whole words.
+func containsTitle(long, short string) bool {
+	if short == "" {
+		return false
+	}
+	for _, r := range short {
+		if unicode.Is(unicode.Han, r) {
+			return strings.Contains(long, short)
+		}
+	}
+	words := func(s string) string {
+		return " " + strings.Join(strings.FieldsFunc(s, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }), " ") + " "
+	}
+	return strings.Contains(words(long), words(short))
 }
