@@ -83,3 +83,12 @@ func ResetStoragesLoadSignal() {
 // FrontendChannelDefault is the frontend release tag followed when
 // frontend_channel is not set.
 const FrontendChannelDefault = "rolling"
+
+// Where a node gets its frontend (config frontend_source).
+const (
+	// FrontendSourceWatch follows the frontend release channel at run time (the default).
+	FrontendSourceWatch = "watch"
+	// FrontendSourceEmbedded serves the frontend built into the binary and never fetches one:
+	// for hosts that cannot download release assets, whose image carries the frontend.
+	FrontendSourceEmbedded = "embedded"
+)

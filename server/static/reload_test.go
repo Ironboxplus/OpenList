@@ -42,3 +42,39 @@ func TestReloadStaticKeepsACustomDistDir(t *testing.T) {
 		t.Fatalf("ReloadStatic replaced the operator's dist_dir with %q", b)
 	}
 }
+
+// With frontend_source embedded the node serves the build in the binary: an
+// older fetched copy on disk is not served at start and a reload does not swap
+// to it.
+func TestEmbeddedSourceServesTheEmbeddedDistNotAFetchedOne(t *testing.T) {
+	oldData, oldConf := flags.DataDir, conf.Conf
+	t.Cleanup(func() { flags.DataDir, conf.Conf = oldData, oldConf })
+	flags.DataDir = t.TempDir()
+	fetched := filepath.Join(frontend.GetDistPath(), "dist")
+	if err := os.MkdirAll(fetched, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fetched, "index.html"), []byte("OLD FETCHED COPY"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	index := func() string {
+		f, err := staticFS.Open("index.html")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+		b, _ := io.ReadAll(f)
+		return string(b)
+	}
+
+	conf.Conf = &conf.Config{FrontendSource: conf.FrontendSourceEmbedded}
+	initStatic()
+	embedded := index()
+	if embedded == "OLD FETCHED COPY" {
+		t.Fatal("the fetched copy is what initStatic serves")
+	}
+	ReloadStatic() // what the watcher would call after a fetch
+	if got := index(); got != embedded {
+		t.Fatalf("embedded node serves %q after a reload", got)
+	}
+}

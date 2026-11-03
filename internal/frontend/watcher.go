@@ -111,6 +111,10 @@ func StartWatcher(onUpdated func()) {
 	if globalWatcher != nil {
 		return
 	}
+	if EmbeddedOnly() {
+		utils.Log.Infof("[frontend] frontend_source is embedded, frontend watcher not started")
+		return
+	}
 	if OperatorManagedDist() {
 		utils.Log.Infof("[frontend] dist_dir %q is operator-managed, frontend watcher not started", conf.Conf.DistDir)
 		return

@@ -143,3 +143,34 @@ func TestCustomDistDirIsNeverFetchedIntoOrSwapped(t *testing.T) {
 		t.Fatalf("EnsureDist fetched for a custom dist_dir: %q, %d requests", got, hits.Load())
 	}
 }
+
+// frontend_source embedded: the node serves what is built into the binary. The
+// watcher does not start, nothing is fetched, and a check does not reach the
+// release server even when an older fetched copy is on disk.
+func TestEmbeddedSourceNeverStartsTheWatcherOrFetches(t *testing.T) {
+	distEnv(t)
+	ts, hits := releaseServer(t)
+	useServer(ts)
+	conf.Conf.FrontendSource = conf.FrontendSourceEmbedded
+	if !EmbeddedOnly() {
+		t.Fatal("embedded source not recognised")
+	}
+	var updated atomic.Int32
+	NewWatcher(func() { updated.Add(1) }).check()
+	StartWatcher(func() { updated.Add(1) })
+	if globalWatcher != nil {
+		t.Fatal("the watcher was started")
+	}
+	if got := EnsureDist(context.Background()); got != "" {
+		t.Fatalf("EnsureDist = %q, want nothing", got)
+	}
+	if _, err := FetchFromRolling(context.Background()); err == nil {
+		t.Fatal("FetchFromRolling worked in embedded mode")
+	}
+	if hits.Load() != 0 || updated.Load() != 0 {
+		t.Fatalf("release server got %d requests, %d reloads, want 0/0", hits.Load(), updated.Load())
+	}
+	if _, err := os.Stat(filepath.Join(GetDistPath(), distDirName)); err == nil {
+		t.Fatal("a dist was fetched")
+	}
+}

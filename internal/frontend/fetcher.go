@@ -77,6 +77,12 @@ func frontendChannel() string {
 	return conf.FrontendChannelDefault
 }
 
+// EmbeddedOnly reports whether frontend_source is "embedded": the node serves the
+// frontend built into the binary and never fetches one.
+func EmbeddedOnly() bool {
+	return conf.Conf != nil && strings.EqualFold(strings.TrimSpace(conf.Conf.FrontendSource), conf.FrontendSourceEmbedded)
+}
+
 // FetchFromRolling downloads the frontend dist from the GitHub release of the
 // configured channel (frontend_channel, default "rolling").
 func FetchFromRolling(ctx context.Context) (*FetchResult, error) {
@@ -222,6 +228,9 @@ func resolveTagCommitSHA(ctx context.Context, client *http.Client, baseURL, tag 
 // fetchFromTag downloads frontend dist from a GitHub release tag.
 // If baseURL is non-empty, it replaces api.github.com (used for testing).
 func fetchFromTag(ctx context.Context, tag string, baseURL string) (*FetchResult, error) {
+	if EmbeddedOnly() {
+		return nil, fmt.Errorf("frontend_source is embedded: not fetching")
+	}
 	repo := getFrontendRepo()
 	var apiURL string
 	if baseURL != "" {
@@ -483,6 +492,9 @@ func mustParseURL(raw string) *url.URL {
 // It first tries the dynamic dist, then falls back to fetching from GitHub.
 // Returns the path to the dist directory, or empty string if no dist is available.
 func EnsureDist(ctx context.Context) string {
+	if EmbeddedOnly() {
+		return ""
+	}
 	// If user explicitly configured dist_dir, use that
 	if conf.Conf != nil && conf.Conf.DistDir != "" {
 		if _, err := os.Stat(filepath.Join(conf.Conf.DistDir, "index.html")); err == nil {

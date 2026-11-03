@@ -109,7 +109,10 @@ FetchWebRolling() {
     return 0
   fi
 
-  pre_release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/tags/rolling\"")
+  # The release tag to embed: rolling, or canary for the canary image (FRONTEND_TAG).
+  frontendTag="${FRONTEND_TAG:-rolling}"
+  echo "embedding the frontend release tagged $frontendTag"
+  pre_release_json=$(eval "curl -fsSL --max-time 2 $githubAuthArgs -H \"Accept: application/vnd.github.v3+json\" \"https://api.github.com/repos/$frontendRepo/releases/tags/$frontendTag\"")
   pre_release_assets=$(echo "$pre_release_json" | jq -r '.assets[].browser_download_url')
   
   # There is no lite for rolling
@@ -119,6 +122,13 @@ FetchWebRolling() {
   rm -rf public/dist && mkdir -p public/dist
   tar -zxvf dist.tar.gz -C public/dist
   rm -rf dist.tar.gz
+  # public/dist/VERSION names the embedded build (the server logs it at startup).
+  # The frontend build writes it; a tarball without one gets the release tag and
+  # its publish time.
+  if [ ! -s public/dist/VERSION ]; then
+    published=$(echo "$pre_release_json" | jq -r '.published_at // empty')
+    echo -n "$frontendTag@$published" > public/dist/VERSION
+  fi
 }
 
 FetchWebRelease() {

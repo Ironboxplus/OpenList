@@ -126,7 +126,10 @@ type Config struct {
 	FrontendRepo   string      `json:"frontend_repo" env:"FRONTEND_REPO"`
 	// FrontendChannel is the release tag of the frontend repo that FetchFromRolling
 	// follows ("rolling" by default; "canary" lets one node run a frontend the others do not).
-	FrontendChannel       string      `json:"frontend_channel" env:"FRONTEND_CHANNEL"`
+	FrontendChannel string `json:"frontend_channel" env:"FRONTEND_CHANNEL"`
+	// FrontendSource is "watch" (default: the watcher fetches the channel's release) or
+	// "embedded" (serve the build embedded in the binary; no watcher, no fetch).
+	FrontendSource        string      `json:"frontend_source" env:"FRONTEND_SOURCE"`
 	Log                   LogConfig   `json:"log" envPrefix:"LOG_"`
 	DelayedStart          int         `json:"delayed_start" env:"DELAYED_START"`
 	AutoMemoryLimit       int         `json:"auto_memory_limit" env:"AUTO_MEMORY_LIMIT"`
@@ -189,6 +192,7 @@ func DefaultConfig(dataDir string) *Config {
 		BleveDir:        indexDir,
 		FrontendRepo:    FrontendRepoDefault,
 		FrontendChannel: FrontendChannelDefault,
+		FrontendSource:  FrontendSourceWatch,
 		Log: LogConfig{
 			Enable:     true,
 			Name:       logPath,

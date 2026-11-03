@@ -64,6 +64,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WEB_VERSION: ${{ matrix.frontend_channel }}
           FRONTEND_REPO: ${{ env.FRONTEND_REPO }}
+          # an image carries the frontend of its own channel: :canary the canary build
+          FRONTEND_TAG: ${{ github.ref_name == 'canary' && 'canary' || 'rolling' }}
         run: bash build.sh beta docker-multiplatform
 
       - name: Set up Docker Buildx

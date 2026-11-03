@@ -157,6 +157,9 @@ func UpdateIndex() {
 
 // ReloadStatic reloads the static files from disk (called by the watcher after an update)
 func ReloadStatic() {
+	if frontend.EmbeddedOnly() {
+		return // the embedded build is what this node serves
+	}
 	if frontend.OperatorManagedDist() {
 		// dist_dir names a directory the operator maintains; never replace it.
 		return
@@ -226,7 +229,8 @@ func Static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc)) {
 	initStatic()
 	initIndex(siteConfig)
 
-	// Start the frontend watcher for periodic updates
+	logFrontendSource()
+	// Start the frontend watcher for periodic updates (not with frontend_source embedded)
 	frontend.StartWatcher(ReloadStatic)
 
 	folders := []string{"assets", "images", "streamer", "static"}
@@ -274,4 +278,19 @@ func Static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc)) {
 		c.Writer.Flush()
 		c.Writer.WriteHeaderNow()
 	})
+}
+
+// logFrontendSource says once at startup where the frontend comes from and, for
+// the embedded build, which version it is (dist/VERSION, written by the frontend
+// build or by the image build).
+func logFrontendSource() {
+	source := conf.FrontendSourceWatch
+	if frontend.EmbeddedOnly() {
+		source = conf.FrontendSourceEmbedded
+	}
+	version := "unknown"
+	if b, err := fs.ReadFile(public.Public, "dist/VERSION"); err == nil && strings.TrimSpace(string(b)) != "" {
+		version = strings.TrimSpace(string(b))
+	}
+	utils.Log.Infof("[frontend] source=%s, embedded version=%s", source, version)
 }
