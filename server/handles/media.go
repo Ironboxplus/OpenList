@@ -775,6 +775,13 @@ func StartMediaScrape(c *gin.Context) {
 		wg.Wait()
 		close(saveCh)
 		saveWg.Wait()
+		if req.MediaType == model.MediaTypeVideo {
+			folders := make([]string, 0, len(items))
+			for i := range items {
+				folders = append(folders, items[i].FolderPath)
+			}
+			media.ConsolidateVideoFolders(context.Background(), folders)
+		}
 
 		log.Infof("刮削完成 [%s]，共处理 %d 条（并发=%d）", req.MediaType, len(items), concurrency)
 	}()

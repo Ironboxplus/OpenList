@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"path"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 // EpisodeFile is a video file of a show with the season and episode its name
@@ -98,6 +100,7 @@ func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error)
 			season int
 		}
 		var named, unnamed []variant
+		numbered := siblingSeasons(specialDirs)
 		for i, d := range specialDirs {
 			if i >= maxSeasonDirs {
 				break
@@ -107,6 +110,9 @@ func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error)
 				return nil, err
 			}
 			v := variant{refs: refs, season: seasonOfDirName(d.Name)}
+			if v.season == 0 {
+				v.season = numbered[d.Name]
+			}
 			for j := range v.refs {
 				if v.refs[j].dirSeason == 0 {
 					v.refs[j].dirSeason = v.season
@@ -287,4 +293,58 @@ func unwrapping(list func(rel string) ([]Entry, error)) func(rel string) ([]Entr
 		budget -= opened
 		return out, nil
 	}
+}
+
+// SiblingSeasons is siblingSeasons for callers outside the package.
+func SiblingSeasons(dirs []Entry) map[string]int { return siblingSeasons(dirs) }
+
+// siblingSeasons reads the seasons of directories that are one name with a
+// number added ("Log Horizon", "Log Horizon 2"): the bare name is season 1 and
+// the numbered ones are the seasons they say. Release tags in brackets do not
+// count. Anything else (two copies of one name, a different word) gives nil: the
+// directories are not seasons of each other by their names.
+func siblingSeasons(dirs []Entry) map[string]int {
+	if len(dirs) < 2 {
+		return nil
+	}
+	norm := make([]string, len(dirs))
+	base := -1
+	for i, d := range dirs {
+		norm[i] = strings.ToLower(strings.Join(strings.Fields(bracketGroupRe.ReplaceAllString(d.Name, " ")), " "))
+		if norm[i] == "" {
+			return nil
+		}
+		if base < 0 || len(norm[i]) < len(norm[base]) {
+			base = i
+		}
+	}
+	out := map[string]int{}
+	used := map[int]bool{}
+	for i, d := range dirs {
+		if i == base {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(norm[i], norm[base]))
+		n, err := strconv.Atoi(rest)
+		if !strings.HasPrefix(norm[i], norm[base]) || err != nil || n < 2 || n > 30 || used[n] || len(rest) > 2 {
+			return nil
+		}
+		used[n] = true
+		out[d.Name] = n
+	}
+	out[dirs[base].Name] = 1
+	return out
+}
+
+// SameTitleSiblings reports whether directories differ only in their bracketed
+// tags: copies of one show released by different groups, not different seasons.
+func SameTitleSiblings(dirs []Entry) bool {
+	for i, d := range dirs {
+		n := strings.ToLower(strings.Join(strings.Fields(bracketGroupRe.ReplaceAllString(d.Name, " ")), " "))
+		m := strings.ToLower(strings.Join(strings.Fields(bracketGroupRe.ReplaceAllString(dirs[0].Name, " ")), " "))
+		if i > 0 && n != m {
+			return false
+		}
+	}
+	return len(dirs) > 1
 }

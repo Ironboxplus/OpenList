@@ -66,3 +66,35 @@ func TestVariantDuplicatesAreVersionsNotDropped(t *testing.T) {
 		t.Error("S04E22-37 are not listed as episodes of season 4")
 	}
 }
+
+// 记录的地平线: "Log Horizon" and "Log Horizon 2" are its seasons, named by the number.
+func TestSeasonsNamedByANumberAfterTheSameName(t *testing.T) {
+	tree := map[string][]Entry{
+		"":                                       dirs("[VCB-Studio] Log Horizon [Hi10p_1080p]", "[VCB-Studio] Log Horizon 2 [Ma10p_1080p]"),
+		"[VCB-Studio] Log Horizon [Hi10p_1080p]": eps("[VCB-Studio] Log Horizon [%02d][Hi10p_1080p].mkv", 3),
+		"[VCB-Studio] Log Horizon 2 [Ma10p_1080p]": eps("[VCB-Studio] Log Horizon 2 [%02d][Ma10p_1080p].mkv", 2),
+	}
+	got, err := EpisodeFiles(func(rel string) ([]Entry, error) { return tree[rel], nil })
+	if err != nil || len(got) != 5 {
+		t.Fatalf("got %d files (%v)", len(got), err)
+	}
+	per := map[int]int{}
+	for _, f := range got {
+		if f.Version {
+			t.Errorf("%s is a version", f.Rel)
+		}
+		per[f.Season]++
+	}
+	if per[1] != 3 || per[2] != 2 {
+		t.Fatalf("episodes per season %v, want 3 in season 1 and 2 in season 2", per)
+	}
+}
+
+func TestTwoCopiesOfOneNameAreNotSeasons(t *testing.T) {
+	if m := siblingSeasons(dirs("Show [A]", "Show [B]")); m != nil {
+		t.Fatalf("got %v", m)
+	}
+	if m := siblingSeasons(dirs("Show Ni no Sara", "Show San no Sara")); m != nil {
+		t.Fatalf("got %v", m)
+	}
+}

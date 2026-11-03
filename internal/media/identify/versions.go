@@ -221,3 +221,10 @@ func unrelatedFilmDir(seasonNames []string, workDirs []Entry, peek Peek) bool {
 	}
 	return false
 }
+
+// VersionOrder is versionOrder for callers outside the package: the names of
+// the videos, the one to play by default first.
+func VersionOrder(videos []Entry) []string { return versionOrder(videos) }
+
+// MainVideos is mainVideos for callers outside the package.
+func MainVideos(videos []Entry) []Entry { return mainVideos(videos) }

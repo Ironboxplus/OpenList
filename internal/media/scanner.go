@@ -352,6 +352,12 @@ func doScanPath(sp *model.MediaScanPath, p *ScanProgress) error {
 		case n > 0:
 			log.Infof("media scan [%s]: %d rows no longer produced were removed", sp.Path, n)
 		}
+		// releases of one film side by side are its versions (see ConsolidateVideoFolders)
+		folders := make([]string, 0, len(queue))
+		for _, t := range queue {
+			folders = append(folders, stdpath.Dir(t))
+		}
+		ConsolidateVideoFolders(ctx, folders)
 	}
 	return nil
 }
