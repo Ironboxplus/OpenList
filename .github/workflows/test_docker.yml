@@ -19,7 +19,7 @@ on:
           - both
   push:
     branches:
-      - feat/dynamic-frontend
+      - main
       - canary
 
 concurrency:

@@ -6,7 +6,7 @@ name: test-ours
 
 on:
   push:
-    branches: ["dev/**", "feat/**"]
+    branches: ["main", "dev/**", "feat/**"]
   workflow_dispatch:
 
 permissions:
