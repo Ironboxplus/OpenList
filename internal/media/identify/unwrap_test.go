@@ -2,6 +2,7 @@ package identify
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -112,5 +113,23 @@ func TestShowDirectoryOffersTheTitleOfItsEpisodeFilesToTheSearch(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("content %+v", r.Content)
+	}
+}
+
+func TestCommaSeparatedReleaseNameIsDotted(t *testing.T) {
+	ni := ParseName("Back,to,School,Mr,Bean,576i,Remux,AC3", true)
+	if strings.Contains(ni.Title, ",") || !strings.HasPrefix(ni.Title, "Back to School") {
+		t.Fatalf("title %q", ni.Title)
+	}
+}
+
+func TestBracketedLatinAliasIsOfferedToTheSearch(t *testing.T) {
+	r := Classify("[Kamigami] Omohide Poro Poro(Only Yesterday) [BD x264 1920x1040 FLAC(CH1,CH2,JP) Sub(CH1,CH2,JP,EN)].mkv", false, nil)
+	found := false
+	for _, c := range r.Content {
+		found = found || c.Name == "Only Yesterday"
+	}
+	if r.Title != "Omohide Poro Poro" || !found {
+		t.Fatalf("title %q content %+v", r.Title, r.Content)
 	}
 }

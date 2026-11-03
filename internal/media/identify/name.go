@@ -25,6 +25,7 @@ type NameInfo struct {
 	TVHint     bool   // season / episode markers in the name
 	Collection bool   // 合集 / 系列 / 三部曲 ...
 	Theatrical bool   // 剧场版 / 映画 / Movie in the name
+	Alias      string // a Latin name in brackets next to the title: Omohide Poro Poro(Only Yesterday)
 	TMDBID     string // inline {tmdb-123} tag: the number
 	IMDbID     string // inline {imdb-tt0112159} tag
 	Parsed     scraper.ParsedName
@@ -207,6 +208,10 @@ func ParseName(name string, isFile bool) NameInfo {
 	// A re-encode of a film is named after it: "AV1_Recode_GantzO.2016.…" is GantzO.
 	name = recodePrefixRe.ReplaceAllString(name, "")
 	name, ni.TMDBID, ni.IMDbID = ExtractIDTags(name)
+	// commas as the separator of a release name: Back,to,School,Mr,Bean,576i,Remux
+	if strings.Count(name, ",") >= 3 && !strings.ContainsAny(name, " 	") {
+		name = strings.ReplaceAll(name, ",", ".")
+	}
 	ni.Collection = collRe.MatchString(name)
 	ni.Theatrical = theatreRe.MatchString(name)
 
@@ -384,6 +389,11 @@ func ParseName(name string, isFile bool) NameInfo {
 			ni.Parsed.Year = strconv.Itoa(year)
 		}
 	}
+	// the alias is a second name for a provider search, not part of the title
+	if titleBracket != "" && titleBracket != core && ni.Title != "" && !hasHan(titleBracket) && !isTechBracket(titleBracket) &&
+		!scraper.IsNoiseToken(titleBracket) && len(strings.Fields(titleBracket)) <= 6 && letterCount(titleBracket) >= 4 {
+		ni.Alias = titleBracket
+	}
 	ni.Year = year
 	// a bare number is a title, not a year ("1917")
 	if ni.Title == "" && core != "" {
@@ -433,4 +443,14 @@ func isAllDigits(s string) bool {
 		}
 	}
 	return s != ""
+}
+
+func letterCount(s string) int {
+	n := 0
+	for _, r := range s {
+		if unicode.IsLetter(r) {
+			n++
+		}
+	}
+	return n
 }

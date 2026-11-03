@@ -132,6 +132,9 @@ func ClassifyWith(name string, isDir bool, entries []Entry, peek Peek) Result {
 	}
 	r.Kind, r.Confidence, r.Why = kind, conf, why
 	r.Content = shape.Content
+	if ni.Alias != "" && len(r.Content) < maxContentNames {
+		r.Content = append(r.Content, ContentName{Name: ni.Alias, Year: ni.Year})
+	}
 	r.Firm, r.ChildKinds = shape.Firm, shape.ChildKinds
 	r.FromContent = shape.Kind != "" && shape.Kind == kind
 	if kind == "movie" || kind == "anime" {
