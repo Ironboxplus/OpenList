@@ -111,7 +111,7 @@ func (v *mediaViewer) detail(it *model.MediaItem) (MediaItemView, error) {
 	for _, e := range eps {
 		list = append(list, MediaEpisodeView{
 			FileName: e.FileName, Season: e.Season, Episode: e.Episode, Title: e.Title, Overview: e.Overview,
-			StillURL: mediaCoverURL(e.Still),
+			StillURL: mediaCoverURL(e.Still), Version: e.Version,
 		})
 	}
 	out.EpisodeList = &list

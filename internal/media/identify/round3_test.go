@@ -80,13 +80,18 @@ func TestSecondReleaseFillsMissingEpisodesOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	var keys []string
+	versions := 0
 	for _, f := range got {
 		keys = append(keys, f.Rel)
+		if f.Version {
+			versions++
+		}
 	}
 	// A holds S01E01-03 and S02E01-02 (5 files), B holds S01E01-05 (5 files):
-	// the ties go to the first by name; B adds S01E04 and S01E05
-	if len(got) != 7 {
-		t.Fatalf("%d episodes: %v", len(got), keys)
+	// the ties go to the first by name; B adds S01E04 and S01E05 and keeps its
+	// copies of S01E01-03 as versions
+	if len(got) != 10 || versions != 3 {
+		t.Fatalf("%d files, %d versions: %v", len(got), versions, keys)
 	}
 	if !slices.Contains(keys, "B/Show.S01E05.mkv") || !slices.Contains(keys, "A/wrap/x/Show.S02E02.mkv") {
 		t.Fatalf("episodes: %v", keys)

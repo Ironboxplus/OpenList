@@ -153,7 +153,7 @@ func (s *Store) Set(req model.MediaSetReq, opt SetOptions) (*model.MediaItem, er
 		for _, e := range req.Episodes {
 			eps = append(eps, model.MediaEpisode{
 				FileName: e.FileName, Season: e.Season, Episode: e.Episode,
-				Title: e.Title, Overview: e.Overview, Still: e.Still,
+				Title: e.Title, Overview: e.Overview, Still: e.Still, Version: e.Version,
 			})
 		}
 		it.Episodes = model.EpisodesJSON(eps)

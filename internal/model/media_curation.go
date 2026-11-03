@@ -108,6 +108,7 @@ type MediaEpisodeIn struct {
 	Title    string `json:"title"`
 	Overview string `json:"overview"`
 	Still    string `json:"still"`
+	Version  bool   `json:"version,omitempty"`
 }
 
 // MediaSetReq is the body of /api/admin/media/curate/set. Only the fields

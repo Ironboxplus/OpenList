@@ -13,6 +13,10 @@ type EpisodeFile struct {
 	Name    string
 	Season  int
 	Episode int
+	// Version marks a copy of an episode another file already provides (the
+	// same season and number in another release folder): a version of that
+	// episode, not another episode.
+	Version bool
 }
 
 // fileRef is a candidate episode file while the show is being read.
@@ -20,6 +24,7 @@ type fileRef struct {
 	rel, name string
 	dirSeason int
 	special   int // 1-based number of a special (season 0), 0 for episodes
+	version   bool
 }
 
 // MaxEpisodeFiles caps what EpisodeFiles returns.
@@ -81,8 +86,9 @@ func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error)
 	// seasons under other names (魔道祖师: two releases, 星蝶公主: two languages,
 	// each holding its seasons in folders of its own, one of them wrapped once
 	// more). A folder that names its season keeps it; of the others the one with
-	// most episodes is the show, and the rest only fill the episodes it lacks
-	// when their files name their own season.
+	// most episodes is the show; the others add the episodes it lacks and are
+	// kept as versions of those it has (a file with no season of its own and no
+	// folder naming one is left out).
 	if seasonDirs == 0 && len(files) == 0 {
 		type variant struct {
 			refs   []fileRef
@@ -146,9 +152,10 @@ func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error)
 			}
 			for _, r := range v.refs {
 				s, e, ok := keyOf(r, fallback)
-				if !ok || taken[[2]int{s, e}] {
+				if !ok {
 					continue
 				}
+				r.version = taken[[2]int{s, e}]
 				taken[[2]int{s, e}] = true
 				if r.dirSeason == 0 {
 					r.dirSeason = s
@@ -202,7 +209,7 @@ func EpisodeFiles(list func(rel string) ([]Entry, error)) ([]EpisodeFile, error)
 		if s == 0 {
 			s = 1
 		}
-		out = append(out, EpisodeFile{Rel: f.rel, Name: f.name, Season: s, Episode: e})
+		out = append(out, EpisodeFile{Rel: f.rel, Name: f.name, Season: s, Episode: e, Version: f.version})
 		if len(out) >= MaxEpisodeFiles {
 			break
 		}

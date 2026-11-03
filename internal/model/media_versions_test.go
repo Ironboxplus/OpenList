@@ -17,3 +17,14 @@ func TestVersionsJSON(t *testing.T) {
 		t.Fatal("episodes read as versions")
 	}
 }
+
+func TestEpisodeVersionsShareTheIndexAndTakeNoPosition(t *testing.T) {
+	infos := EpisodeInfos([]MediaEpisode{
+		{FileName: "b/S01E01.mkv", Season: 1, Episode: 1, Version: true},
+		{FileName: "a/S01E01.mkv", Season: 1, Episode: 1},
+		{FileName: "a/S02E01.mkv", Season: 2, Episode: 1},
+	})
+	if len(infos) != 3 || infos[0].Version || !infos[1].Version || infos[1].Index != 1 || infos[2].Index != 2 || infos[2].Version {
+		t.Fatalf("%+v", infos)
+	}
+}

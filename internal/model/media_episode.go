@@ -20,6 +20,9 @@ type MediaEpisode struct {
 	Title    string `json:"title"`
 	Overview string `gorm:"type:text" json:"overview"`
 	Still    string `json:"still"` // same spellings as MediaItem.Cover
+	// Version marks a further file of an episode that another row of the same
+	// season and number already provides (a second release folder).
+	Version bool `json:"version,omitempty"`
 }
 
 // EpisodeInfos turns the episodes of a work into the upstream MediaItem.Episodes
@@ -35,6 +38,9 @@ func EpisodeInfos(eps []MediaEpisode) []EpisodeInfo {
 		if sorted[i].Episode != sorted[j].Episode {
 			return sorted[i].Episode < sorted[j].Episode
 		}
+		if sorted[i].Version != sorted[j].Version {
+			return !sorted[i].Version
+		}
 		return sorted[i].FileName < sorted[j].FileName
 	})
 	multi := false
@@ -45,13 +51,19 @@ func EpisodeInfos(eps []MediaEpisode) []EpisodeInfo {
 		}
 	}
 	out := make([]EpisodeInfo, 0, len(sorted))
-	for i, e := range sorted {
+	pos := 0 // position among the episodes proper: versions do not take one
+	for _, e := range sorted {
+		if e.Version && len(out) > 0 {
+			// shares the number of the episode it is a version of
+			out = append(out, EpisodeInfo{FileName: e.FileName, Index: out[len(out)-1].Index, Title: e.Title, Version: true})
+			continue
+		}
+		pos++
 		idx := e.Episode
 		if multi || idx <= 0 {
-			idx = i + 1
+			idx = pos
 		}
-		title := e.Title
-		out = append(out, EpisodeInfo{FileName: e.FileName, Index: idx, Title: title})
+		out = append(out, EpisodeInfo{FileName: e.FileName, Index: idx, Title: e.Title})
 	}
 	return out
 }

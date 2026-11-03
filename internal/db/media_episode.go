@@ -24,7 +24,7 @@ func ReplaceMediaEpisodes(itemID uint, eps []model.MediaEpisode) error {
 // ListMediaEpisodes returns the item's episodes in season and episode order.
 func ListMediaEpisodes(itemID uint) ([]model.MediaEpisode, error) {
 	var eps []model.MediaEpisode
-	err := db.Where("item_id = ?", itemID).Order("season, episode, file_name").Find(&eps).Error
+	err := db.Where("item_id = ?", itemID).Order("season, episode, version, file_name").Find(&eps).Error
 	return eps, err
 }
 

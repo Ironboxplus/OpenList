@@ -137,7 +137,7 @@ func scanEpisodes(ctx context.Context, folder string) ([]model.MediaEpisode, err
 	}
 	eps := make([]model.MediaEpisode, 0, len(files))
 	for _, f := range files {
-		eps = append(eps, model.MediaEpisode{FileName: f.Rel, Season: f.Season, Episode: f.Episode})
+		eps = append(eps, model.MediaEpisode{FileName: f.Rel, Season: f.Season, Episode: f.Episode, Version: f.Version})
 	}
 	return eps, nil
 }

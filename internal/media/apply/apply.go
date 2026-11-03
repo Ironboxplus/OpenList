@@ -196,7 +196,7 @@ func (o *Orchestrator) mapEpisodes(ctx context.Context, itemPath string, tg *scr
 	}
 	out := make([]model.MediaEpisodeIn, 0, len(files))
 	for _, f := range files {
-		ep := model.MediaEpisodeIn{FileName: f.Rel, Season: f.Season, Episode: f.Episode}
+		ep := model.MediaEpisodeIn{FileName: f.Rel, Season: f.Season, Episode: f.Episode, Version: f.Version}
 		if in, found := byKey[[2]int{f.Season, f.Episode}]; found {
 			ep.Title, ep.Overview = in.Title, in.Overview
 		}
