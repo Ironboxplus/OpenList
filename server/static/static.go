@@ -280,10 +280,23 @@ func Static(r *gin.RouterGroup, noRoute func(handlers ...gin.HandlerFunc)) {
 	})
 }
 
-// logFrontendSource says once at startup where the frontend comes from and, for
-// the embedded build, which version it is (dist/VERSION, written by the frontend
-// build or by the image build).
+// logFrontendSource says once at startup which frontend is actually served.
+// dist_dir wins over frontend_source (initStatic serves it), so it is reported
+// first, with the VERSION file of that directory; otherwise the source and the
+// embedded build's version (dist/VERSION, written by the frontend build or by
+// the image build).
 func logFrontendSource() {
+	if dir := conf.Conf.DistDir; dir != "" {
+		version := "unknown"
+		if b, err := os.ReadFile(filepath.Join(dir, "VERSION")); err == nil && strings.TrimSpace(string(b)) != "" {
+			version = strings.TrimSpace(string(b))
+		}
+		utils.Log.Infof("[frontend] source=dist_dir, path=%s, version=%s", dir, version)
+		if frontend.EmbeddedOnly() {
+			utils.Log.Warnf("[frontend] dist_dir %q overrides frontend_source=embedded: the embedded build is not served", dir)
+		}
+		return
+	}
 	source := conf.FrontendSourceWatch
 	if frontend.EmbeddedOnly() {
 		source = conf.FrontendSourceEmbedded
