@@ -8,14 +8,17 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/rclonefs"
 	"github.com/OpenListTeam/OpenList/v4/internal/testutil/fakedriver"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fs/sync"
 )
 
 // noHookCtx keeps the after-write hook, which re-lists asynchronously, out of
-// the call counts.
-func noHookCtx() context.Context {
-	return context.WithValue(context.Background(), conf.SkipHookKey, struct{}{})
+// the call counts, and the test's errors in a stats group of its own: rclone
+// refuses to delete in any later sync that sees errors in its group.
+func noHookCtx(t *testing.T) context.Context {
+	ctx := context.WithValue(context.Background(), conf.SkipHookKey, struct{}{})
+	return accounting.WithStatsGroup(ctx, t.Name())
 }
 
 func wantContent(t *testing.T, d *fakedriver.Driver, path, want string) {
@@ -29,7 +32,7 @@ func wantContent(t *testing.T, d *fakedriver.Driver, path, want string) {
 // op.MakeDir's lookups of the path and of its parent, each a rate-limit slot
 // on drives like 115.
 func TestNewTreeCostsAListingAndAMakeDirPerDir(t *testing.T) {
-	ctx := noHookCtx()
+	ctx := noHookCtx(t)
 	d := mountFake(t, "/tree")
 	d.CloudLike = true
 	src := t.TempDir()
@@ -65,7 +68,7 @@ func TestNewTreeCostsAListingAndAMakeDirPerDir(t *testing.T) {
 // Directories this Fs removed are made again on the next copy, even when the
 // drive still lists them.
 func TestRemovedDirsAreMadeAgainNotTakenFromAStaleListing(t *testing.T) {
-	ctx := noHookCtx()
+	ctx := noHookCtx(t)
 	d := mountFake(t, "/purge")
 	d.CloudLike, d.LagDeletes = true, true
 	src := t.TempDir()
@@ -104,7 +107,7 @@ func TestRemovedDirsAreMadeAgainNotTakenFromAStaleListing(t *testing.T) {
 // A directory removed behind the Fs's back (another client, the web UI) is
 // made again rather than written into.
 func TestDirRemovedBehindTheFsIsMadeAgain(t *testing.T) {
-	ctx := noHookCtx()
+	ctx := noHookCtx(t)
 	d := mountFake(t, "/behind")
 	d.CloudLike = true
 	src := t.TempDir()
@@ -137,7 +140,7 @@ func TestDirRemovedBehindTheFsIsMadeAgain(t *testing.T) {
 
 // The same, on a drive that still lists the removed directory.
 func TestDirRemovedBehindTheFsOnALaggingDrive(t *testing.T) {
-	ctx := noHookCtx()
+	ctx := noHookCtx(t)
 	d := mountFake(t, "/lag")
 	d.CloudLike, d.LagDeletes = true, true
 	src := t.TempDir()
@@ -174,7 +177,7 @@ func TestDirRemovedBehindTheFsOnALaggingDrive(t *testing.T) {
 // A name another writer takes between the listing and MakeDir is used, not
 // duplicated.
 func TestDirMadeByAnotherWriterMeanwhileIsUsed(t *testing.T) {
-	ctx := noHookCtx()
+	ctx := noHookCtx(t)
 	d := mountFake(t, "/race")
 	d.CloudLike = true
 	d.AddDir("/new")
@@ -202,7 +205,7 @@ func TestDirMadeByAnotherWriterMeanwhileIsUsed(t *testing.T) {
 
 // A file where a directory is wanted is reported, not replaced or wrapped.
 func TestFileInTheWayOfADirIsAnError(t *testing.T) {
-	ctx := noHookCtx()
+	ctx := noHookCtx(t)
 	d := mountFake(t, "/clash")
 	d.CloudLike = true
 	d.AddDir("/new")
