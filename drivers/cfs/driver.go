@@ -37,7 +37,6 @@ type Cfs struct {
 	model.Storage
 	Addition
 	shared *cfsrclone.Shared
-	vol    *core.Volume
 }
 
 func (d *Cfs) Config() driver.Config { return config }
@@ -50,6 +49,17 @@ func ShareKey(mountPath string) string { return "openlist-storage:" + utils.FixA
 
 // volumes maps ShareKey to the volume of the storage currently mounted there.
 var volumes sync.Map
+
+// volume returns the volume the mount path has now. OpenList keeps calling an
+// old driver instance after the storage was edited (Drop, then Init of a new
+// instance), so the instance itself holds no volume.
+func (d *Cfs) volume() (*core.Volume, error) {
+	v, ok := volumes.Load(ShareKey(d.MountPath))
+	if !ok {
+		return nil, errs.StorageNotInit
+	}
+	return v.(*core.Volume), nil
+}
 
 func (d *Cfs) Init(ctx context.Context) error {
 	d.RemotePath = utils.FixAndCleanPath(d.RemotePath)
@@ -88,8 +98,8 @@ func (d *Cfs) Init(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	d.shared, d.vol = sh, sh.Volume()
-	volumes.Store(ShareKey(d.MountPath), d.vol)
+	d.shared = sh
+	volumes.Store(ShareKey(d.MountPath), sh.Volume())
 	return nil
 }
 
@@ -98,8 +108,8 @@ func (d *Cfs) Drop(ctx context.Context) error {
 		return nil
 	}
 	sh := d.shared
-	volumes.CompareAndDelete(ShareKey(d.MountPath), d.vol)
-	d.shared, d.vol = nil, nil
+	volumes.CompareAndDelete(ShareKey(d.MountPath), sh.Volume())
+	d.shared = nil
 	return sh.Release(ctx)
 }
 
@@ -138,7 +148,11 @@ func mapErr(err error) error {
 }
 
 func (d *Cfs) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
-	es, err := d.vol.List(ctx, rel(dir.GetPath()))
+	vol, err := d.volume()
+	if err != nil {
+		return nil, err
+	}
+	es, err := vol.List(ctx, rel(dir.GetPath()))
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -154,7 +168,11 @@ func (d *Cfs) Get(ctx context.Context, path string) (model.Obj, error) {
 	if r == "" {
 		return &model.Object{Path: "/", Name: "/", IsFolder: true}, nil
 	}
-	e, err := d.vol.Stat(ctx, r)
+	vol, err := d.volume()
+	if err != nil {
+		return nil, err
+	}
+	e, err := vol.Stat(ctx, r)
 	if err != nil {
 		return nil, mapErr(err)
 	}
@@ -163,8 +181,12 @@ func (d *Cfs) Get(ctx context.Context, path string) (model.Obj, error) {
 
 func (d *Cfs) Link(ctx context.Context, file model.Obj, _ model.LinkArgs) (*model.Link, error) {
 	p, key := rel(file.GetPath()), ShareKey(d.MountPath)
+	vol, err := d.volume()
+	if err != nil {
+		return nil, err
+	}
 	// Fail now rather than on the first read.
-	if _, err := d.vol.Stat(ctx, p); err != nil {
+	if _, err := vol.Stat(ctx, p); err != nil {
 		return nil, mapErr(err)
 	}
 	return &model.Link{
@@ -182,14 +204,22 @@ func (d *Cfs) Link(ctx context.Context, file model.Obj, _ model.LinkArgs) (*mode
 }
 
 func (d *Cfs) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {
-	return mapErr(d.vol.Mkdir(ctx, stdpath.Join(rel(parentDir.GetPath()), dirName)))
+	vol, err := d.volume()
+	if err != nil {
+		return err
+	}
+	return mapErr(vol.Mkdir(ctx, stdpath.Join(rel(parentDir.GetPath()), dirName)))
 }
 
 func (d *Cfs) moveTo(ctx context.Context, src model.Obj, dst string) error {
-	if src.IsDir() {
-		return mapErr(d.vol.DirMove(ctx, rel(src.GetPath()), dst))
+	vol, err := d.volume()
+	if err != nil {
+		return err
 	}
-	return mapErr(d.vol.Move(ctx, rel(src.GetPath()), dst))
+	if src.IsDir() {
+		return mapErr(vol.DirMove(ctx, rel(src.GetPath()), dst))
+	}
+	return mapErr(vol.Move(ctx, rel(src.GetPath()), dst))
 }
 
 func (d *Cfs) Move(ctx context.Context, srcObj, dstDir model.Obj) error {
@@ -207,17 +237,25 @@ func (d *Cfs) Copy(ctx context.Context, srcObj, dstDir model.Obj) error {
 }
 
 func (d *Cfs) Remove(ctx context.Context, obj model.Obj) error {
-	if obj.IsDir() {
-		return mapErr(d.vol.RemoveAll(ctx, rel(obj.GetPath())))
+	vol, err := d.volume()
+	if err != nil {
+		return err
 	}
-	return mapErr(d.vol.Remove(ctx, rel(obj.GetPath())))
+	if obj.IsDir() {
+		return mapErr(vol.RemoveAll(ctx, rel(obj.GetPath())))
+	}
+	return mapErr(vol.Remove(ctx, rel(obj.GetPath())))
 }
 
 func (d *Cfs) Put(ctx context.Context, dstDir model.Obj, s model.FileStreamer, up driver.UpdateProgress) error {
+	vol, err := d.volume()
+	if err != nil {
+		return err
+	}
 	p := stdpath.Join(rel(dstDir.GetPath()), s.GetName())
 	opts := core.PutOpts{Size: s.GetSize(), MTime: s.ModTime(), SHA1: s.GetHash().GetHash(utils.SHA1)}
 	var r io.Reader
-	if opts.Size >= d.vol.Config().Threshold {
+	if opts.Size >= vol.Config().Threshold {
 		// A big file goes to the underlying storage 1:1, and a failed upload is
 		// repeated from the start of a seekable source.
 		f, err := seekableSource(s, &up)
@@ -231,7 +269,7 @@ func (d *Cfs) Put(ctx context.Context, dstDir model.Obj, s model.FileStreamer, u
 	} else {
 		r = driver.NewLimitedUploadStream(ctx, &driver.ReaderUpdatingProgress{Reader: s, UpdateProgress: up})
 	}
-	if _, err := d.vol.PutWith(ctx, p, r, opts); err != nil {
+	if _, err := vol.PutWith(ctx, p, r, opts); err != nil {
 		return mapErr(err)
 	}
 	up(100)
