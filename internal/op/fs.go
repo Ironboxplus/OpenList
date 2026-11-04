@@ -130,7 +130,18 @@ func List(ctx context.Context, storage driver.Driver, path string, args model.Li
 	return list(ctx, storage, path, args, nil)
 }
 
+// ListIn lists dir, a directory the caller already resolved at path, without
+// looking it up again — the listing counterpart of PutInDir.
+func ListIn(ctx context.Context, storage driver.Driver, dir model.Obj, path string, args model.ListArgs) ([]model.Obj, error) {
+	return listIn(ctx, storage, path, dir, args, nil)
+}
+
 func list(ctx context.Context, storage driver.Driver, path string, args model.ListArgs, resultValidator func([]model.Obj) error) ([]model.Obj, error) {
+	return listIn(ctx, storage, path, nil, args, resultValidator)
+}
+
+// listIn is list with the directory object, when known; nil looks it up.
+func listIn(ctx context.Context, storage driver.Driver, path string, known model.Obj, args model.ListArgs, resultValidator func([]model.Obj) error) ([]model.Obj, error) {
 	if storage.Config().CheckStatus && storage.GetStorage().Status != WORK {
 		return nil, errors.WithMessagef(errs.StorageNotInit, "storage status: %s", storage.GetStorage().Status)
 	}
@@ -156,9 +167,12 @@ func list(ctx context.Context, storage driver.Driver, path string, args model.Li
 		flightKey += ":" + strconv.Quote(base.String())
 	}
 	objs, err, _ := listG.Do(flightKey, func() ([]model.Obj, error) {
-		dir, err := GetUnwrap(ctx, storage, path)
-		if err != nil {
-			return nil, errors.WithMessage(err, "failed get dir")
+		dir := known
+		if dir == nil {
+			var err error
+			if dir, err = GetUnwrap(ctx, storage, path); err != nil {
+				return nil, errors.WithMessage(err, "failed get dir")
+			}
 		}
 		log.Debugf("list dir: %+v", dir)
 		if !dir.IsDir() {
@@ -485,42 +499,67 @@ func MakeDir(ctx context.Context, storage driver.Driver, path string) error {
 		if !parentDir.IsDir() {
 			return nil, errs.NotFolder
 		}
-		if model.ObjHasMask(parentDir, model.NoWrite) {
-			return nil, errors.WithStack(errs.PermissionDenied)
-		}
-
-		var newObj model.Obj
-		switch s := storage.(type) {
-		case driver.MkdirResult:
-			newObj, err = s.MakeDir(ctx, parentDir, dirName)
-		case driver.Mkdir:
-			err = s.MakeDir(ctx, parentDir, dirName)
-		default:
-			return nil, errs.NotImplement
-		}
-		if err != nil && !errs.IsObjectAlreadyExists(err) {
-			return nil, errors.WithStack(err)
-		}
-		if storage.Config().NoCache {
-			return nil, nil
-		}
-		if dirCache, exist := Cache.dirCache.Get(Key(storage, parentPath)); exist {
-			if newObj == nil {
-				t := time.Now()
-				newObj = &model.Object{
-					Name:     dirName,
-					IsFolder: true,
-					Modified: t,
-					Ctime:    t,
-					Mask:     model.Temp,
-					HashInfo: utils.NewHashInfo(nil, ""),
-				}
-			}
-			dirCache.UpdateObject("", wrapObjName(storage, newObj))
+		if _, err := makeDirIn(ctx, storage, parentDir, parentPath, dirName); err != nil && !errs.IsObjectAlreadyExists(err) {
+			return nil, err
 		}
 		return nil, nil
 	})
 	return err
+}
+
+// MakeDirIn creates dirName in parentDir, a directory the caller already
+// resolved at parentPath, and returns what the driver made — the counterpart
+// of PutInDir. It looks nothing up: the caller knows dirName isn't there, and
+// a driver that refuses a duplicate name returns an error. The result is nil
+// for a driver that doesn't report the new directory.
+func MakeDirIn(ctx context.Context, storage driver.Driver, parentDir model.Obj, parentPath, dirName string) (model.Obj, error) {
+	if storage.Config().CheckStatus && storage.GetStorage().Status != WORK {
+		return nil, errors.WithMessagef(errs.StorageNotInit, "storage status: %s", storage.GetStorage().Status)
+	}
+	return makeDirIn(ctx, storage, parentDir, utils.FixAndCleanPath(parentPath), dirName)
+}
+
+func makeDirIn(ctx context.Context, storage driver.Driver, parentDir model.Obj, parentPath, dirName string) (model.Obj, error) {
+	if model.ObjHasMask(parentDir, model.NoWrite) {
+		return nil, errors.WithStack(errs.PermissionDenied)
+	}
+	var (
+		newObj model.Obj
+		err    error
+	)
+	switch s := storage.(type) {
+	case driver.MkdirResult:
+		newObj, err = s.MakeDir(ctx, parentDir, dirName)
+	case driver.Mkdir:
+		err = s.MakeDir(ctx, parentDir, dirName)
+	default:
+		return nil, errs.NotImplement
+	}
+	// An existing directory is still one the parent's cached listing should
+	// have, so the cache is updated for it too; the error goes back to the
+	// caller, which decides whether that's fine.
+	if err != nil && !errs.IsObjectAlreadyExists(err) {
+		return nil, errors.WithStack(err)
+	}
+	if storage.Config().NoCache {
+		return newObj, err
+	}
+	if dirCache, exist := Cache.dirCache.Get(Key(storage, parentPath)); exist {
+		cached := newObj
+		if cached == nil {
+			t := time.Now()
+			cached = &model.Object{
+				Name:     dirName,
+				IsFolder: true,
+				Modified: t,
+				Ctime:    t,
+				Mask:     model.Temp,
+				HashInfo: utils.NewHashInfo(nil, ""),
+			}
+		}
+		dirCache.UpdateObject("", wrapObjName(storage, cached))
+	}
+	return newObj, err
 }
 
 func Move(ctx context.Context, storage driver.Driver, srcPath, dstDirPath string) error {

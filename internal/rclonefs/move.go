@@ -7,6 +7,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	olfs "github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
+	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/pkg/errors"
 	"github.com/rclone/rclone/fs"
 )
@@ -31,13 +32,19 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	if !ok {
 		return fs.ErrorCantDirMove
 	}
-	dstFull := f.fullPath(dstRemote)
-	srcFs.forgetDir(srcFs.fullPath(srcRemote))
+	srcFull, dstFull := srcFs.fullPath(srcRemote), f.fullPath(dstRemote)
+	moved := srcFs.forgetDir(srcFull)
 	f.forgetDir(dstFull)
 	if _, err := olfs.Get(ctx, dstFull, &olfs.GetArgs{NoLog: true}); err == nil {
 		return fs.ErrorDirExists
 	}
-	return moveWithin(ctx, srcFs.fullPath(srcRemote), dstFull, fs.ErrorCantDirMove)
+	if err := moveWithin(ctx, srcFull, dstFull, fs.ErrorCantDirMove); err != nil {
+		return err
+	}
+	// The directory is at dstFull now, under the ID it had at srcFull.
+	srcFs.buryDir(srcFull, moved)
+	f.gone.Delete(utils.FixAndCleanPath(dstFull))
+	return nil
 }
 
 // moveWithin is a driver Move into the destination's directory followed by a

@@ -6,6 +6,7 @@ package fakedriver
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	stdpath "path"
 	"strings"
@@ -42,6 +43,20 @@ type Driver struct {
 
 	// GetPaths records every path Get was asked for, in order.
 	GetPaths []string
+
+	// CloudLike makes the driver behave like a cloud drive rather than a
+	// file system: every node gets an ID of its own, MakeDir refuses a name
+	// that is taken, and nothing can be made or put in a directory that was
+	// removed (ObjectNotFound). Set it before the first call.
+	CloudLike bool
+	// LagDeletes, with CloudLike, keeps a removed directory in its parent's
+	// listing, as a drive slow to reflect a delete does; Get doesn't find it.
+	LagDeletes bool
+	// OnMakeDir, when set, is called with the path of each MakeDir before it
+	// is carried out (to let another writer take the name first).
+	OnMakeDir func(path string)
+	seq       int
+	ghosts    map[string]*model.Object
 }
 
 func init() {
@@ -96,8 +111,13 @@ func (d *Driver) AddFile(path, content string) {
 }
 
 func (d *Driver) newNode(path string, dir bool, size int64) *model.Object {
+	id := path
+	if d.CloudLike {
+		d.seq++
+		id = fmt.Sprintf("%s#%d", path, d.seq)
+	}
 	return &model.Object{
-		ID:       path,
+		ID:       id,
 		Path:     path,
 		Name:     stdpath.Base(path),
 		Size:     size,
@@ -124,13 +144,25 @@ func (d *Driver) List(_ context.Context, dir model.Obj, _ model.ListArgs) ([]mod
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	var out []model.Obj
-	for p, n := range d.nodes {
-		if stdpath.Dir(p) == dir.GetPath() && p != "/" {
-			c := *n
-			out = append(out, &c)
+	for _, nodes := range []map[string]*model.Object{d.nodes, d.ghosts} {
+		for p, n := range nodes {
+			if stdpath.Dir(p) == dir.GetPath() && p != "/" {
+				c := *n
+				out = append(out, &c)
+			}
 		}
 	}
 	return out, nil
+}
+
+// live reports, for CloudLike, whether parent is a directory that is still
+// there (not one removed, nor another made at its path since). Call with mu.
+func (d *Driver) live(parent model.Obj) bool {
+	if !d.CloudLike || parent.GetPath() == "/" {
+		return true
+	}
+	n, ok := d.nodes[parent.GetPath()]
+	return ok && n.IsFolder && n.ID == parent.GetID()
 }
 
 // Link serves the stored bytes of a file through a range reader.
@@ -153,9 +185,18 @@ func (d *Driver) Link(_ context.Context, file model.Obj, _ model.LinkArgs) (*mod
 
 func (d *Driver) MakeDir(_ context.Context, parent model.Obj, name string) (model.Obj, error) {
 	d.MakeDirs.Add(1)
+	p := stdpath.Join(parent.GetPath(), name)
+	if d.OnMakeDir != nil {
+		d.OnMakeDir(p)
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	p := stdpath.Join(parent.GetPath(), name)
+	if !d.live(parent) {
+		return nil, errs.ObjectNotFound
+	}
+	if _, taken := d.nodes[p]; taken && d.CloudLike {
+		return nil, errs.ObjectAlreadyExists
+	}
 	n := d.newNode(p, true, 0)
 	d.nodes[p] = n
 	c := *n
@@ -175,6 +216,9 @@ func (d *Driver) Put(_ context.Context, parent model.Obj, file model.FileStreame
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if !d.live(parent) {
+		return nil, errs.ObjectNotFound
+	}
 	p := stdpath.Join(parent.GetPath(), file.GetName())
 	n := d.newNode(p, false, int64(len(b)))
 	n.HashInfo = file.GetHash()
@@ -199,6 +243,12 @@ func (d *Driver) Remove(_ context.Context, obj model.Obj) error {
 	p := obj.GetPath()
 	for k := range d.nodes {
 		if k == p || strings.HasPrefix(k, p+"/") {
+			if n := d.nodes[k]; d.LagDeletes && k == p && n.IsFolder {
+				if d.ghosts == nil {
+					d.ghosts = map[string]*model.Object{}
+				}
+				d.ghosts[k] = n
+			}
 			delete(d.nodes, k)
 			delete(d.data, k)
 		}
