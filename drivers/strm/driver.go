@@ -6,6 +6,8 @@ import (
 	"fmt"
 	stdpath "path"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
@@ -28,6 +30,14 @@ type Strm struct {
 	supportSuffix  map[string]struct{}
 	downloadSuffix map[string]struct{}
 	minSizeBytes   int64
+
+	// media mode (Source = media), see media.go
+	mediaMode   bool
+	treeMu      sync.RWMutex
+	tree        *mediaTree
+	treeChecked time.Time
+	recheck     time.Duration // how long a look at the library's fingerprint holds
+	images      *mediaImages
 }
 
 func (d *Strm) Config() driver.Config {
@@ -45,6 +55,7 @@ func (d *Strm) Init(ctx context.Context) error {
 	if d.SaveStrmToLocal && len(d.SaveStrmLocalPath) <= 0 {
 		return errors.New("SaveStrmLocalPath is required")
 	}
+	d.mediaMode = d.Source == SourceMedia
 	d.pathMap = make(map[string][]string)
 	for path := range strings.SplitSeq(d.Paths, "\n") {
 		path = strings.TrimSpace(path)
@@ -52,8 +63,11 @@ func (d *Strm) Init(ctx context.Context) error {
 			continue
 		}
 		k, v := getPair(path)
+		if d.mediaMode {
+			v = utils.FixAndCleanPath(v)
+		}
 		d.pathMap[k] = append(d.pathMap[k], v)
-		if d.SaveStrmToLocal {
+		if d.SaveStrmToLocal && !d.mediaMode {
 			err := InsertStrm(utils.FixAndCleanPath(strings.TrimSpace(path)), d)
 			if err != nil {
 				log.Errorf("insert strmTrie error: %v", err)
@@ -122,10 +136,14 @@ func (d *Strm) Init(ctx context.Context) error {
 		d.SaveLocalMode = SaveLocalInsertMode
 	}
 	d.minSizeBytes = d.MinFileSize * 1024 * 1024
+	d.tree, d.treeChecked, d.recheck, d.images = nil, time.Time{}, 3*time.Second, newMediaImages()
 	return nil
 }
 
 func (d *Strm) Drop(ctx context.Context) error {
+	d.treeMu.Lock()
+	d.tree, d.images = nil, nil
+	d.treeMu.Unlock()
 	d.pathMap = nil
 	d.downloadSuffix = nil
 	d.supportSuffix = nil
@@ -140,6 +158,9 @@ func (Addition) GetRootPath() string {
 }
 
 func (d *Strm) Get(ctx context.Context, path string) (model.Obj, error) {
+	if d.mediaMode {
+		return d.getMedia(ctx, path)
+	}
 	root, sub := d.getRootAndPath(path)
 	dsts, ok := d.pathMap[root]
 	if !ok {
@@ -179,6 +200,9 @@ func (d *Strm) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]
 	if utils.PathEqual(path, "/") && !d.autoFlatten {
 		return d.listRoot(), nil
 	}
+	if d.mediaMode {
+		return d.listMedia(ctx, path)
+	}
 	root, sub := d.getRootAndPath(path)
 	dsts, ok := d.pathMap[root]
 	if !ok {
@@ -196,17 +220,24 @@ func (d *Strm) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]
 }
 
 func (d *Strm) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
+	if d.mediaMode {
+		return d.linkMedia(ctx, file, args)
+	}
 	if file.GetID() == "strm" {
 		link := d.getLink(ctx, file.GetPath())
 		return &model.Link{
 			RangeReader: stream.GetRangeReaderFromMFile(int64(len(link)), strings.NewReader(link)),
 		}, nil
 	}
+	return d.linkFile(ctx, file.GetPath(), args)
+}
+
+// linkFile is the link of a file of the storages under Paths.
+func (d *Strm) linkFile(ctx context.Context, reqPath string, args model.LinkArgs) (*model.Link, error) {
 	// ftp,s3
 	if common.GetApiUrl(ctx) == "" {
 		args.Redirect = false
 	}
-	reqPath := file.GetPath()
 	link, _, err := d.link(ctx, reqPath, args)
 	if err != nil {
 		return nil, err

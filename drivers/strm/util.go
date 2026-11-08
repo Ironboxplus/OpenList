@@ -111,16 +111,16 @@ func (d *Strm) getLink(ctx context.Context, path string) string {
 	if d.EncodePath {
 		finalPath = utils.EncodePath(path, true)
 	}
-	if d.WithSign {
-		signPath := sign.Sign(path)
-		finalPath = fmt.Sprintf("%s?sign=%s", finalPath, signPath)
-	}
 	pathPrefix := d.PathPrefix
 	if len(pathPrefix) > 0 {
 		finalPath = stdpath.Join(pathPrefix, finalPath)
 	}
 	if !strings.HasPrefix(finalPath, "/") {
 		finalPath = "/" + finalPath
+	}
+	if d.WithSign {
+		// appended after the Join: Join cleans the path, and the query is not one
+		finalPath = fmt.Sprintf("%s?sign=%s", finalPath, sign.Sign(path))
 	}
 	if d.WithoutUrl {
 		return finalPath

@@ -5,6 +5,12 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 )
 
+// Addition.Source: what the tree is made of
+const (
+	SourceFiles = "files" // the storages under Paths, listed with their videos as .strm files
+	SourceMedia = "media" // the media library, see media.go
+)
+
 const (
 	SaveLocalInsertMode = "insert"
 	SaveLocalUpdateMode = "update"
@@ -13,6 +19,7 @@ const (
 
 type Addition struct {
 	Paths             string `json:"paths" required:"true" type:"text"`
+	Source            string `json:"source" type:"select" options:"files,media" default:"files" help:"files: list the storages under Paths as strm files; media: build the tree from the media library (scraped names, NFO, posters, subtitles); a line of Paths is then name:VFS path of the library files"`
 	SiteUrl           string `json:"siteUrl" type:"text" required:"false" help:"The prefix URL of the strm file"`
 	PathPrefix        string `json:"PathPrefix" type:"text" required:"false" default:"/d"  help:"Path prefix"`
 	DownloadFileTypes string `json:"downloadFileTypes" type:"text" default:"ass,srt,vtt,sub,strm" required:"false" help:"Files need to download with strm (usally subtitles)"`
