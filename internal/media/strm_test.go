@@ -74,3 +74,22 @@ func TestStrmTargetsFolderWithoutRowsKeepsJSONBehaviour(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+func TestStrmTargetsNeverPointAtADirectory(t *testing.T) {
+	film := &model.MediaItem{
+		MediaType: model.MediaTypeVideo, FolderPath: "/lib", FileName: "Film", IsFolder: true,
+		ScrapedName: "Film", VideoType: model.VideoTypeMovie,
+	}
+	if got := StrmTargets(film); len(got) != 0 {
+		t.Errorf("film folder without a known video: %v", strmRels(got))
+	}
+	album := &model.MediaItem{MediaType: model.MediaTypeMusic, FolderPath: "/lib", FileName: "Album", IsFolder: true, ScrapedName: "A"}
+	if got := StrmTargets(album); len(got) != 0 {
+		t.Errorf("album folder: %v", strmRels(got))
+	}
+	// a single file still gets its target
+	film.IsFolder, film.FileName = false, "Film.mkv"
+	if got := StrmTargets(film); len(got) != 1 || got[0].RawPath != "/lib/Film.mkv" {
+		t.Errorf("file: %v", strmRels(got))
+	}
+}

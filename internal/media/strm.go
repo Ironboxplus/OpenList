@@ -276,10 +276,15 @@ func StrmTargetsWithEpisodes(item *model.MediaItem, eps []model.MediaEpisode) []
 				}}
 			}
 		}
+		if item.IsFolder {
+			// no version is known, so the video inside is not either: a strm must not point at a directory
+			log.Debugf("[media] strm: no video known for folder %s, skipped", raw)
+			return nil
+		}
 		return []StrmTarget{{
 			RelPath:     stdpath.Join(name, name+".strm"),
 			RawPath:     raw,
-			SameDirPath: strmSibling(raw, item.IsFolder),
+			SameDirPath: strmSibling(raw, false),
 		}}
 	case model.MediaTypeMusic:
 		artist := sanitizeName(item.AlbumArtist)
@@ -295,6 +300,10 @@ func StrmTargetsWithEpisodes(item *model.MediaItem, eps []model.MediaEpisode) []
 			track = 1
 		}
 		raw := stdpath.Join(folder, item.FileName)
+		if item.IsFolder {
+			log.Debugf("[media] strm: album folder %s has no single file, skipped", raw)
+			return nil
+		}
 		return []StrmTarget{{
 			RelPath:     stdpath.Join(artist, album, fmt.Sprintf("%02d - %s.strm", track, title)),
 			RawPath:     raw,
