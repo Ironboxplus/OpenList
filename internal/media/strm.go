@@ -159,7 +159,51 @@ func MediaItemFolder(item *model.MediaItem) string {
 
 // StrmTargets 计算条目对应的 STRM 目标列表。
 // 图片/书籍返回空列表（不生成 STRM）。
+// 剧集文件夹条目的每集季/集/标题取自 media_episodes（读库）；没有分集行时回落到 Episodes JSON。
 func StrmTargets(item *model.MediaItem) []StrmTarget {
+	var eps []model.MediaEpisode
+	if item != nil && item.ID != 0 && item.IsFolder && item.MediaType == model.MediaTypeVideo && model.IsEpisodicVideo(item.VideoType) {
+		eps, _ = db.ListMediaEpisodes(item.ID)
+	}
+	return StrmTargetsWithEpisodes(item, eps)
+}
+
+// episodeTargets 按 media_episodes 的每一行算剧集文件夹条目的目标：季、集、标题各取自该行。
+// 同季同集的另一个版本（Version）共用路径，不再生成；集号缺失时按顺序编号。
+func episodeTargets(item *model.MediaItem, series, folder string, eps []model.MediaEpisode) []StrmTarget {
+	var out []StrmTarget
+	pos := 0
+	for _, ep := range eps {
+		if ep.Version {
+			continue
+		}
+		pos++
+		season, num := ep.Season, ep.Episode
+		if season <= 0 {
+			season = item.Season
+		}
+		if season <= 0 {
+			season = 1
+		}
+		if num <= 0 {
+			num = pos
+		}
+		name := fmt.Sprintf("%s S%02dE%02d", series, season, num)
+		if t := strings.TrimSpace(ep.Title); t != "" {
+			name += " - " + sanitizeName(t)
+		}
+		epRaw := stdpath.Join(folder, item.FileName, ep.FileName)
+		out = append(out, StrmTarget{
+			RelPath:     stdpath.Join(series, fmt.Sprintf("Season %02d", season), name+".strm"),
+			RawPath:     epRaw,
+			SameDirPath: strmSibling(epRaw, false),
+		})
+	}
+	return out
+}
+
+// StrmTargetsWithEpisodes 同 StrmTargets，分集行由调用方给出（不读库）。
+func StrmTargetsWithEpisodes(item *model.MediaItem, eps []model.MediaEpisode) []StrmTarget {
 	if item == nil {
 		return nil
 	}
@@ -177,6 +221,9 @@ func StrmTargets(item *model.MediaItem) []StrmTarget {
 			}
 			var out []StrmTarget
 			if item.IsFolder {
+				if len(eps) > 0 {
+					return episodeTargets(item, series, folder, eps)
+				}
 				for i, ep := range parseEpisodes(item) {
 					num := ep.Index
 					if num <= 0 {
@@ -210,6 +257,17 @@ func StrmTargets(item *model.MediaItem) []StrmTarget {
 			name = fmt.Sprintf("%s (%s)", title, year)
 		}
 		raw := stdpath.Join(folder, item.FileName)
+		if item.IsFolder {
+			// several versions of one film in a folder: the default (first) version plays
+			if vs := model.ItemVersions(item.Episodes); len(vs) > 0 {
+				raw = stdpath.Join(raw, vs[0].FileName)
+				return []StrmTarget{{
+					RelPath:     stdpath.Join(name, name+".strm"),
+					RawPath:     raw,
+					SameDirPath: strmSibling(raw, false),
+				}}
+			}
+		}
 		return []StrmTarget{{
 			RelPath:     stdpath.Join(name, name+".strm"),
 			RawPath:     raw,
