@@ -357,7 +357,7 @@ func InitialSettings() []model.SettingItem {
 			Help: `扫描完成后自动把媒体条目生成为 .strm 文件并写入下方目录`},
 		{Key: conf.MediaStrmOverwrite, Value: "true", Type: conf.TypeBool, Group: model.MEDIA, Flag: model.PRIVATE,
 			Help: `生成 STRM 时覆盖已存在的同名文件`},
-		{Key: conf.MediaStrmSameDir, Value: "true", Type: conf.TypeBool, Group: model.MEDIA, Flag: model.PRIVATE,
+		{Key: conf.MediaStrmSameDir, Value: "false", Type: conf.TypeBool, Group: model.MEDIA, Flag: model.PRIVATE,
 			Help: `开启时 .strm 与媒体文件放在同一目录且同名（仅扩展名不同）；关闭时统一输出到下方指定目录`},
 		{Key: conf.MediaStrmPath, Value: "/strm", Type: conf.TypeString, Group: model.MEDIA, Flag: model.PRIVATE,
 			Help: `STRM 输出目录（VFS 路径，需位于可写存储中），仅在关闭「与媒体文件同目录」时使用`},
