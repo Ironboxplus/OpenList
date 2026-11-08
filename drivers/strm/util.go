@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	stdpath "path"
+	"sort"
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
@@ -15,8 +16,13 @@ import (
 )
 
 func (d *Strm) listRoot() []model.Obj {
-	var objs []model.Obj
+	keys := make([]string, 0, len(d.pathMap))
 	for k := range d.pathMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // map order is random; a listing should not shuffle
+	var objs []model.Obj
+	for _, k := range keys {
 		obj := model.Object{
 			Path:     "/" + k,
 			Name:     k,

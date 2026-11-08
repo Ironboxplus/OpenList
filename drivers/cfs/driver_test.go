@@ -227,8 +227,14 @@ func TestCfsRejectsRemotePathInsideItself(t *testing.T) {
 // count once, and the uploaded bytes must be the source bytes.
 func TestSyncIntoStackedCfsCountsEachFileOnce(t *testing.T) {
 	under, state, src := t.TempDir(), t.TempDir(), t.TempDir()
-	addStorage(t, "Local", "/stack-under", `{"root_folder_path":`+q(under)+`}`)
-	addStorage(t, "Cfs", "/stack-cfs", `{"remote_path":"/stack-under/vol","root_folder_path":"/","state_dir":`+q(state)+`,"seal_quiet":"50ms","seal_max":"500ms","threshold":"64KiB"}`)
+	underID := addStorage(t, "Local", "/stack-under", `{"root_folder_path":`+q(under)+`}`)
+	cfsID := addStorage(t, "Cfs", "/stack-cfs", `{"remote_path":"/stack-under/vol","root_folder_path":"/","state_dir":`+q(state)+`,"seal_quiet":"50ms","seal_max":"500ms","threshold":"64KiB"}`)
+	// Cleanups run last-in first-out, so this runs before the TempDirs above are removed:
+	// dropping the storages closes the volume, whose sealing writes .cfs/log under `under`.
+	t.Cleanup(func() {
+		op.DeleteStorageById(context.Background(), cfsID)
+		op.DeleteStorageById(context.Background(), underID)
+	})
 
 	sizes := map[string]int{"small1.txt": 100, "d/small2.txt": 5000, "d/edge.bin": 64<<10 - 1, "big1.bin": 64 << 10, "d/big2.bin": 300 << 10, "big3.bin": 1 << 20}
 	var total int64
