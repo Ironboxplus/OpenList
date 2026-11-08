@@ -43,7 +43,7 @@ func deleteMediaChildren(tx *gorm.DB, ids []uint) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	for _, m := range []any{&model.MediaAnnotation{}, &model.MediaRating{}, &model.MediaEpisode{}} {
+	for _, m := range []any{&model.MediaAnnotation{}, &model.MediaRating{}, &model.MediaEpisode{}, &model.MediaSidecar{}} {
 		if err := tx.Where("item_id IN ?", ids).Delete(m).Error; err != nil {
 			return err
 		}

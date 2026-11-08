@@ -132,9 +132,11 @@ func foldFilm(ctx context.Context, group []*model.MediaItem, list listFunc) erro
 	if len(files) < 2 {
 		return nil
 	}
-	if err := db.UpdateMediaItemEpisodes(survivor.ID, model.VersionsJSON(identify.VersionOrder(files))); err != nil {
+	versions := identify.VersionOrder(files)
+	if err := db.UpdateMediaItemEpisodes(survivor.ID, model.VersionsJSON(versions)); err != nil {
 		return err
 	}
+	recordSidecars(ctx, survivor, versions, list)
 	return db.FoldMediaItems(survivor.ID, others)
 }
 
@@ -212,6 +214,7 @@ func foldShowReleases(ctx context.Context, group []*model.MediaItem, list listFu
 	if err := db.UpdateMediaItemEpisodes(survivor.ID, model.EpisodesJSON(merged)); err != nil {
 		return err
 	}
+	recordSidecars(ctx, survivor, episodeFiles(merged), list)
 	return db.FoldMediaItems(survivor.ID, others)
 }
 
@@ -263,6 +266,7 @@ func foldSeasonsIntoCollection(ctx context.Context, folder string, members []mod
 	if err := db.SaveVideoItem(parent, ratings[first.ID], eps); err != nil {
 		return err
 	}
+	recordSidecars(ctx, parent, episodeFiles(eps), list)
 	ids := make([]uint, 0, len(seasons))
 	for _, s := range seasons {
 		ids = append(ids, s.ID)

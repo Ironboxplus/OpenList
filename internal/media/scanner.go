@@ -18,6 +18,7 @@ import (
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
+	"github.com/OpenListTeam/OpenList/v4/internal/media/identify"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
@@ -270,7 +271,8 @@ func doScanPath(sp *model.MediaScanPath, p *ScanProgress) error {
 		}
 
 		var scannedEpisodes []model.MediaEpisode
-		trusted := true // the listings behind the verdict all worked
+		var sidecarVideos []string // the videos whose subtitles are recorded once the item is saved
+		trusted := true            // the listings behind the verdict all worked
 		if sp.MediaType == model.MediaTypeVideo {
 			entries, r, lerr := identifyScanItemChecked(ctx, target, item)
 			if lerr != nil {
@@ -279,10 +281,15 @@ func doScanPath(sp *model.MediaScanPath, p *ScanProgress) error {
 			}
 			settleVerdict(item, &r, depth[target] > 0, db.DecidedShowKind)
 			switch {
+			case !item.IsFolder:
+				sidecarVideos = []string{item.FileName}
 			case item.IsFolder && model.IsEpisodicVideo(r.Kind):
 				if eps, err := scanEpisodes(ctx, target); err == nil {
 					scannedEpisodes = eps
 					item.Episodes = model.EpisodesJSON(eps)
+					for _, e := range eps {
+						sidecarVideos = append(sidecarVideos, e.FileName)
+					}
 				} else {
 					log.Warnf("scan episodes error [%s]: %v", target, err)
 					trusted = false
@@ -290,12 +297,21 @@ func doScanPath(sp *model.MediaScanPath, p *ScanProgress) error {
 			case item.IsFolder && len(r.Versions) > 1:
 				// one film kept in several versions: the files are the choices
 				item.Episodes = model.VersionsJSON(r.Versions)
+				sidecarVideos = r.Versions
 			case item.IsFolder && sp.PathMerge:
 				if episodes, err := buildEpisodesFromFolder(ctx, target, sp.MediaType); err == nil {
 					item.Episodes = episodes
 				} else {
 					log.Warnf("build episodes error [%s]: %v", target, err)
 					trusted = false
+				}
+			}
+			if item.IsFolder && sidecarVideos == nil && r.Kind != model.VideoTypeCollection {
+				// a film folder: its videos sit at the top (or in the one wrapper directory, already unwrapped)
+				for _, e := range entries {
+					if !e.IsDir && identify.IsVideo(e.Name) {
+						sidecarVideos = append(sidecarVideos, e.Rel())
+					}
 				}
 			}
 			if r.Kind == model.VideoTypeCollection && depth[target] < maxCollectionDepth {
@@ -328,6 +344,9 @@ func doScanPath(sp *model.MediaScanPath, p *ScanProgress) error {
 			p.mu.Unlock()
 		} else {
 			produced[item.ID] = true
+			if trusted && sp.MediaType == model.MediaTypeVideo && sidecarVideos != nil {
+				recordSidecars(ctx, item, sidecarVideos, listEntries)
+			}
 			if scannedEpisodes != nil {
 				// keep the titles a scrape gave the episodes that are still there
 				if merged, err := db.SyncMediaEpisodes(item.ID, scannedEpisodes); err != nil {

@@ -10,7 +10,7 @@ import (
 func newCurationDB(t *testing.T) {
 	t.Helper()
 	db = openTestDB(t, "x_")
-	if err := db.AutoMigrate(&model.MediaItem{}, &model.MediaRating{}, &model.MediaEpisode{}); err != nil {
+	if err := db.AutoMigrate(&model.MediaItem{}, &model.MediaRating{}, &model.MediaEpisode{}, &model.MediaSidecar{}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -119,7 +119,7 @@ func TestClearScrapedDataSparesLocked(t *testing.T) {
 
 func TestMediaRatingsReplaceAndClear(t *testing.T) {
 	newCurationDB(t)
-	if err := db.AutoMigrate(&model.MediaRating{}, &model.MediaAnnotation{}); err != nil {
+	if err := db.AutoMigrate(&model.MediaRating{}, &model.MediaAnnotation{}, &model.MediaSidecar{}); err != nil {
 		t.Fatal(err)
 	}
 	a, b := scanned("A"), scanned("B")
@@ -177,7 +177,7 @@ func TestPrimaryRating(t *testing.T) {
 
 func TestMediaEpisodesReplaceAndDelete(t *testing.T) {
 	newCurationDB(t)
-	if err := db.AutoMigrate(&model.MediaEpisode{}, &model.MediaRating{}, &model.MediaAnnotation{}); err != nil {
+	if err := db.AutoMigrate(&model.MediaEpisode{}, &model.MediaRating{}, &model.MediaAnnotation{}, &model.MediaSidecar{}); err != nil {
 		t.Fatal(err)
 	}
 	it := scanned("Show")
