@@ -3,6 +3,7 @@ package media
 import (
 	"context"
 	stdpath "path"
+	"sort"
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
@@ -45,31 +46,37 @@ func recordSidecars(ctx context.Context, item *model.MediaItem, videos []string,
 		return
 	}
 	base := itemBaseDir(item)
-	byDir := map[string][]string{} // directory relative to base -> names in it
+	byDir := map[string]map[string]int64{} // directory relative to base -> file names in it, with sizes
 	var rows []model.MediaSidecar
 	for _, v := range videos {
 		v = stdpath.Clean(v)
 		dir := stdpath.Dir(v)
-		names, ok := byDir[dir]
+		files, ok := byDir[dir]
 		if !ok {
 			entries, err := list(ctx, stdpath.Join(base, dir))
 			if err != nil {
 				log.Warnf("media sidecars: list %s: %v", stdpath.Join(base, dir), err)
 				return
 			}
+			files = make(map[string]int64, len(entries))
 			for _, e := range entries {
 				if !e.IsDir {
-					names = append(names, e.Name)
+					files[e.Name] = e.Size
 				}
 			}
-			byDir[dir] = names
+			byDir[dir] = files
 		}
+		names := make([]string, 0, len(files))
+		for n := range files {
+			names = append(names, n)
+		}
+		sort.Strings(names)
 		for _, s := range SidecarNames(stdpath.Base(v), names) {
 			p := stdpath.Join(dir, s)
 			if len(v) > model.MediaIndexColumnMax || len(p) > model.MediaIndexColumnMax {
 				continue
 			}
-			rows = append(rows, model.MediaSidecar{Video: v, Path: p})
+			rows = append(rows, model.MediaSidecar{Video: v, Path: p, Size: files[s]})
 		}
 	}
 	if err := db.ReplaceMediaSidecars(item.ID, rows); err != nil {

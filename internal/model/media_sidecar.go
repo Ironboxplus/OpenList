@@ -12,4 +12,5 @@ type MediaSidecar struct {
 	ItemID uint   `gorm:"not null;uniqueIndex:idx_media_sidecar_file" json:"item_id"`
 	Video  string `gorm:"size:191;not null;uniqueIndex:idx_media_sidecar_file" json:"video"` // the video, e.g. "Season 1/x.S01E03.mkv"
 	Path   string `gorm:"size:191;not null;uniqueIndex:idx_media_sidecar_file" json:"path"`  // the subtitle, e.g. "Season 1/x.S01E03.chs.ass"
+	Size   int64  `json:"size"`                                                              // bytes of the subtitle file when the scan listed it
 }

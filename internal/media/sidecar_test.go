@@ -43,7 +43,7 @@ func TestRecordSidecarsReplacesPerItem(t *testing.T) {
 		}
 	}
 	tree := map[string][]identify.Entry{
-		"/lib/Show/Season 1": {{Name: "a.S01E01.mkv"}, {Name: "a.S01E01.chs.ass"}, {Name: "a.S01E02.mkv"}, {Name: "a.S01E02.srt"}, {Name: "sub", IsDir: true}},
+		"/lib/Show/Season 1": {{Name: "a.S01E01.mkv"}, {Name: "a.S01E01.chs.ass", Size: 123}, {Name: "a.S01E02.mkv"}, {Name: "a.S01E02.srt"}, {Name: "sub", IsDir: true}},
 		"/lib/films":         {{Name: "F.mkv"}, {Name: "F.eng.srt"}, {Name: "G.srt"}},
 	}
 	list := func(_ context.Context, p string) ([]identify.Entry, error) {
@@ -60,7 +60,7 @@ func TestRecordSidecarsReplacesPerItem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got[show.ID]) != 2 || got[show.ID][0].Video != "Season 1/a.S01E01.mkv" || got[show.ID][0].Path != "Season 1/a.S01E01.chs.ass" ||
+	if len(got[show.ID]) != 2 || got[show.ID][0].Video != "Season 1/a.S01E01.mkv" || got[show.ID][0].Path != "Season 1/a.S01E01.chs.ass" || got[show.ID][0].Size != 123 ||
 		got[show.ID][1].Path != "Season 1/a.S01E02.srt" {
 		t.Errorf("show: %+v", got[show.ID])
 	}
@@ -69,7 +69,7 @@ func TestRecordSidecarsReplacesPerItem(t *testing.T) {
 	}
 
 	// a rescan that no longer finds a subtitle drops it; a failed listing keeps the rows
-	tree["/lib/Show/Season 1"] = []identify.Entry{{Name: "a.S01E01.mkv"}, {Name: "a.S01E01.chs.ass"}, {Name: "a.S01E02.mkv"}}
+	tree["/lib/Show/Season 1"] = []identify.Entry{{Name: "a.S01E01.mkv"}, {Name: "a.S01E01.chs.ass", Size: 123}, {Name: "a.S01E02.mkv"}}
 	recordSidecars(ctx, show, []string{"Season 1/a.S01E01.mkv", "Season 1/a.S01E02.mkv"}, list)
 	delete(tree, "/lib/films")
 	recordSidecars(ctx, file, []string{"F.mkv"}, list)
