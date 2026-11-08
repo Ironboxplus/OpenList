@@ -144,3 +144,31 @@ Handles multiple scenarios in priority order:
 For sequential multipart uploads (115_open, baidu_netdisk, aliyundrive_open, etc.), `hybridSectionReader.GetSectionReader` launches a background goroutine to pre-read the next chunk while the caller uploads the current one. The next call picks up the prefetched block; mismatched offsets fall back to synchronous read. Prefetch is clamped to remaining file size, drains on `DiscardSection`, and surfaces errors on the next `GetSectionReader`. Cleanup is registered via `file.Add` so the goroutine is drained before `HybridCache` is freed.
 
 Drivers that already use `errgroup.Lifecycle` (e.g. 123/upload.go) with `Before` (List/GetSectionReader) and `Do` (upload) get overlap from the lifecycle pattern itself; the section-reader prefetch helps drivers that loop sequentially without Before/Do split (e.g. 115_open, which requires `oss.Sequential()`).
+
+---
+
+## Per-storage Proxy User-Agent — Override the Request Header Before `fs.Link`
+
+**Rule**: to override the upstream User-Agent for a proxy download, set it on the **incoming HTTP request** (`r.Header["User-Agent"]`) **before** calling `fs.Link` / `op.Link`. Never mutate `link.Header` after the fact.
+
+**Why post-link mutation is wrong**:
+
+1. **Link cache pollution**: `op.Link` caches the returned `*model.Link` pointer. If you write to `link.Header` after `fs.Link` returns, the mutated header persists in the cache. The next request that hits the cache inherits the stale UA — clearing the config field has no effect until the cache entry expires.
+2. **Data race**: `link.Header` is an `http.Header` (a `map[string][]string`). Concurrent downloads share the same cached pointer, so concurrent writes to `link.Header` are an unsynchronized map mutation.
+3. **115 `LinkCacheUA` signing**: `drivers/115_open` sets `LinkCacheMode: LinkCacheUA` in its `Meta`. This means `op.Link` keys the link cache on the UA extracted from `args.Header` and signs the CDN download URL with that UA at `Link()` time. A post-link UA change is invisible to the signing step and produces a URL/UA mismatch that 115's CDN will reject.
+
+**Correct pattern** (`server/common/proxy.go` `ApplyProxyUserAgent`):
+
+```go
+// Called in down.go Proxy() and webdav.go native-proxy path,
+// BEFORE fs.Link / op.Link:
+func ApplyProxyUserAgent(r *http.Request, storage *model.Storage) {
+    if ua := storage.ProxyUserAgent; ua != "" {
+        r.Header.Set("User-Agent", ua)
+    }
+}
+```
+
+`fs.Link` receives the modified `r.Header` via `model.LinkArgs{Header: r.Header}`, so 115's `DownURL` signing and the UA-keyed cache both see the correct value. Transparent-proxy drivers apply the request UA via `net.ProcessHeader(requestHeader, link.Header)`. A driver that pins its own UA in `link.Header` (e.g. to satisfy a CDN auth requirement) still wins — `ProcessHeader` applies `link.Header` last, overriding the request header.
+
+**Storage config**: `proxy_user_agent` is a column on the embedded `Proxy` struct in `internal/model/storage.go` (GORM auto-migrated). Empty = passthrough client UA. Set via the storage form (surfaced by `getMainItems()` in `internal/op/driver.go`).

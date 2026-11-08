@@ -11,6 +11,17 @@ import (
 type Obj sdk.GetFilesResp_File
 
 // Thumb implements model.Thumb.
+//
+// Only `thumb` is a real thumbnail, and 115 fills it for images only (the SDK
+// comment says 图片缩略图). Measured against the live storage on 2026-09-13:
+// every entry under /MOV — videos and folders alike — returned an empty `thumb`.
+//
+// The two neighbouring fields look like alternatives but are not. `v_img` is a
+// *static quality badge*, not a frame: every 1080p file returns the identical
+// URL http://115.com/static/plug/vq/mobile/1080p.png, so falling back to it
+// would stamp the same meaningless image on every row. `fco` (folder cover) came
+// back empty for all 82 folders under /MOV/Live. So there is no cover art to be
+// had here, and the UI must degrade to the type icon rather than pretend.
 func (o *Obj) Thumb() string {
 	return o.Thumbnail
 }

@@ -164,6 +164,21 @@ movi-player (FFmpeg WASM + WebCodecs) is the default video player. It requires C
 | Dolby Vision: purple tint | WASM decoder lacks DV enhancement layer |
 | Requires COOP/COEP headers | SharedArrayBuffer for WASM threads |
 
+**Quality overlay and movi control-bar interaction**: the top-right quality-tier dropdown in `movi_video.tsx` must remain `pointer-events:auto` / `opacity:1` while the cursor is over it, regardless of movi's control-bar visibility signal. If the overlay's pointer-events are toggled in lockstep with the control-bar, the cursor falling through to the movi element causes movi to re-show its controls, the overlay re-enables, and an infinite flicker loop results. Fix: use a separate `overlayHovered` signal so the overlay stays interactive while hovered. See JOURNAL 2026-06-28 for details.
+
+---
+
+## Subtitle Handling — Unified `/fs/video_subtitle` Endpoint
+
+**All** subtitle tracks — both sidecar files and driver-provided tracks — are sourced exclusively from `POST /api/fs/video_subtitle`. The frontend (`movi_video.tsx`) no longer computes sidecar subtitle URLs locally from `objStore.related`.
+
+**What the endpoint returns** (as of 2026-06-25):
+
+1. **Same-name sidecar subtitles** (any driver): the backend lists the video's parent directory once and returns any sibling file whose basename (without extension) matches the video's basename exactly. Recognized extensions: `srt`, `vtt`, `ass`, `ssa`, `sup`. Each subtitle is returned as a signed `/p` proxy URL so it is served same-origin. `Title` = filename without extension, `Type` = lowercased extension.
+2. **Provider tracks** (drivers implementing `VideoSubtitleProvider`, e.g. `115_open`): appended as a best-effort step. Drivers that do not implement the interface simply skip this step — no error is returned.
+
+**Frontend consumption** (`movi_video.tsx`): signals were renamed from `providerSubs` / `loadProviderSubs` / `fetchProviderSubs` to `subtitles` / `loadSubtitles` / `fetchSubtitles` when the scope widened to all drivers. The local `subtitleFiles` `createMemo` and the per-file `proxyLink` / `useLink` URL construction were removed.
+
 ---
 
 ## 115 Official Play Source (`115_video.tsx`)
