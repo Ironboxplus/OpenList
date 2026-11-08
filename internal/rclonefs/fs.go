@@ -316,12 +316,9 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, exists bo
 			}()
 			if err := op.PutInDir(ctx, storage, parent, actualDir, file, nil); err != nil {
 				// The directory may be what failed (removed behind this
-				// Fs's back): the next Put resolves it afresh, and if the
-				// driver said it is gone, not to the same one.
-				f.forgetDir(dir)
-				if errs.IsObjectNotFound(err) {
-					f.buryDir(dir, parent)
-				}
+				// Fs's back): the next Put resolves it afresh, and if it is
+				// gone, not to the same one.
+				f.dropFailedDir(ctx, storage, dir, actualDir, parent, err)
 				return nil, read.Load(), err
 			}
 			// Everything about the new object is already known; asking the
@@ -458,26 +455,31 @@ func (f *Fs) parentFailed(ctx context.Context, storage driver.Driver, parentKey,
 		f.forgetListing(parentKey)
 		return err
 	}
-	f.forgetDir(parentKey)
-	if errs.IsObjectNotFound(err) {
-		f.buryIfGone(ctx, storage, parentKey, parentActual, parent)
-	}
+	f.dropFailedDir(ctx, storage, parentKey, parentActual, parent, err)
 	return err
 }
 
-// buryIfGone buries dir, which was at full (actual on its storage) and which a
-// driver answered ObjectNotFound for, if it is not there any more. Drivers
-// also say that when a new file can't be found after the upload, which is no
-// reason to stop using a directory that is there.
-func (f *Fs) buryIfGone(ctx context.Context, storage driver.Driver, full, actual string, dir model.Obj) {
-	// Not from op's dir cache, which may still show it.
-	op.Cache.DeleteDirectory(storage, stdpath.Dir(utils.FixAndCleanPath(actual)))
-	cur, err := op.GetUnwrap(ctx, storage, actual)
-	if err == nil && cur.IsDir() && cur.GetID() == dir.GetID() {
+// dropFailedDir forgets dir, at full (actual on its storage), which an
+// operation in it failed with err for, unless err is ObjectNotFound and dir is
+// still there: drivers also say that when a new file can't be found after the
+// upload, which is no reason to stop using the directory. If dir is gone, its
+// ID isn't taken from a listing again.
+func (f *Fs) dropFailedDir(ctx context.Context, storage driver.Driver, full, actual string, dir model.Obj, err error) {
+	if !errs.IsObjectNotFound(err) {
+		f.forgetDir(full)
 		return
 	}
-	if err == nil || errs.IsObjectNotFound(err) {
+	// Not from op's dir cache, which may still show it.
+	op.Cache.DeleteDirectory(storage, stdpath.Dir(utils.FixAndCleanPath(actual)))
+	cur, getErr := op.GetUnwrap(ctx, storage, actual)
+	switch {
+	case getErr == nil && cur.IsDir() && cur.GetID() == dir.GetID():
+		return
+	case getErr == nil || errs.IsObjectNotFound(getErr):
+		f.forgetDir(full)
 		f.buryDir(full, dir)
+	default:
+		f.forgetDir(full)
 	}
 }
 
