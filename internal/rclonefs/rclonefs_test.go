@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	gosync "sync"
 	"testing"
 
 	_ "github.com/OpenListTeam/OpenList/v4/drivers/local"
@@ -285,8 +286,14 @@ func TestUploadObserverBelongsToOneFs(t *testing.T) {
 	mountLocal(t, "/obs-inner")
 	writeFile(t, src, "a.bin", strings.Repeat("a", 100*1024))
 	writeFile(t, src, "b.bin", strings.Repeat("b", 3))
+	// rclone transfers in parallel, so the observer is called concurrently.
+	var mu gosync.Mutex
 	var outer []rclonefs.Upload
-	outerFs, err := rclonefs.NewFs(ctx, "/obs-outer", rclonefs.WithUploadObserver(func(u rclonefs.Upload) { outer = append(outer, u) }))
+	outerFs, err := rclonefs.NewFs(ctx, "/obs-outer", rclonefs.WithUploadObserver(func(u rclonefs.Upload) {
+		mu.Lock()
+		defer mu.Unlock()
+		outer = append(outer, u)
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
