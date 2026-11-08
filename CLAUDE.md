@@ -17,7 +17,7 @@ Primary development guide for the Go backend. See [../INDEX.MD](../INDEX.MD) for
 
 | Directory | Repo | Branch | Remote |
 |-----------|------|--------|--------|
-| `OP/` | [Ironboxplus/OpenList](https://github.com/Ironboxplus/OpenList) | `feat/dynamic-frontend` | origin (fork), op (upstream: OpenListTeam/OpenList) |
+| `OP/` | [Ironboxplus/OpenList](https://github.com/Ironboxplus/OpenList) | `main` | origin (fork), op (upstream: OpenListTeam/OpenList) |
 | `OpenList-Frontend/` | [Ironboxplus/OpenList-Frontend](https://github.com/Ironboxplus/OpenList-Frontend) | `main` | origin (upstream), ironbox (fork) |
 | `movi-player/` | Local fork of [MrUjjwalG/movi-player](https://github.com/MrUjjwalG/movi-player) | `main` | — |
 | `115-sdk-go/` | [Ironboxplus/115-sdk-go](https://github.com/Ironboxplus/115-sdk-go) | — | — |
