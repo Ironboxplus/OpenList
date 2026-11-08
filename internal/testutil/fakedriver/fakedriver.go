@@ -37,6 +37,10 @@ type Driver struct {
 
 	Gets, Lists, MakeDirs, Puts atomic.Int32
 
+	// ListPaths records the driver-side path of every directory List was asked
+	// for, in order.
+	ListPaths []string
+
 	// FailPut, when set, is asked before each Put with the driver-side path
 	// of the file; a non-nil error fails the Put and stores nothing.
 	FailPut func(path string) error
@@ -52,6 +56,13 @@ type Driver struct {
 	// LagDeletes, with CloudLike, keeps a removed directory in its parent's
 	// listing, as a drive slow to reflect a delete does; Get doesn't find it.
 	LagDeletes bool
+	// PathIDs, with CloudLike, gives each node its path as ID, as drives do
+	// whose IDs are paths: a directory made again at a removed one's path has
+	// the same ID.
+	PathIDs bool
+	// PutReportsNotFound makes Put return ObjectNotFound after the file is
+	// stored, as drivers do that can't find the new file after the upload.
+	PutReportsNotFound bool
 	// OnMakeDir, when set, is called with the path of each MakeDir before it
 	// is carried out (to let another writer take the name first).
 	OnMakeDir func(path string)
@@ -84,7 +95,22 @@ func (d *Driver) ResetCounts() {
 	d.Puts.Store(0)
 	d.mu.Lock()
 	d.GetPaths = nil
+	d.ListPaths = nil
 	d.mu.Unlock()
+}
+
+// ListCount returns how often the directory at path was listed since the last
+// ResetCounts.
+func (d *Driver) ListCount(path string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	n := 0
+	for _, p := range d.ListPaths {
+		if p == path {
+			n++
+		}
+	}
+	return n
 }
 
 // Content returns what was stored at path, if anything.
@@ -112,7 +138,7 @@ func (d *Driver) AddFile(path, content string) {
 
 func (d *Driver) newNode(path string, dir bool, size int64) *model.Object {
 	id := path
-	if d.CloudLike {
+	if d.CloudLike && !d.PathIDs {
 		d.seq++
 		id = fmt.Sprintf("%s#%d", path, d.seq)
 	}
@@ -143,6 +169,7 @@ func (d *Driver) List(_ context.Context, dir model.Obj, _ model.ListArgs) ([]mod
 	d.Lists.Add(1)
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.ListPaths = append(d.ListPaths, dir.GetPath())
 	var out []model.Obj
 	for _, nodes := range []map[string]*model.Object{d.nodes, d.ghosts} {
 		for p, n := range nodes {
@@ -225,6 +252,9 @@ func (d *Driver) Put(_ context.Context, parent model.Obj, file model.FileStreame
 	d.nodes[p] = n
 	d.data[p] = b
 	up(100)
+	if d.PutReportsNotFound {
+		return nil, errs.ObjectNotFound
+	}
 	c := *n
 	return &c, nil
 }

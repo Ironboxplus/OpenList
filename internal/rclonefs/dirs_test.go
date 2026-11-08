@@ -2,13 +2,17 @@ package rclonefs_test
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/rclonefs"
 	"github.com/OpenListTeam/OpenList/v4/internal/testutil/fakedriver"
 	"github.com/rclone/rclone/fs/accounting"
+	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fs/sync"
 )
@@ -59,9 +63,10 @@ func TestNewTreeCostsAListingAndAMakeDirPerDir(t *testing.T) {
 	if g := d.Gets.Load(); g > 1 {
 		t.Fatalf("Getter called %d times, want <= 1", g)
 	}
-	// the parent of each new directory, once
-	if l := d.Lists.Load(); l > 5 {
-		t.Fatalf("driver List called %d times, want <= 5", l)
+	// only the storage root, which already was there, is listed: what is made
+	// by this Fs is empty and needs no look
+	if l := d.Lists.Load(); l > 1 {
+		t.Fatalf("driver List called %d times, want <= 1", l)
 	}
 }
 
@@ -220,4 +225,114 @@ func TestFileInTheWayOfADirIsAnError(t *testing.T) {
 		t.Fatal("Mkdir over a file succeeded")
 	}
 	wantContent(t, d, "/new/a", "not a dir")
+}
+
+func putString(ctx context.Context, f *rclonefs.Fs, remote, content string) error {
+	info := object.NewStaticObjectInfo(remote, time.Now(), int64(len(content)), true, nil, nil)
+	_, err := f.Put(ctx, strings.NewReader(content), info)
+	return err
+}
+
+// Making many sibling directories in a parent that already holds many entries
+// lists the parent once, not once per directory (on 115 a listing is a page
+// per 1000 entries at one request a second).
+func TestSiblingDirsInAnExistingParentListItOnce(t *testing.T) {
+	ctx := noHookCtx(t)
+	d := mountFake(t, "/wide")
+	d.CloudLike = true
+	d.AddDir("/new")
+	for i := 0; i < 20; i++ {
+		d.AddFile(fmt.Sprintf("/new/old%02d.txt", i), "old")
+	}
+	olFs, err := rclonefs.NewFs(ctx, "/wide/new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.ResetCounts()
+	for i := 0; i < 6; i++ {
+		if err := putString(ctx, olFs, fmt.Sprintf("d%d/x.txt", i), "x"); err != nil {
+			t.Fatalf("put into d%d: %v", i, err)
+		}
+	}
+	t.Logf("lists of /new=%d mkdirs=%d", d.ListCount("/new"), d.MakeDirs.Load())
+	for i := 0; i < 6; i++ {
+		wantContent(t, d, fmt.Sprintf("/new/d%d/x.txt", i), "x")
+	}
+	if n := d.MakeDirs.Load(); n != 6 {
+		t.Fatalf("MakeDir called %d times, want 6", n)
+	}
+	if n := d.ListCount("/new"); n > 1 {
+		t.Fatalf("/new listed %d times for 6 new siblings, want <= 1", n)
+	}
+	// A name that turns out to be taken makes the next one look afresh.
+	d.AddDir("/new/late")
+	if err := putString(ctx, olFs, "late/y.txt", "y"); err != nil {
+		t.Fatalf("put into late: %v", err)
+	}
+	wantContent(t, d, "/new/late/y.txt", "y")
+}
+
+// A driver that answers ObjectNotFound for a file it did store doesn't make
+// the directory it is in a removed one: it is used again, not made again.
+func TestNotFoundAfterAPutDoesNotBuryTheDir(t *testing.T) {
+	ctx := noHookCtx(t)
+	d := mountFake(t, "/nf")
+	d.CloudLike = true
+	d.PutReportsNotFound = true
+	olFs, err := rclonefs.NewFs(ctx, "/nf/new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := olFs.Mkdir(ctx, "a"); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	d.ResetCounts()
+	for i := 0; i < 3; i++ {
+		// the error is the driver's; where the file went is what matters
+		_ = putString(ctx, olFs, fmt.Sprintf("a/f%d.txt", i), "f")
+	}
+	for i := 0; i < 3; i++ {
+		wantContent(t, d, fmt.Sprintf("/new/a/f%d.txt", i), "f")
+	}
+	if n := d.MakeDirs.Load(); n != 0 {
+		t.Fatalf("MakeDir called %d times for a directory that was there, want 0", n)
+	}
+}
+
+// On a drive whose IDs are paths, a directory someone else made again where
+// this Fs removed one has the removed one's ID. It is still taken as it is
+// found, not looked for again for every file.
+func TestDirMadeAgainByAnotherWriterAtTheSamePath(t *testing.T) {
+	ctx := noHookCtx(t)
+	d := mountFake(t, "/pid")
+	d.CloudLike, d.PathIDs = true, true
+	src := t.TempDir()
+	writeFile(t, src, "a/b/y.txt", "y")
+	olFs, err := rclonefs.NewFs(ctx, "/pid/new")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sync.CopyDir(ctx, olFs, localFs(t, src), false); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	if err := operations.Purge(ctx, olFs, "a/b"); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	d.AddDir("/new/a/b")
+	d.ResetCounts()
+	for i := 0; i < 3; i++ {
+		if err := putString(ctx, olFs, fmt.Sprintf("a/b/f%d.txt", i), "f"); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	t.Logf("gets=%d lists=%d mkdirs=%d", d.Gets.Load(), d.Lists.Load(), d.MakeDirs.Load())
+	for i := 0; i < 3; i++ {
+		wantContent(t, d, fmt.Sprintf("/new/a/b/f%d.txt", i), "f")
+	}
+	if n := d.MakeDirs.Load(); n > 1 {
+		t.Fatalf("MakeDir called %d times for 3 files, want <= 1", n)
+	}
+	if n := d.Lists.Load(); n > 1 {
+		t.Fatalf("driver List called %d times for 3 files, want <= 1", n)
+	}
 }
