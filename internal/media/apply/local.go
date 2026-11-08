@@ -59,7 +59,7 @@ func (w LocalWriter) Existing(_ context.Context, prefix string) (map[string]Exis
 	for i := range items {
 		it := &items[i]
 		p := db.MediaItemPath(it)
-		e := Existing{Path: p, Kind: it.VideoType, Title: it.ScrapedName, Locked: it.Locked, Confidence: it.Confidence}
+		e := Existing{Path: p, Kind: it.VideoType, Title: it.ScrapedName, Locked: it.Locked, Confidence: it.Confidence, HasBackdrop: it.Backdrop != ""}
 		if it.ExternalIDs != "" {
 			_ = json.Unmarshal([]byte(it.ExternalIDs), &e.ExternalIDs)
 		}

@@ -46,6 +46,8 @@ type Existing struct {
 	Confidence float32 `json:"confidence"`
 	// ExternalIDs are the provider ids of a matched work (tmdb "tv/890", imdb "tt...").
 	ExternalIDs map[string]string `json:"external_ids,omitempty"`
+	// HasBackdrop is set by the in-process writer only.
+	HasBackdrop bool `json:"-"`
 }
 
 // Writer reads and writes the media store.

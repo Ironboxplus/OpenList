@@ -24,6 +24,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
+	logrus "github.com/sirupsen/logrus"
 )
 
 // The curate API is what `openlist media` talks to (and what an admin UI can
@@ -366,6 +367,42 @@ func CurateScrape(c *gin.Context) {
 		return
 	}
 	common.SuccessResp(c, res)
+}
+
+// CurateBackfillBackdrop fills the missing backdrop of works already matched to
+// TMDB (one detail request each, in order) without identifying them again.
+// Locked works and works with a backdrop are skipped. prefix defaults to "/".
+// It runs inside the request and can take minutes on a large library.
+func CurateBackfillBackdrop(c *gin.Context) {
+	var req struct {
+		Prefix string `json:"prefix"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	if !MediaEnabled() {
+		common.ErrorStrResp(c, "media scraping is disabled (media_enabled)", 400)
+		return
+	}
+	set, err := mediaScraperSet()
+	if err != nil {
+		common.ErrorResp(c, err, 500, true)
+		return
+	}
+	dl, err := mediaDownloader()
+	if err != nil {
+		common.ErrorResp(c, err, 500, true)
+		return
+	}
+	o := &apply.Orchestrator{
+		Writer: apply.LocalWriter{Store: mediaStore()}, Providers: set, Download: dl,
+		Logf: func(f string, a ...any) { logrus.Warnf("[media] "+f, a...) },
+	}
+	prefix := path.Clean("/" + strings.TrimLeft(strings.ReplaceAll(req.Prefix, "\\", "/"), "/"))
+	rep, err := o.BackfillBackdrops(c.Request.Context(), prefix)
+	if err != nil {
+		mediaErr(c, err)
+		return
+	}
+	common.SuccessResp(c, rep)
 }
 
 // CurateSearch searches one provider for the manual-pick UI.

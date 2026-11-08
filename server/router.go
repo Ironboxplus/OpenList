@@ -254,6 +254,7 @@ func admin(g *gin.RouterGroup) {
 	curate.GET("/list", handles.CurateList)
 	curate.POST("/image", handles.CurateImage)
 	curate.POST("/scrape", handles.CurateScrape)
+	curate.POST("/backfill_backdrop", handles.CurateBackfillBackdrop)
 	curate.GET("/search", handles.CurateSearch)
 	curate.POST("/export_nfo", handles.CurateExportNFO)
 
