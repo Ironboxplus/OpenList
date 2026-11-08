@@ -139,3 +139,9 @@ func (o *Orchestrator) classify(ctx context.Context, p, name string, isDir bool,
 	}
 	return cl.Classify(ctx, name, isDir, entries)
 }
+
+// EpisodeReader is implemented by Writers that can read the episodes a work
+// has (the in-process one). The backfill of stills needs it.
+type EpisodeReader interface {
+	Episodes(ctx context.Context, path string) ([]model.MediaEpisodeIn, error)
+}

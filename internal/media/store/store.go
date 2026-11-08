@@ -188,6 +188,17 @@ func pathExt(name string) string {
 	return ""
 }
 
+// ValidImageRole reports whether role names an image of a work: "poster",
+// "backdrop" or the still of an episode ("still-<season>-<episode>").
+func ValidImageRole(role string) bool {
+	if role == "poster" || role == "backdrop" {
+		return true
+	}
+	var s, e int
+	n, err := fmt.Sscanf(role, "still-%d-%d", &s, &e)
+	return err == nil && n == 2 && role == fmt.Sprintf("still-%d-%d", s, e)
+}
+
 // SaveImage stores a poster or backdrop for the work at path as a cover and
 // returns the cover reference to put in MediaItem.Cover or Backdrop. role keeps
 // the two apart ("poster" or "backdrop"). Where it goes follows the library's
@@ -200,9 +211,12 @@ func (s *Store) SaveImage(ctx context.Context, path, role string, data []byte) (
 	if !strings.HasPrefix(mime, "image/") {
 		return "", fmt.Errorf("not an image (%s)", mime)
 	}
+	if !ValidImageRole(role) {
+		return "", fmt.Errorf("unknown image role %q", role)
+	}
 	key := NormalizePath(path)
-	if role == "backdrop" {
-		key += "#backdrop"
+	if role != "poster" {
+		key += "#" + role
 	}
 	cover := scraper.SaveThumb(ctx, s.ThumbMode, s.ThumbPath, key, mime, data)
 	if cover == "" {

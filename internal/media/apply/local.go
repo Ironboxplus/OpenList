@@ -80,3 +80,20 @@ func (w LocalWriter) Set(_ context.Context, req model.MediaSetReq, force bool) e
 	}
 	return err
 }
+
+// Episodes returns the stored episodes of the work at p.
+func (w LocalWriter) Episodes(_ context.Context, p string) ([]model.MediaEpisodeIn, error) {
+	it, err := db.GetVideoItemByPath(store.NormalizePath(p))
+	if err != nil || it == nil {
+		return nil, err
+	}
+	rows, err := db.ListMediaEpisodes(it.ID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]model.MediaEpisodeIn, 0, len(rows))
+	for _, e := range rows {
+		out = append(out, model.MediaEpisodeIn{FileName: e.FileName, Season: e.Season, Episode: e.Episode, Title: e.Title, Overview: e.Overview, Still: e.Still, Version: e.Version})
+	}
+	return out, nil
+}

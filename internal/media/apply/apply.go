@@ -142,29 +142,19 @@ func (o *Orchestrator) fillRequest(ctx context.Context, req *model.MediaSetReq, 
 		if img.url == "" {
 			continue
 		}
-		if o.Download == nil {
-			// no way to fetch here: the work keeps the provider's URL
-			*img.dst = ptr(img.url)
-			continue
-		}
-		data, err := o.Download(ctx, img.url)
+		cover, err := o.fetchImage(ctx, row.Path, img.role, img.url)
 		if err != nil {
 			if fatal(err) {
 				return err
 			}
-			*warns = append(*warns, "image: "+scraper.MaskSecrets(err.Error()))
-			continue
-		}
-		cover, err := o.Writer.SaveImage(ctx, row.Path, img.role, data)
-		if err != nil {
-			*warns = append(*warns, "upload: "+err.Error())
+			*warns = append(*warns, scraper.MaskSecrets(err.Error()))
 			continue
 		}
 		*img.dst = ptr(cover)
 	}
 
 	if (row.Kind == "tv" || row.Kind == "anime") && o.Lister != nil && tg.Kind != "movie" && !strings.HasPrefix(tg.ExternalIDs[scraper.ProviderTMDB], "movie/") {
-		eps, err := o.mapEpisodes(ctx, row.Path, tg)
+		eps, err := o.mapEpisodes(ctx, row.Path, tg, warns)
 		if err != nil {
 			if fatal(err) {
 				return err
@@ -178,10 +168,34 @@ func (o *Orchestrator) fillRequest(ctx context.Context, req *model.MediaSetReq, 
 	return nil
 }
 
+// fetchImage downloads a provider image and stores it as the work's role image
+// (poster, backdrop, or a still), returning the reference to keep. Without a
+// downloader the work keeps the provider's URL.
+func (o *Orchestrator) fetchImage(ctx context.Context, itemPath, role, url string) (string, error) {
+	if o.Download == nil {
+		return url, nil
+	}
+	data, err := o.Download(ctx, url)
+	if err != nil {
+		return "", fmt.Errorf("image: %w", err)
+	}
+	cover, err := o.Writer.SaveImage(ctx, itemPath, role, data)
+	if err != nil {
+		return "", fmt.Errorf("upload: %w", err)
+	}
+	return cover, nil
+}
+
+// StillRole is the image role of the still of an episode.
+func StillRole(season, episode int) string { return fmt.Sprintf("still-%d-%d", season, episode) }
+
+// maxStillFailures is how many stills of one work may fail before the rest are left.
+const maxStillFailures = 3
+
 // mapEpisodes lists the item's directory (and its season directories, one
 // level) and pairs every episode-looking video with the provider's episode
 // info by season and number.
-func (o *Orchestrator) mapEpisodes(ctx context.Context, itemPath string, tg *scraper.ScrapeTarget) ([]model.MediaEpisodeIn, error) {
+func (o *Orchestrator) mapEpisodes(ctx context.Context, itemPath string, tg *scraper.ScrapeTarget, warns *[]string) ([]model.MediaEpisodeIn, error) {
 	info, ierr := o.Providers.Episodes(ctx, tg)
 	byKey := map[[2]int]scraper.EpisodeInfo{}
 	for _, e := range info {
@@ -195,10 +209,28 @@ func (o *Orchestrator) mapEpisodes(ctx context.Context, itemPath string, tg *scr
 		return nil, fmt.Errorf("list %s: %w", itemPath, err)
 	}
 	out := make([]model.MediaEpisodeIn, 0, len(files))
+	stills := map[[2]int]string{} // one image per season and number; versions share it
+	stillFailed := 0
 	for _, f := range files {
 		ep := model.MediaEpisodeIn{FileName: f.Rel, Season: f.Season, Episode: f.Episode, Version: f.Version}
-		if in, found := byKey[[2]int{f.Season, f.Episode}]; found {
+		k := [2]int{f.Season, f.Episode}
+		if in, found := byKey[k]; found {
 			ep.Title, ep.Overview = in.Title, in.Overview
+			if in.StillURL != "" && stillFailed < maxStillFailures {
+				if _, done := stills[k]; !done {
+					cover, err := o.fetchImage(ctx, itemPath, StillRole(f.Season, f.Episode), in.StillURL)
+					if err != nil {
+						if fatal(err) {
+							return nil, err
+						}
+						if stillFailed++; stillFailed == maxStillFailures {
+							*warns = append(*warns, "stills: giving up after "+scraper.MaskSecrets(err.Error()))
+						}
+					}
+					stills[k] = cover
+				}
+				ep.Still = stills[k]
+			}
 		}
 		out = append(out, ep)
 	}

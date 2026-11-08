@@ -282,8 +282,8 @@ func CurateList(c *gin.Context) {
 func CurateImage(c *gin.Context) {
 	p := strings.TrimSpace(c.Query("path"))
 	role := c.DefaultQuery("role", "poster")
-	if p == "" || (role != "poster" && role != "backdrop") {
-		common.ErrorStrResp(c, "path and role (poster or backdrop) are required", 400)
+	if p == "" || !store.ValidImageRole(role) {
+		common.ErrorStrResp(c, "path and role (poster, backdrop or still-S-E) are required", 400)
 		return
 	}
 	var data []byte
@@ -369,11 +369,11 @@ func CurateScrape(c *gin.Context) {
 	common.SuccessResp(c, res)
 }
 
-// CurateBackfillBackdrop fills the missing backdrop of works already matched to
-// TMDB (one detail request each, in order) without identifying them again.
-// Locked works and works with a backdrop are skipped. prefix defaults to "/".
+// CurateBackfillArtwork fills the missing backdrop and episode stills of works already matched to
+// TMDB (one detail request each, plus one per season, in order) without identifying them again.
+// Locked works are skipped and only empty fields are filled. prefix defaults to "/".
 // It runs inside the request and can take minutes on a large library.
-func CurateBackfillBackdrop(c *gin.Context) {
+func CurateBackfillArtwork(c *gin.Context) {
 	var req struct {
 		Prefix string `json:"prefix"`
 	}
@@ -397,7 +397,7 @@ func CurateBackfillBackdrop(c *gin.Context) {
 		Logf: func(f string, a ...any) { logrus.Warnf("[media] "+f, a...) },
 	}
 	prefix := path.Clean("/" + strings.TrimLeft(strings.ReplaceAll(req.Prefix, "\\", "/"), "/"))
-	rep, err := o.BackfillBackdrops(c.Request.Context(), prefix)
+	rep, err := o.BackfillArtwork(c.Request.Context(), prefix)
 	if err != nil {
 		mediaErr(c, err)
 		return

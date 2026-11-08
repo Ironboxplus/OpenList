@@ -23,3 +23,14 @@ func TestLoadImageDataURIAndRejects(t *testing.T) {
 		}
 	}
 }
+
+func TestBangumiImageHostIsAllowedButNotLookalikes(t *testing.T) {
+	for host, want := range map[string]bool{
+		"lain.bgm.tv": true, "bgm.tv": true, "image.tmdb.org": true,
+		"evilbgm.tv": false, "bgm.tv.evil.com": false, "127.0.0.1": false,
+	} {
+		if got := hostAllowed(host); got != want {
+			t.Errorf("hostAllowed(%q) = %v, want %v", host, got, want)
+		}
+	}
+}

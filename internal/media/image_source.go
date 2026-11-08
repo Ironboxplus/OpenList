@@ -29,6 +29,7 @@ const MaxImageSize = 8 << 20
 var coverAllowedHosts = []string{
 	"image.tmdb.org",
 	"tmdb.org",
+	"bgm.tv", // lain.bgm.tv: posters of the Bangumi provider
 	"doubanio.com",
 	"douban.com",
 	"discogs.com",
