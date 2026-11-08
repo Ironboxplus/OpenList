@@ -53,6 +53,8 @@ type StrmTarget struct {
 	RelPath     string // 相对输出目录的路径
 	RawPath     string // 对应媒体文件的 VFS 路径
 	SameDirPath string // 与媒体文件同目录时的 .strm 路径
+	Season      int    // 剧集：文件名里的季（其余类型为 0）
+	Episode     int    // 剧集：文件名里的集
 }
 
 // strmSibling 计算与媒体文件同目录、同名的 .strm 路径
@@ -197,6 +199,8 @@ func episodeTargets(item *model.MediaItem, series, folder string, eps []model.Me
 			RelPath:     stdpath.Join(series, fmt.Sprintf("Season %02d", season), name+".strm"),
 			RawPath:     epRaw,
 			SameDirPath: strmSibling(epRaw, false),
+			Season:      season,
+			Episode:     num,
 		})
 	}
 	return out
@@ -236,6 +240,8 @@ func StrmTargetsWithEpisodes(item *model.MediaItem, eps []model.MediaEpisode) []
 							fmt.Sprintf("%s S%02dE%02d - %s.strm", series, season, num, epTitle)),
 						RawPath:     epRaw,
 						SameDirPath: strmSibling(epRaw, false),
+						Season:      season,
+						Episode:     num,
 					})
 				}
 				return out
@@ -250,6 +256,8 @@ func StrmTargetsWithEpisodes(item *model.MediaItem, eps []model.MediaEpisode) []
 					fmt.Sprintf("%s S%02dE%02d.strm", series, season, num)),
 				RawPath:     raw,
 				SameDirPath: strmSibling(raw, false),
+				Season:      season,
+				Episode:     num,
 			}}
 		}
 		name := title
