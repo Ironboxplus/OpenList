@@ -42,6 +42,17 @@ type Fs struct {
 	// the ID it had there, so that a listing which still shows it (a drive
 	// that is slow to reflect a delete) isn't taken for the directory itself.
 	gone sync.Map
+	// knownMu guards made and listed.
+	knownMu sync.Mutex
+	// made holds the directories this Fs made itself. Nothing was in them
+	// before, so a directory made below one goes in without listing it first
+	// (one writer per tree: if another got there first the driver says the name
+	// is taken, and the path is resolved the checked way).
+	made map[string]struct{}
+	// listed holds, for each directory that was there already, what one fresh
+	// listing of it showed, by name: the next sibling to make looks there
+	// instead of listing a parent of thousands of entries again.
+	listed map[string]map[string][]model.Obj
 	// observer, when set, is told about every finished Put on this Fs.
 	observer func(Upload)
 }
@@ -54,7 +65,11 @@ var (
 // NewFs returns an rclone Fs rooted at the OpenList mount path root. The root
 // does not have to exist yet; rclone creates it on the first write.
 func NewFs(ctx context.Context, root string, opts ...Option) (*Fs, error) {
-	f := &Fs{root: utils.FixAndCleanPath(root)}
+	f := &Fs{
+		root:   utils.FixAndCleanPath(root),
+		made:   map[string]struct{}{},
+		listed: map[string]map[string][]model.Obj{},
+	}
 	for _, o := range opts {
 		o(f)
 	}
@@ -173,13 +188,19 @@ func (f *Fs) isGone(full string, obj model.Obj) bool {
 	return ok && obj.GetID() != "" && obj.GetID() == id.(string)
 }
 
+// within reports whether p is full or below it.
+func within(p, full string) bool {
+	return p == full || strings.HasPrefix(p, strings.TrimSuffix(full, "/")+"/")
+}
+
 // forgetDir drops dir and everything remembered below it, and returns what
-// was remembered for dir itself, if anything.
+// was remembered for dir itself, if anything. What was listed of its parent
+// may be out of date too.
 func (f *Fs) forgetDir(full string) model.Obj {
 	full = utils.FixAndCleanPath(full)
 	var dir model.Obj
 	f.dirs.Range(func(k, v any) bool {
-		if p := k.(string); p == full || strings.HasPrefix(p, strings.TrimSuffix(full, "/")+"/") {
+		if p := k.(string); within(p, full) {
 			if p == full {
 				dir = v.(model.Obj)
 			}
@@ -187,7 +208,64 @@ func (f *Fs) forgetDir(full string) model.Obj {
 		}
 		return true
 	})
+	f.knownMu.Lock()
+	defer f.knownMu.Unlock()
+	for p := range f.made {
+		if within(p, full) {
+			delete(f.made, p)
+		}
+	}
+	for p := range f.listed {
+		if within(p, full) {
+			delete(f.listed, p)
+		}
+	}
+	delete(f.listed, stdpath.Dir(full))
 	return dir
+}
+
+func (f *Fs) isMade(key string) bool {
+	f.knownMu.Lock()
+	defer f.knownMu.Unlock()
+	_, ok := f.made[key]
+	return ok
+}
+
+func (f *Fs) markMade(key string) {
+	f.knownMu.Lock()
+	defer f.knownMu.Unlock()
+	f.made[key] = struct{}{}
+}
+
+func (f *Fs) forgetListing(key string) {
+	f.knownMu.Lock()
+	defer f.knownMu.Unlock()
+	delete(f.listed, key)
+}
+
+// listParent returns what is in the directory parent at parentKey by name,
+// from the one fresh listing this Fs took of it, or takes it now. Fresh, not
+// op's dir cache: a directory deleted since it was cached must not be handed
+// out as the parent of new files.
+func (f *Fs) listParent(ctx context.Context, storage driver.Driver, parent model.Obj, parentKey, parentActual string) (map[string][]model.Obj, error) {
+	f.knownMu.Lock()
+	byName, ok := f.listed[parentKey]
+	f.knownMu.Unlock()
+	if ok {
+		return byName, nil
+	}
+	objs, err := op.ListIn(ctx, storage, parent, parentActual, model.ListArgs{Refresh: true})
+	if err != nil {
+		return nil, err
+	}
+	byName = make(map[string][]model.Obj, len(objs))
+	for _, o := range objs {
+		byName[o.GetName()] = append(byName[o.GetName()], o)
+	}
+	f.knownMu.Lock()
+	f.listed[parentKey] = byName
+	f.knownMu.Unlock()
+	return byName, nil
 }
 
 // Put is only called by rclone for a destination that does not exist, so it
@@ -309,6 +387,10 @@ func (f *Fs) ensureDirLocked(ctx context.Context, key string) (model.Obj, error)
 		if obj, err = f.makeChecked(ctx, storage, actualDir); err != nil {
 			return nil, err
 		}
+		// The checked lookup found the directory at key: whoever put it there,
+		// it isn't the one this Fs removed, even if a drive whose IDs are paths
+		// gives it the same ID.
+		f.gone.Delete(key)
 	}
 	f.rememberDir(key, obj)
 	return obj, nil
@@ -330,27 +412,28 @@ func (f *Fs) makeInParent(ctx context.Context, storage driver.Driver, key, actua
 	if err != nil {
 		return nil, true, err
 	}
-	// Fresh, not op's dir cache: a directory deleted since it was cached must
-	// not be handed out as the parent of new files.
-	objs, err := op.ListIn(ctx, storage, parent, parentActual, model.ListArgs{Refresh: true})
-	if err != nil {
-		return nil, true, f.parentFailed(parentKey, parent, err)
-	}
-	var file model.Obj
-	for _, o := range objs {
-		if o.GetName() != name || f.isGone(key, o) {
-			continue
+	// A directory this Fs made holds nothing yet; any other is listed, once.
+	if !f.isMade(parentKey) {
+		byName, err := f.listParent(ctx, storage, parent, parentKey, parentActual)
+		if err != nil {
+			return nil, true, f.parentFailed(ctx, storage, parentKey, parentActual, parent, err)
 		}
-		if o.IsDir() {
-			return model.UnwrapObjName(o), true, nil
+		var file model.Obj
+		for _, o := range byName[name] {
+			if f.isGone(key, o) {
+				continue
+			}
+			if o.IsDir() {
+				return model.UnwrapObjName(o), true, nil
+			}
+			file = o
 		}
-		file = o
-	}
-	if file != nil {
-		return nil, true, errors.WithStack(errs.NotFolder)
+		if file != nil {
+			return nil, true, errors.WithStack(errs.NotFolder)
+		}
 	}
 	if obj, err = op.MakeDirIn(ctx, storage, parent, parentActual, name); err != nil {
-		return nil, true, f.parentFailed(parentKey, parent, err)
+		return nil, true, f.parentFailed(ctx, storage, parentKey, parentActual, parent, err)
 	}
 	// Made just now: whatever was removed from here before, this is not it,
 	// even on a drive whose IDs are paths.
@@ -361,23 +444,41 @@ func (f *Fs) makeInParent(ctx context.Context, storage driver.Driver, key, actua
 			return nil, true, err
 		}
 	}
+	f.markMade(key)
 	return obj, true, nil
 }
 
 // parentFailed is told that listing the remembered directory parent, or
-// making a directory in it, failed with err, and returns err. Short of a name
-// another writer took, the parent may have been removed behind this Fs's
-// back, so it is forgotten, and if the driver says it is gone, its ID isn't
-// taken from a listing again.
-func (f *Fs) parentFailed(parentKey string, parent model.Obj, err error) error {
+// making a directory in it, failed with err, and returns err. For a name
+// another writer took, only what was listed of the parent is out of date.
+// Otherwise the parent may have been removed behind this Fs's back, so it is
+// forgotten, and if it is gone, its ID isn't taken from a listing again.
+func (f *Fs) parentFailed(ctx context.Context, storage driver.Driver, parentKey, parentActual string, parent model.Obj, err error) error {
 	if errs.IsObjectAlreadyExists(err) {
+		f.forgetListing(parentKey)
 		return err
 	}
 	f.forgetDir(parentKey)
 	if errs.IsObjectNotFound(err) {
-		f.buryDir(parentKey, parent)
+		f.buryIfGone(ctx, storage, parentKey, parentActual, parent)
 	}
 	return err
+}
+
+// buryIfGone buries dir, which was at full (actual on its storage) and which a
+// driver answered ObjectNotFound for, if it is not there any more. Drivers
+// also say that when a new file can't be found after the upload, which is no
+// reason to stop using a directory that is there.
+func (f *Fs) buryIfGone(ctx context.Context, storage driver.Driver, full, actual string, dir model.Obj) {
+	// Not from op's dir cache, which may still show it.
+	op.Cache.DeleteDirectory(storage, stdpath.Dir(utils.FixAndCleanPath(actual)))
+	cur, err := op.GetUnwrap(ctx, storage, actual)
+	if err == nil && cur.IsDir() && cur.GetID() == dir.GetID() {
+		return
+	}
+	if err == nil || errs.IsObjectNotFound(err) {
+		f.buryDir(full, dir)
+	}
 }
 
 // makeChecked makes the directory with op.MakeDir, which looks the path and
