@@ -184,9 +184,19 @@ serve_with_portmap serve-2.log
 # GETATTR/LOOKUP with the file handles this client got from the first process.
 sleep 8
 echo "handle cache dir after restart:"; find "$D/data/cfs-nfs" -type f | head -n 12
-tcpdump -i lo0 -nn -vv -c 60 'tcp port 2049' >"$D/nfs-after-restart.pcap.txt" 2>&1 &
+tcpdump -l -i lo0 -nn -vv -c 200 'tcp port 2049' >"$D/nfs-after-restart.pcap.txt" 2>&1 &
 sleep 1
-ls -l "$MNT/dir1" >/dev/null || { sleep 2; echo "--- nfs traffic of the failed ls"; cut -c1-220 "$D/nfs-after-restart.pcap.txt" | head -n 60; fail "ls after restart failed (stale file handle?)"; }
+if ! ls -l "$MNT/dir1" >/dev/null; then
+	echo "--- other lookups after the failure"
+	ls "$MNT" || true
+	ls "$MNT/big" || true
+	stat "$MNT/dir1" || true
+	sleep 2
+	echo "--- nfs traffic of the failed ls"
+	cut -c1-220 "$D/nfs-after-restart.pcap.txt" | head -n 80
+	nfsstat -c | head -n 30 || true
+	fail "ls after restart failed (stale file handle?)"
+fi
 verify "after restart, same mount"
 echo "new file after restart" >"$MNT/after-restart.txt"
 [ "$(cat "$MNT/after-restart.txt")" = "new file after restart" ] || fail "write after restart"
