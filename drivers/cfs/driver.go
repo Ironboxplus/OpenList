@@ -120,7 +120,7 @@ const backingWait = 2 * time.Minute
 // The volume of a cfs storage is opened in Init, though, so a backing storage
 // that is not mounted yet (a 115 storage still refreshing its token, say) made
 // Init fail for good with "storage not found". A storage is put in the map only
-// when its Init returned, so being found there means it has finished loading.
+// when its Init returned, so being found there means it has finished loading, and its status is final.
 // A backing storage that loaded with an error is reported at once instead of
 // waiting for it. The wait ends with ctx and after backingWait.
 func waitBacking(ctx context.Context, remote string) error {

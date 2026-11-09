@@ -135,7 +135,6 @@ func initStorage(ctx context.Context, storage model.Storage, storageDriver drive
 	if err == nil {
 		err = storageDriver.Init(ctx)
 	}
-	storagesMap.Store(driverStorage.MountPath, storageDriver)
 	if err != nil {
 		if IsUseOnlineAPI(storageDriver) {
 			driverStorage.SetStatus(utils.SanitizeHTML(err.Error()))
@@ -146,6 +145,9 @@ func initStorage(ctx context.Context, storage model.Storage, storageDriver drive
 	} else {
 		driverStorage.SetStatus(WORK)
 	}
+	// Put it in the map last: whoever finds it there must see the final status,
+	// not the one stored in the database by the previous run.
+	storagesMap.Store(driverStorage.MountPath, storageDriver)
 	MustSaveDriverStorage(storageDriver)
 	return err
 }

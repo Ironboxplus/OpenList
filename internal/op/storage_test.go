@@ -1,6 +1,7 @@
 package op_test
 
 import (
+	"fmt"
 	"context"
 	"testing"
 
@@ -85,6 +86,50 @@ func setupStorages(t *testing.T) {
 		_, err := op.CreateStorage(context.Background(), storage)
 		if err != nil {
 			t.Fatalf("failed to create storage: %+v", err)
+		}
+	}
+}
+
+// A storage is put in the map only after its status is set, so a reader that
+// finds it never sees the status the previous run left in the database.
+func TestStorageInMapHasFinalStatus(t *testing.T) {
+	ctx := context.Background()
+	for i := 0; i < 50; i++ {
+		mount := fmt.Sprintf("/final-status-%d", i)
+		row := model.Storage{Driver: "Local", MountPath: mount, Addition: `{"root_folder_path":"."}`}
+		row.SetStatus("stale error from the previous run")
+		if err := db.CreateStorage(&row); err != nil {
+			t.Fatal(err)
+		}
+		bad := make(chan string, 1)
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if st, err := op.GetStorageByMountPath(mount); err == nil {
+					if got := st.GetStorage().Status; got != op.WORK {
+						bad <- got
+					}
+					return
+				}
+			}
+		}()
+		err := op.LoadStorage(ctx, row)
+		close(stop)
+		<-done
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case got := <-bad:
+			t.Fatalf("found %s in the map with status %q", mount, got)
+		default:
 		}
 	}
 }
