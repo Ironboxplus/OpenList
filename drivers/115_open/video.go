@@ -3,6 +3,7 @@ package _115_open
 import (
 	"context"
 	"sort"
+	"strings"
 
 	sdk "github.com/OpenListTeam/115-sdk-go"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
@@ -28,23 +29,43 @@ func toVideoPlayInfos(urls []sdk.VideoPlayURL) []driver.VideoPlayInfo {
 	return infos
 }
 
+// embeddedSubtitlePrefix marks, in the title 115 reports, a track it extracted
+// from the video container; the rest of the title is the container's own.
+const embeddedSubtitlePrefix = "[内置字幕]"
+
 // toVideoSubtitleInfos maps the SDK subtitle list to driver.VideoSubtitleInfo,
-// dropping caption-map placeholder entries and any without a downloadable URL.
+// dropping caption-map placeholder entries and any without a downloadable URL
+// or a title (115 lists a blank entry after the real tracks).
+//
+// An entry whose title carries embeddedSubtitlePrefix is a container track:
+// EmbeddedTitle is the title without it, and EmbeddedOrder the entry's position
+// among the prefixed entries in the order 115 returned them, which is the order
+// of the container's subtitle streams. The position is counted before any entry
+// is dropped, so a track that is dropped still holds its slot.
 func toVideoSubtitleInfos(list []sdk.SubtitleItem) []driver.VideoSubtitleInfo {
 	infos := make([]driver.VideoSubtitleInfo, 0, len(list))
+	embedded := 0
 	for _, s := range list {
-		if s.URL == "" || s.IsCaptionMap == 1 {
+		var embeddedTitle string
+		var embeddedOrder *int
+		if rest, ok := strings.CutPrefix(s.Title, embeddedSubtitlePrefix); ok {
+			order := embedded
+			embedded++
+			if rest = strings.TrimSpace(rest); rest != "" {
+				embeddedTitle = rest
+				embeddedOrder = &order
+			}
+		}
+		if s.URL == "" || s.IsCaptionMap == 1 || s.Title == "" {
 			continue
 		}
-		title := s.Title
-		if title == "" {
-			title = s.Language
-		}
 		infos = append(infos, driver.VideoSubtitleInfo{
-			Language: s.Language,
-			Title:    title,
-			URL:      s.URL,
-			Type:     s.Type,
+			Language:      s.Language,
+			Title:         s.Title,
+			URL:           s.URL,
+			Type:          s.Type,
+			EmbeddedTitle: embeddedTitle,
+			EmbeddedOrder: embeddedOrder,
 		})
 	}
 	return infos

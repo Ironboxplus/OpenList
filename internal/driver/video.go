@@ -33,6 +33,14 @@ type VideoSubtitleInfo struct {
 	// Source tells where the track came from: "sidecar" (a subtitle file found
 	// next to the video) or "provider" (reported by the storage provider's API).
 	Source string `json:"source"`
+	// EmbeddedTitle / EmbeddedOrder are set only for a track the provider
+	// extracted from the video container itself: the container's own track
+	// title, and the track's position among the container's subtitle streams.
+	// They let a player treat the extracted file as the same logical subtitle
+	// as the in-band track of the original file. Absent for sidecar files and
+	// for provider tracks that are not container tracks.
+	EmbeddedTitle string `json:"embedded_title,omitempty"`
+	EmbeddedOrder *int   `json:"embedded_order,omitempty"`
 }
 
 // VideoSubtitleProvider is an optional driver capability exposing the provider's
