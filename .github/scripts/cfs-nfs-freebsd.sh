@@ -120,9 +120,17 @@ stop_server
 
 # ----------------------------------------------------------------- 3. mount
 serve_with_portmap() {
-	start "$1" cfs serve nfs /cfs --addr 127.0.0.1:2049 --portmap
+	# --gid/--umask as the NAS will use them (group 1000 writes, others read).
+	start "$1" cfs serve nfs /cfs --addr 127.0.0.1:2049 --portmap --gid 1000 --umask 002
 	wait_log "$1" '^nfs of /cfs on'
 	wait_log "$1" 'portmap on tcp'
+	# The service came up by itself: storages load concurrently, and the cfs
+	# storage has to wait for the one under it instead of failing.
+	if grep -q 'failed load storage' "$D/$1"; then
+		grep 'failed load storage' "$D/$1" | cut -c1-300
+		fail "a storage failed to load in $1 (load-order race?)"
+	fi
+	grep -q 'success load storage: \[/cfs\]' "$D/$1" || fail "/cfs was not loaded in $1"
 }
 do_mount() {
 	# The parameters of the NAS mount; no mountport on purpose.
@@ -158,6 +166,18 @@ verify() { # verify LABEL: the mount has exactly what src has
 }
 verify "after write"
 
+# Owner and mode as the client sees them: gid 1000, 0777/0666 minus umask 002.
+check_perms() { # check_perms LABEL: stat of what exists at this point
+	for d in small big "$@"; do
+		[ "$(stat -f '%g %Lp' "$MNT/$d")" = "1000 775" ] || fail "$LABEL: $d is '$(stat -f '%g %Lp' "$MNT/$d")', want '1000 775' (gid, mode)"
+	done
+	for f in small/003 big/30m.bin; do
+		[ "$(stat -f '%g %Lp' "$MNT/$f")" = "1000 664" ] || fail "$LABEL: $f is '$(stat -f '%g %Lp' "$MNT/$f")', want '1000 664' (gid, mode)"
+	done
+	echo "$LABEL: gid/mode of dirs 1000 775, of files 1000 664"
+}
+LABEL="after write"; check_perms
+
 step "mv, rm, mkdir, ls -l"
 mutate() {
 	mkdir "$1/dir1"
@@ -173,6 +193,11 @@ ls -l "$MNT" "$MNT/dir1"
 [ -d "$MNT/dir1/sub" ] || fail "dir1/sub is missing"
 [ ! -e "$MNT/small/002" ] || fail "small/002 survived rm"
 verify "after mv/rm"
+mkdir "$MNT/newdir"; echo x >"$MNT/newdir/newfile"
+[ "$(stat -f '%g %Lp' "$MNT/newdir")" = "1000 775" ] || fail "new dir: '$(stat -f '%g %Lp' "$MNT/newdir")', want '1000 775'"
+[ "$(stat -f '%g %Lp' "$MNT/newdir/newfile")" = "1000 664" ] || fail "new file: '$(stat -f '%g %Lp' "$MNT/newdir/newfile")', want '1000 664'"
+echo "created by the client: gid/mode 1000 775 (dir), 1000 664 (file)"
+rm -r "$MNT/newdir"
 
 # ----------------------------------------------------------- 5. server restart
 step "restart openlist while the mount stays up"
@@ -204,6 +229,7 @@ if ! ls -l "$MNT/dir1" >/dev/null; then
 	fail "ls after restart failed (stale file handle?)"
 fi
 verify "after restart, same mount"
+LABEL="after restart"; check_perms dir1
 echo "new file after restart" >"$MNT/after-restart.txt"
 [ "$(cat "$MNT/after-restart.txt")" = "new file after restart" ] || fail "write after restart"
 echo "new file after restart" >"$D/src/after-restart.txt"
@@ -217,6 +243,7 @@ do_mount
 manifest_extra() { (cd "$1" && sha256 -r after-restart.txt); }
 [ "$(manifest_extra "$MNT")" = "$(manifest_extra "$D/src")" ] || fail "after-restart.txt differs after remount"
 verify "after remount"
+LABEL="after remount"; check_perms dir1
 ids >"$D/ids-after.txt"
 diff "$D/ids-before.txt" "$D/ids-after.txt" || fail "fileids changed across the restart (clients that stay mounted get EIDRM)"
 echo "fileids (stat %i) identical before the restart and after the remount:"; cat "$D/ids-after.txt"

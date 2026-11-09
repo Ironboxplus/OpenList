@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Ironboxplus/cfs/core"
 	cfsrclone "github.com/Ironboxplus/cfs/frontend/rclone"
@@ -24,6 +25,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/rclonefs"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
@@ -31,6 +33,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/shirou/gopsutil/v4/disk"
+	log "github.com/sirupsen/logrus"
 )
 
 type Cfs struct {
@@ -92,6 +95,9 @@ func (d *Cfs) Init(ctx context.Context) error {
 		return fmt.Errorf("cfs options: %w", err)
 	}
 	remote := d.RemotePath
+	if err := waitBacking(ctx, remote); err != nil {
+		return err
+	}
 	sh, err := cfsrclone.Acquire(ctx, ShareKey(d.MountPath), func() (fs.Fs, error) {
 		return rclonefs.NewFs(ctx, remote)
 	}, opt)
@@ -101,6 +107,51 @@ func (d *Cfs) Init(ctx context.Context) error {
 	d.shared = sh
 	volumes.Store(ShareKey(d.MountPath), sh.Volume())
 	return nil
+}
+
+// backingWait is how long Init waits for the storage under remote_path.
+const backingWait = 2 * time.Minute
+
+// waitBacking returns once the storage that owns remote is loaded and working.
+//
+// Storages load concurrently, one goroutine per driver (bootstrap.LoadStorages),
+// and OpenList has no ordering between them: Alias and Crypt only resolve their
+// target per request, so a target that is not there yet costs them nothing.
+// The volume of a cfs storage is opened in Init, though, so a backing storage
+// that is not mounted yet (a 115 storage still refreshing its token, say) made
+// Init fail for good with "storage not found". A storage is put in the map only
+// when its Init returned, so being found there means it has finished loading.
+// A backing storage that loaded with an error is reported at once instead of
+// waiting for it. The wait ends with ctx and after backingWait.
+func waitBacking(ctx context.Context, remote string) error {
+	timeout := time.NewTimer(backingWait)
+	defer timeout.Stop()
+	tick := time.NewTicker(200 * time.Millisecond)
+	defer tick.Stop()
+	waiting := false
+	for {
+		st, _, err := op.GetStorageAndActualPath(remote)
+		if err == nil {
+			if status := st.GetStorage().Status; status != op.WORK {
+				return fmt.Errorf("the storage %s under remote_path %s is not working: %s", st.GetStorage().MountPath, remote, status)
+			}
+			return nil
+		}
+		if !errors.Is(err, errs.StorageNotFound) {
+			return err
+		}
+		if !waiting {
+			waiting = true
+			log.Infof("[cfs] waiting for the storage that holds %s to load", remote)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timeout.C:
+			return fmt.Errorf("no storage holds remote_path %s after %s: %w", remote, backingWait, err)
+		case <-tick.C:
+		}
+	}
 }
 
 func (d *Cfs) Drop(ctx context.Context) error {

@@ -272,3 +272,72 @@ func TestSyncIntoStackedCfsCountsEachFileOnce(t *testing.T) {
 		t.Fatalf("big3.bin has %d bytes", len(got))
 	}
 }
+
+// Storages load concurrently and OpenList has no order between them, so the
+// storage under a cfs storage may not be there when cfs initialises (a cold
+// start of a node whose backing 115 storage is still logging in). The cfs
+// storage must wait for it instead of failing for good, and must not wait for
+// a backing storage that already failed to load.
+func TestCfsWaitsForItsBackingStorage(t *testing.T) {
+	ctx := context.Background()
+	state := t.TempDir()
+	cfsRow := func(mount, under string) model.Storage {
+		row := model.Storage{
+			Driver: "Cfs", MountPath: mount,
+			Addition: `{"remote_path":"` + under + `/vol","root_folder_path":"/","state_dir":` + q(filepath.Join(state, mount)) + `,"seal_quiet":"50ms","seal_max":"500ms","threshold":"64KiB"}`,
+		}
+		if err := db.CreateStorage(&row); err != nil {
+			t.Fatal(err)
+		}
+		return row
+	}
+
+	t.Run("backing storage loads later", func(t *testing.T) {
+		row := cfsRow("/late-cfs", "/late-under")
+		done := make(chan error, 1)
+		go func() { done <- op.LoadStorage(ctx, row) }()
+
+		select {
+		case err := <-done:
+			t.Fatalf("cfs finished loading (%v) before the storage under it exists", err)
+		case <-time.After(1500 * time.Millisecond):
+		}
+		under := t.TempDir()
+		addStorage(t, "Local", "/late-under", `{"root_folder_path":`+q(under)+`}`)
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("cfs did not come up once its backing storage did: %v", err)
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("cfs did not come up after its backing storage loaded")
+		}
+		st, err := op.GetStorageByMountPath("/late-cfs")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := st.GetStorage().Status; got != op.WORK {
+			t.Fatalf("status %q, want %q", got, op.WORK)
+		}
+		putFile(t, "/late-cfs", "/", "hello.txt", []byte("hello"))
+		if got := readAll(t, "/late-cfs", "/hello.txt"); string(got) != "hello" {
+			t.Fatalf("read back %q", got)
+		}
+	})
+
+	t.Run("backing storage failed to load", func(t *testing.T) {
+		// Local refuses a root folder that does not exist: it is in the
+		// storage map, with an error status.
+		_, _ = op.CreateStorage(ctx, model.Storage{Driver: "Local", MountPath: "/bad-under",
+			Addition: `{"root_folder_path":` + q(filepath.Join(state, "missing")) + `}`})
+		row := cfsRow("/bad-cfs", "/bad-under")
+		start := time.Now()
+		err := op.LoadStorage(ctx, row)
+		if err == nil || !strings.Contains(err.Error(), "not working") {
+			t.Fatalf("want a 'not working' error, got %v", err)
+		}
+		if d := time.Since(start); d > 10*time.Second {
+			t.Fatalf("took %s: it waited for a storage that had already failed", d)
+		}
+	})
+}

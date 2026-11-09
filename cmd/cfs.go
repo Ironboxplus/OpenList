@@ -32,6 +32,28 @@ var cfsFlags struct {
 	user      string
 	pass      string
 	readOnly  bool
+	// Ownership and permissions the VFS reports (rclone's uid, gid, umask);
+	// empty keeps rclone's default (the process's own).
+	uid   string
+	gid   string
+	umask string
+}
+
+// cfsOwnership puts the --uid, --gid and --umask that were given into the
+// parameters of a serve/start call (rclone's names of the VFS options).
+func cfsOwnership(p rc.Params) {
+	for k, v := range map[string]string{"uid": cfsFlags.uid, "gid": cfsFlags.gid, "umask": cfsFlags.umask} {
+		if v != "" {
+			p[k] = v
+		}
+	}
+}
+
+func cfsOwnershipFlags(c *cobra.Command) {
+	f := c.Flags()
+	f.StringVar(&cfsFlags.uid, "uid", "", "uid reported for all files (default: that of this process)")
+	f.StringVar(&cfsFlags.gid, "gid", "", "gid reported for all files (default: that of this process)")
+	f.StringVar(&cfsFlags.umask, "umask", "", "octal permission bits to clear from 0777 (dirs) and 0666 (files), e.g. 002 (default: umask of this process)")
 }
 
 // cfsFsName is the name the shared volume goes by in rclone's fs cache.
@@ -96,6 +118,7 @@ and is what the cfs black-box tests use when no mount driver is installed.`,
 				"vfs_cache_mode": cfsFlags.cacheMode,
 				"read_only":      cfsFlags.readOnly,
 			}
+			cfsOwnership(p)
 			if cfsFlags.user != "" {
 				p["user"], p["pass"] = cfsFlags.user, cfsFlags.pass
 			}
@@ -170,4 +193,5 @@ func init() {
 	cfsWebdavCmd.Flags().StringVar(&cfsFlags.user, "user", "", "WebDAV user (none: anonymous)")
 	cfsWebdavCmd.Flags().StringVar(&cfsFlags.pass, "pass", "", "WebDAV password")
 	cfsWebdavCmd.Flags().BoolVar(&cfsFlags.readOnly, "read-only", false, "serve read-only")
+	cfsOwnershipFlags(cfsWebdavCmd)
 }

@@ -49,6 +49,11 @@ The NFS file handles are kept on disk under <data>/cfs-nfs, so that a client
 that stays mounted keeps working across a restart of this process (with the
 default in-memory handle cache every handle goes stale on restart).
 
+--uid, --gid and --umask set the owner and the permission bits the client
+sees (NFS carries no users of its own here): every file and directory belongs
+to that uid/gid, with 0666/0777 minus the umask. For a share used by a group,
+e.g. --gid 1000 --umask 002 gives 664 for files and 775 for directories.
+
 Example:
   openlist cfs serve nfs /cfs --addr 127.0.0.1:2049 --portmap
   mount_nfs -o nfsv3,tcp,port=2049,soft 127.0.0.1:/ /mnt/cfs`,
@@ -63,6 +68,7 @@ Example:
 				"nfs_cache_type":     "disk",
 				"nfs_cache_dir":      filepath.Join(flags.DataDir, "cfs-nfs", cfsNfsDirName(args[0])),
 			}
+			cfsOwnership(p)
 			out, err := rc.Calls.Get("serve/start").Fn(ctx, p)
 			if err != nil {
 				return nil, fmt.Errorf("serve nfs: %w", err)
@@ -120,4 +126,5 @@ func init() {
 	f.BoolVar(&cfsNfsFlags.portmap, "portmap", false, "also serve portmap (UDP+TCP port 111) on the IP of --addr, for clients that cannot be given the mount port")
 	f.StringVar(&cfsNfsFlags.cacheMaxSize, "vfs-cache-max-size", "10G", "upper bound of the VFS cache on local disk")
 	f.BoolVar(&cfsNfsFlags.readOnly, "read-only", false, "serve read-only")
+	cfsOwnershipFlags(cfsNfsCmd)
 }
