@@ -34,8 +34,9 @@ func toVideoPlayInfos(urls []sdk.VideoPlayURL) []driver.VideoPlayInfo {
 const embeddedSubtitlePrefix = "[内置字幕]"
 
 // toVideoSubtitleInfos maps the SDK subtitle list to driver.VideoSubtitleInfo,
-// dropping caption-map placeholder entries and any without a downloadable URL
-// or a title (115 lists a blank entry after the real tracks).
+// dropping caption-map placeholder entries, any without a downloadable URL and
+// any with neither a title nor a language (115 lists a blank entry after the
+// real tracks). A track with a language but no title is titled by its language.
 //
 // An entry whose title carries embeddedSubtitlePrefix is a container track:
 // EmbeddedTitle is the title without it, and EmbeddedOrder the entry's position
@@ -56,12 +57,16 @@ func toVideoSubtitleInfos(list []sdk.SubtitleItem) []driver.VideoSubtitleInfo {
 				embeddedOrder = &order
 			}
 		}
-		if s.URL == "" || s.IsCaptionMap == 1 || s.Title == "" {
+		if s.URL == "" || s.IsCaptionMap == 1 || (s.Title == "" && s.Language == "") {
 			continue
+		}
+		title := s.Title
+		if title == "" {
+			title = s.Language
 		}
 		infos = append(infos, driver.VideoSubtitleInfo{
 			Language:      s.Language,
-			Title:         s.Title,
+			Title:         title,
 			URL:           s.URL,
 			Type:          s.Type,
 			EmbeddedTitle: embeddedTitle,

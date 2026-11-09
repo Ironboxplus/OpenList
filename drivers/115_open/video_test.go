@@ -140,3 +140,22 @@ func TestToVideoSubtitleInfos_FiltersEmptyAndCaptionMap(t *testing.T) {
 		t.Errorf("Title = %q, want ok", got[1].Title)
 	}
 }
+
+func TestToVideoSubtitleInfos_LanguageOnlyEntryIsKept(t *testing.T) {
+	list := []sdk.SubtitleItem{
+		{Language: "eng", Type: "srt", URL: "http://example.com/eng"},
+		{Language: "", Title: "", URL: "http://example.com/blank"},
+	}
+
+	got := toVideoSubtitleInfos(list)
+
+	if len(got) != 1 {
+		t.Fatalf("expected 1 info (blank dropped), got %d: %+v", len(got), got)
+	}
+	if got[0].Title != "eng" || got[0].Language != "eng" {
+		t.Errorf("a language-only entry is titled by its language, got %+v", got[0])
+	}
+	if got[0].EmbeddedTitle != "" || got[0].EmbeddedOrder != nil {
+		t.Errorf("only prefixed entries carry embedded fields, got %+v", got[0])
+	}
+}
