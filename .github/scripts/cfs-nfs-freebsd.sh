@@ -176,6 +176,8 @@ verify "after mv/rm"
 
 # ----------------------------------------------------------- 5. server restart
 step "restart openlist while the mount stays up"
+ids() { for f in dir1 dir1/001.renamed small/003 big/30m.bin; do echo "$f $(stat -f %i "$MNT/$f")"; done; }
+ids >"$D/ids-before.txt"
 sleep 8 # past the VFS write-back delay
 stop_server
 echo "server stopped, mount still in place: $(mount | grep -c " on $MNT ") mount(s)"
@@ -187,6 +189,10 @@ echo "handle cache dir after restart:"; find "$D/data/cfs-nfs" -type f | head -n
 tcpdump -l -i lo0 -nn -vv -c 200 'tcp port 2049' >"$D/nfs-after-restart.pcap.txt" 2>&1 &
 sleep 1
 if ! ls -l "$MNT/dir1" >/dev/null; then
+	echo "--- fileids (stat %i) before the restart:"; cat "$D/ids-before.txt"
+	umount -f "$MNT" || true
+	do_mount || true
+	echo "--- fileids after a fresh mount against the restarted server:"; ids || true
 	echo "--- other lookups after the failure"
 	ls "$MNT" || true
 	ls "$MNT/big" || true
