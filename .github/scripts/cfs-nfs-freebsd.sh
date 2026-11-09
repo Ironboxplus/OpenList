@@ -11,7 +11,9 @@ MNT=/mnt/cfs
 PORT=5244
 BASE=http://127.0.0.1:$PORT
 # The admin password never leaves this script's environment; nothing here echoes it.
-PASS=$(head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 24)
+PASS=$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' 
+')
+[ ${#PASS} -ge 32 ] || { echo 'FAIL: no random password'; exit 1; }
 
 rm -rf "$D"
 mkdir -p "$D/data" "$D/back/vol" "$D/src" "$MNT"
