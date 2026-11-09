@@ -183,7 +183,10 @@ serve_with_portmap serve-2.log
 # Past the attribute cache (3s default), so that stat and ls really send
 # GETATTR/LOOKUP with the file handles this client got from the first process.
 sleep 8
-ls -l "$MNT/dir1" >/dev/null || fail "ls after restart failed (stale file handle?)"
+echo "handle cache dir after restart:"; find "$D/data/cfs-nfs" -type f | head -n 12
+tcpdump -i lo0 -nn -vv -c 60 'tcp port 2049' >"$D/nfs-after-restart.pcap.txt" 2>&1 &
+sleep 1
+ls -l "$MNT/dir1" >/dev/null || { sleep 2; echo "--- nfs traffic of the failed ls"; cut -c1-220 "$D/nfs-after-restart.pcap.txt" | head -n 60; fail "ls after restart failed (stale file handle?)"; }
 verify "after restart, same mount"
 echo "new file after restart" >"$MNT/after-restart.txt"
 [ "$(cat "$MNT/after-restart.txt")" = "new file after restart" ] || fail "write after restart"
