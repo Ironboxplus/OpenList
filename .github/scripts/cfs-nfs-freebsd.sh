@@ -71,9 +71,13 @@ wait_log() {
 	done
 }
 
-api() { # api PATH JSON -> response body
-	curl -sS -m 60 -H "Authorization: $TOKEN" -H 'Content-Type: application/json' -d "$2" "$BASE$1"
+# The VM has no curl (and the 12.4 package repository is gone), so POST with nc.
+post() { # post PATH JSON [TOKEN] -> response body
+	len=$(printf '%s' "$2" | wc -c | tr -d ' ')
+	printf 'POST %s HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nAuthorization: %s\r\nContent-Length: %s\r\n\r\n%s' \
+		"$1" "${3:-}" "$len" "$2" | nc -w 30 127.0.0.1 "$PORT" | tr -d '\r' | sed '1,/^$/d'
 }
+api() { post "$1" "$2" "$TOKEN"; }
 
 ok_code() { echo "$1" | grep -q '"code":200' || fail "$2: $(echo "$1" | head -c 300)"; }
 
@@ -81,11 +85,10 @@ ok_code() { echo "$1" | grep -q '"code":200' || fail "$2: $(echo "$1" | head -c 
 step "first start: create the storages through the HTTP API"
 start server.log server
 i=0
-until curl -sf -m 2 "$BASE/ping" >/dev/null; do
+until fetch -q -T 2 -o - "$BASE/ping" >/dev/null 2>&1; do
 	i=$((i + 1)); [ "$i" -gt 60 ] && fail "server did not listen"; sleep 1
 done
-r=$(curl -sS -m 30 -H 'Content-Type: application/json' \
-	-d "{\"username\":\"admin\",\"password\":\"$PASS\"}" "$BASE/api/auth/login")
+r=$(post /api/auth/login "{\"username\":\"admin\",\"password\":\"$PASS\"}")
 ok_code "$r" login
 TOKEN=$(echo "$r" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
 [ -n "$TOKEN" ] || fail "no token in login response"
