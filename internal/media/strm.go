@@ -266,9 +266,9 @@ func StrmTargetsWithEpisodes(item *model.MediaItem, eps []model.MediaEpisode) []
 		}
 		raw := stdpath.Join(folder, item.FileName)
 		if item.IsFolder {
-			// several versions of one film in a folder: the default (first) version plays
-			if vs := model.ItemVersions(item.Episodes); len(vs) > 0 {
-				raw = stdpath.Join(raw, vs[0].FileName)
+			// the default (first) version, or the one video the folder holds
+			if f, ok := model.ItemPlayFile(item); ok {
+				raw = stdpath.Join(raw, f.FileName)
 				return []StrmTarget{{
 					RelPath:     stdpath.Join(name, name+".strm"),
 					RawPath:     raw,
@@ -277,7 +277,7 @@ func StrmTargetsWithEpisodes(item *model.MediaItem, eps []model.MediaEpisode) []
 			}
 		}
 		if item.IsFolder {
-			// no version is known, so the video inside is not either: a strm must not point at a directory
+			// the video inside is not known: a strm must not point at a directory
 			log.Debugf("[media] strm: no video known for folder %s, skipped", raw)
 			return nil
 		}

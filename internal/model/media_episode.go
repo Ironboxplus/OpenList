@@ -5,6 +5,8 @@ import (
 	"path"
 	"sort"
 	"strings"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // MediaEpisode maps one video file inside a series work (tv or anime) to its
@@ -115,7 +117,26 @@ func ItemVersions(episodes string) []EpisodeInfo {
 }
 
 // ItemPlayFile is the video that plays for a non-episodic folder item (a film)
-// when no episode is chosen. TODO stub
+// when no episode is chosen: the first (default) version, else the one video the
+// Episodes JSON records. False when the folder's video is not known (nothing
+// recorded, or several without a version mark: no guessing) and for a single
+// file, whose own path is the video.
 func ItemPlayFile(item *MediaItem) (EpisodeInfo, bool) {
+	if item == nil || !item.IsFolder || item.Episodes == "" {
+		return EpisodeInfo{}, false
+	}
+	if vs := ItemVersions(item.Episodes); len(vs) > 0 {
+		return vs[0], true
+	}
+	var eps []EpisodeInfo
+	if err := json.Unmarshal([]byte(item.Episodes), &eps); err != nil {
+		return EpisodeInfo{}, false
+	}
+	if len(eps) == 1 && eps[0].FileName != "" {
+		return eps[0], true
+	}
+	if len(eps) > 1 {
+		log.Debugf("[media] folder %s records %d videos and no version mark, play file unknown", item.FileName, len(eps))
+	}
 	return EpisodeInfo{}, false
 }

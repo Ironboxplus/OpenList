@@ -222,13 +222,11 @@ func MediaStreamURL(c *gin.Context, item *model.MediaItem, ep *model.EpisodeInfo
 }
 
 // MediaItemPlayPath is the file that plays when no episode is chosen: for a
-// film kept in several versions the first (default) version, else the item's
+// film folder the first (default) version or its one video, else the item's
 // own path.
 func MediaItemPlayPath(item *model.MediaItem) string {
-	if item != nil && item.IsFolder {
-		if vs := model.ItemVersions(item.Episodes); len(vs) > 0 {
-			return MediaEpisodeFilePath(item, &vs[0])
-		}
+	if f, ok := model.ItemPlayFile(item); ok {
+		return MediaEpisodeFilePath(item, &f)
 	}
 	return MediaItemFilePath(item)
 }
