@@ -93,3 +93,22 @@ func TestStrmTargetsNeverPointAtADirectory(t *testing.T) {
 		t.Errorf("file: %v", strmRels(got))
 	}
 }
+
+func TestStrmTargetsPathMergeSingleVideoFolderMovie(t *testing.T) {
+	// what buildEpisodesFromFolder writes for a movie folder holding one video: no "version" mark
+	it := &model.MediaItem{
+		MediaType: model.MediaTypeVideo, FolderPath: "/lib", FileName: "1917 (2019)", IsFolder: true,
+		ScrapedName: "1917", ReleaseDate: "2019-12-25", VideoType: model.VideoTypeMovie,
+		Episodes: `[{"file_name":"1917.2019.mkv","index":0,"title":"1917.2019"}]`,
+	}
+	got := StrmTargets(it)
+	if len(got) != 1 {
+		t.Fatalf("targets: %v", strmRels(got))
+	}
+	if got[0].RelPath != "1917 (2019)/1917 (2019).strm" || got[0].RawPath != "/lib/1917 (2019)/1917.2019.mkv" {
+		t.Errorf("got %+v", got[0])
+	}
+	if got[0].SameDirPath != "/lib/1917 (2019)/1917.2019.strm" {
+		t.Errorf("same dir: %q", got[0].SameDirPath)
+	}
+}

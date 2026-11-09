@@ -44,3 +44,14 @@ func TestFilmWithoutVersionsKeepsItsOwnPath(t *testing.T) {
 		t.Fatalf("versions %d", v.Versions)
 	}
 }
+
+func TestFilmFolderWithOneUnmarkedVideoPlaysThatVideo(t *testing.T) {
+	it := &model.MediaItem{
+		FolderPath: "/MOV/Live", FileName: "1917 (2019)", IsFolder: true, MediaType: model.MediaTypeVideo,
+		VideoType: model.VideoTypeMovie,
+		Episodes:  `[{"file_name":"1917.2019.mkv","index":0,"title":"1917.2019"}]`,
+	}
+	if got := MediaItemPlayPath(it); got != "/MOV/Live/1917 (2019)/1917.2019.mkv" {
+		t.Fatalf("play path %q", got)
+	}
+}

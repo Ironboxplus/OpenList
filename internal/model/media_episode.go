@@ -113,3 +113,9 @@ func ItemVersions(episodes string) []EpisodeInfo {
 	}
 	return eps
 }
+
+// ItemPlayFile is the video that plays for a non-episodic folder item (a film)
+// when no episode is chosen. TODO stub
+func ItemPlayFile(item *MediaItem) (EpisodeInfo, bool) {
+	return EpisodeInfo{}, false
+}
