@@ -217,6 +217,9 @@ do_mount
 manifest_extra() { (cd "$1" && sha256 -r after-restart.txt); }
 [ "$(manifest_extra "$MNT")" = "$(manifest_extra "$D/src")" ] || fail "after-restart.txt differs after remount"
 verify "after remount"
+ids >"$D/ids-after.txt"
+diff "$D/ids-before.txt" "$D/ids-after.txt" || fail "fileids changed across the restart (clients that stay mounted get EIDRM)"
+echo "fileids (stat %i) identical before the restart and after the remount:"; cat "$D/ids-after.txt"
 
 umount "$MNT"
 stop_server

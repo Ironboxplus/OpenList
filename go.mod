@@ -367,4 +367,4 @@ replace github.com/OpenListTeam/115-sdk-go => github.com/Ironboxplus/115-sdk-go 
 
 replace github.com/KarpelesLab/reflink => github.com/OpenListTeam/reflink v0.0.0-20260701021214-78760eaeafef
 
-replace github.com/rclone/rclone => github.com/Ironboxplus/rclone v0.0.0-20261102231652-26c153dad3e6
+replace github.com/rclone/rclone => github.com/Ironboxplus/rclone v0.0.0-20261109100924-51390063fba7
