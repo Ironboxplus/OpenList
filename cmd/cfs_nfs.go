@@ -23,10 +23,12 @@ import (
 )
 
 var cfsNfsFlags struct {
-	addr         string
-	portmap      bool
-	cacheMaxSize string
-	readOnly     bool
+	addr          string
+	portmap       bool
+	cacheMaxSize  string
+	cacheMaxDirty string
+	bwlimit       string
+	readOnly      bool
 }
 
 var cfsNfsCmd = &cobra.Command{
@@ -54,21 +56,38 @@ sees (NFS carries no users of its own here): every file and directory belongs
 to that uid/gid, with 0666/0777 minus the umask. For a share used by a group,
 e.g. --gid 1000 --umask 002 gives 664 for files and 775 for directories.
 
+--vfs-cache-max-dirty bounds the files that are written but not uploaded yet.
+A write that would go over it waits until the uploads of closed files have made
+room, so a client writing faster than the drive takes data is slowed down to
+the speed of the uploads instead of filling the cache disk. Mount with "hard"
+(not "soft"): a soft mount turns the wait into an I/O error after its timeout.
+A file bigger than the limit can't be written ("no space left on device"): the
+drive needs the whole file's SHA-1 before it takes the first byte, so the file
+has to stay on the cache disk until it is uploaded. Files that are still open are
+never waited for (nothing could lower the total), so give the cache directory a
+disk quota as the hard limit.
+
 Example:
   openlist cfs serve nfs /cfs --addr 127.0.0.1:2049 --portmap
-  mount_nfs -o nfsv3,tcp,port=2049,soft 127.0.0.1:/ /mnt/cfs`,
+  mount_nfs -o nfsv3,tcp,port=2049,hard 127.0.0.1:/ /mnt/cfs`,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		runCfs(args[0], func(ctx context.Context) (func(), error) {
 			p := rc.Params{
 				"type": "nfs", "fs": cfsFsName, "addr": cfsNfsFlags.addr,
-				"vfs_cache_mode":     cfsFlags.cacheMode,
-				"vfs_cache_max_size": cfsNfsFlags.cacheMaxSize,
-				"read_only":          cfsNfsFlags.readOnly,
-				"nfs_cache_type":     "disk",
-				"nfs_cache_dir":      filepath.Join(flags.DataDir, "cfs-nfs", cfsNfsDirName(args[0])),
+				"vfs_cache_mode":      cfsFlags.cacheMode,
+				"vfs_cache_max_size":  cfsNfsFlags.cacheMaxSize,
+				"vfs_cache_max_dirty": cfsNfsFlags.cacheMaxDirty,
+				"read_only":           cfsNfsFlags.readOnly,
+				"nfs_cache_type":      "disk",
+				"nfs_cache_dir":       filepath.Join(flags.DataDir, "cfs-nfs", cfsNfsDirName(args[0])),
 			}
 			cfsOwnership(p)
+			if cfsNfsFlags.bwlimit != "" {
+				if _, err := rc.Calls.Get("core/bwlimit").Fn(ctx, rc.Params{"rate": cfsNfsFlags.bwlimit}); err != nil {
+					return nil, fmt.Errorf("bwlimit: %w", err)
+				}
+			}
 			out, err := rc.Calls.Get("serve/start").Fn(ctx, p)
 			if err != nil {
 				return nil, fmt.Errorf("serve nfs: %w", err)
@@ -125,6 +144,8 @@ func init() {
 	f.StringVar(&cfsNfsFlags.addr, "addr", "127.0.0.1:2049", "address to serve on (no authentication: keep it reachable by the mounting host only)")
 	f.BoolVar(&cfsNfsFlags.portmap, "portmap", false, "also serve portmap (UDP+TCP port 111) on the IP of --addr, for clients that cannot be given the mount port")
 	f.StringVar(&cfsNfsFlags.cacheMaxSize, "vfs-cache-max-size", "10G", "upper bound of the VFS cache on local disk")
+	f.StringVar(&cfsNfsFlags.cacheMaxDirty, "vfs-cache-max-dirty", "0", "upper bound of the files not uploaded yet: a write that would go over it waits until the uploads have made room (0: off)")
+	f.StringVar(&cfsNfsFlags.bwlimit, "bwlimit", "", "limit the bandwidth of the uploads and reads of the VFS, e.g. 1M for 1 MiB/s (default: unlimited)")
 	f.BoolVar(&cfsNfsFlags.readOnly, "read-only", false, "serve read-only")
 	cfsOwnershipFlags(cfsNfsCmd)
 }

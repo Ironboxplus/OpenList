@@ -3,6 +3,9 @@ name: cfs-nfs
 # `openlist cfs serve nfs` and its portmap (pkg/portmap): unit tests of the
 # portmap, and a real mount of a cfs volume with FreeBSD's mount_nfs. 12.4 asks
 # the server's portmapper over UDP (like the NAS's 13.1), 13.5 over TCP.
+# The VM also checks the write buffer limit (--vfs-cache-max-dirty with uploads
+# at 1 MiB/s: writes wait, the cache stays under the limit, a file over the
+# limit gets ENOSPC) and, on 13.5, a file written and read back through Samba.
 
 on:
   push:
