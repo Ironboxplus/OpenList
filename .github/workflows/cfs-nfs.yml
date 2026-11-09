@@ -69,6 +69,19 @@ jobs:
           name: openlist-freebsd
           path: openlist-freebsd
           retention-days: 1
+      # The very binary the VM jobs below test, gzip'd, for deployment. Built
+      # with the placeholder frontend: the node fetches the rolling one itself.
+      - name: gzip for deployment
+        id: pack
+        run: |
+          sha256sum openlist-freebsd
+          gzip -9 -c openlist-freebsd > openlist-freebsd-amd64.gz
+          echo "name=openlist-freebsd-amd64-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.name }}
+          path: openlist-freebsd-amd64.gz
+          retention-days: 3
 
   freebsd:
     name: mount_nfs on FreeBSD ${{ matrix.release }}
