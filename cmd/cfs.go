@@ -156,11 +156,13 @@ func runCfs(mountPath string, attach func(ctx context.Context) (detach func(), e
 	bootstrap.Shutdown(1 * time.Second)
 }
 
+// cfsServeCmd is a variable so that platform-specific files can add servers.
+var cfsServeCmd = &cobra.Command{Use: "serve", Short: "Serve a cfs storage"}
+
 func init() {
 	RootCmd.AddCommand(cfsCmd)
-	serve := &cobra.Command{Use: "serve", Short: "Serve a cfs storage"}
-	cfsCmd.AddCommand(cfsMountCmd, serve)
-	serve.AddCommand(cfsWebdavCmd)
+	cfsCmd.AddCommand(cfsMountCmd, cfsServeCmd)
+	cfsServeCmd.AddCommand(cfsWebdavCmd)
 	for _, c := range []*cobra.Command{cfsMountCmd, cfsWebdavCmd} {
 		c.Flags().StringVar(&cfsFlags.cacheMode, "vfs-cache-mode", "writes", "VFS cache mode: off, minimal, writes, full")
 	}

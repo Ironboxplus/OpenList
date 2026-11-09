@@ -1,0 +1,94 @@
+name: cfs-nfs
+
+# `openlist cfs serve nfs` and its portmap (pkg/portmap): unit tests of the
+# portmap, and a real mount of a cfs volume with FreeBSD's mount_nfs. 12.4 asks
+# the server's portmapper over UDP (like the NAS's 13.1), 13.5 over TCP.
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "pkg/portmap/**"
+      - "cmd/cfs*.go"
+      - "drivers/cfs/**"
+      - ".github/scripts/cfs-nfs-freebsd.sh"
+      - ".github/workflows/cfs-nfs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cfs-nfs-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CGO_ENABLED: "0"
+  # pipe = fall through to the next proxy on any error (proxy.golang.org drops streams now and then)
+  GOPROXY: "https://proxy.golang.org|https://goproxy.cn|direct"
+
+jobs:
+  portmap:
+    name: portmap unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: go vet, go test
+        run: |
+          go vet ./pkg/portmap/...
+          go test -count=1 -v ./pkg/portmap/...
+
+  build-freebsd:
+    name: build for FreeBSD
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Embedded frontend placeholder
+        run: |
+          mkdir -p public/dist
+          [ -e public/dist/index.html ] || echo '<!doctype html>' > public/dist/index.html
+      - name: go build
+        env:
+          GOOS: freebsd
+          GOARCH: amd64
+        run: go build -trimpath -buildvcs=false -ldflags "-s -w" -o openlist-freebsd .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openlist-freebsd
+          path: openlist-freebsd
+          retention-days: 1
+
+  freebsd:
+    name: mount_nfs on FreeBSD ${{ matrix.release }}
+    needs: build-freebsd
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ["12.4", "13.5"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: openlist-freebsd
+      - name: serve nfs, mount, restart (inside the VM)
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: ${{ matrix.release }}
+          usesh: true
+          run: |
+            uname -a
+            sh .github/scripts/cfs-nfs-freebsd.sh
