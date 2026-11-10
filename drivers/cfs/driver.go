@@ -198,6 +198,37 @@ func mapErr(err error) error {
 	return err
 }
 
+// Other: "maintain" (administrators only) takes the writer lease, writes the log
+// of everything committed, uploads a checkpoint, deletes the log an old enough
+// checkpoint makes garbage, and hands the lease back, so that the next start of
+// any volume of the drive reads that checkpoint and next to no log. It fails while
+// another writer holds the lease. The answer: the sequence number the checkpoint
+// covers, the segments and checkpoints deleted, the seconds it took.
+func (d *Cfs) Other(ctx context.Context, args model.OtherArgs) (interface{}, error) {
+	switch args.Method {
+	case "maintain":
+		if u, _ := ctx.Value(conf.UserKey).(*model.User); u == nil || !u.IsAdmin() {
+			return nil, errors.New("cfs: maintain is for administrators")
+		}
+		vol, err := d.volume()
+		if err != nil {
+			return nil, err
+		}
+		// The work does not stop with the request that asked for it.
+		rep, err := vol.MaintainLog(context.WithoutCancel(ctx))
+		if err != nil {
+			return nil, mapErr(err)
+		}
+		return map[string]any{
+			"checkpoint_seq":      rep.CheckpointSeq,
+			"segments_deleted":    rep.SegmentsDeleted,
+			"checkpoints_deleted": rep.CheckpointsDeleted,
+			"seconds":             rep.Elapsed.Seconds(),
+		}, nil
+	}
+	return nil, errs.NotImplement
+}
+
 func (d *Cfs) List(ctx context.Context, dir model.Obj, args model.ListArgs) ([]model.Obj, error) {
 	vol, err := d.volume()
 	if err != nil {
