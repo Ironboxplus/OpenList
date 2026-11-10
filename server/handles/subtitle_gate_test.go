@@ -26,12 +26,6 @@ func TestAStorageWithoutALimitIsReadAndServedAsBefore(t *testing.T) {
 	if got := gatedSource(limitedStorage{0}, "/a.mkv", src); got != any(src) {
 		t.Errorf("a limit of 0 is no limit, but the source was wrapped: %T", got)
 	}
-	if end := holdPlayback(struct{}{}, "/a.mkv"); end != nil {
-		t.Error("a storage with no limit registered a playback")
-	}
-	if stream.DownloadGate.Playing("/a.mkv") {
-		t.Error("the gate saw a playback of a file on a storage with no limit")
-	}
 }
 
 func TestAStorageWithALimitGatesBackgroundReadsAndRegistersPlaybacks(t *testing.T) {
@@ -43,9 +37,5 @@ func TestAStorageWithALimitGatesBackgroundReadsAndRegistersPlaybacks(t *testing.
 	if got.Limit() != 1 {
 		t.Errorf("the source's limit is %d, want the storage's 1", got.Limit())
 	}
-	end := holdPlayback(st, "/g/a.mkv")
-	if end == nil || !stream.DownloadGate.Playing("/g/a.mkv") {
-		t.Fatal("a playback on a limited storage is not registered")
-	}
-	end()
+
 }

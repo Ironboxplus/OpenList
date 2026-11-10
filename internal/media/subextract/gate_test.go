@@ -262,3 +262,94 @@ func TestPlaybacksNeverWaitForOneAnotherOrForBackground(t *testing.T) {
 		t.Errorf("a storage with no limit was held: %v", err)
 	}
 }
+
+func gatedManagerFile(t *testing.T, s *served, f film, limit int, gate *stream.FileGate) (File, *stream.GatedSource) {
+	t.Helper()
+	var gs *stream.GatedSource
+	file := File{Key: "timeout|/film.mkv|1|1", Open: func(ctx context.Context) (Source, func(), error) {
+		inner, err := NewLinkSource(linkTo(s), int64(len(f.data)))
+		gs = &stream.GatedSource{Inner: inner, Key: gateKey, Gate: gate, Limit: func() int { return limit }}
+		return gs, func() {}, err
+	}}
+	return file, gs
+}
+
+// The task timeout is for reading. A task parked behind a playback for longer than
+// the timeout is still there when the playback is over, and finishes.
+func TestATaskParkedBehindPlaybackSurvivesTheTimeoutAndResumes(t *testing.T) {
+	oldT, oldC := taskTimeout, timeoutCheck
+	taskTimeout, timeoutCheck = 300*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { taskTimeout, timeoutCheck = oldT, oldC })
+
+	f := makeFilm(t)
+	s := serve(t, f.data)
+	gate := &stream.FileGate{Grace: 20 * time.Millisecond}
+	m := NewManager(Config{Dir: t.TempDir()})
+	file, _ := gatedManagerFile(t, s, f, 1, gate)
+	// the source is made when the task opens it; the parked time is read off it
+	var opened *stream.GatedSource
+	open := file.Open
+	file.Open = func(ctx context.Context) (Source, func(), error) {
+		src, c, err := open(ctx)
+		opened, _ = src.(*stream.GatedSource)
+		return src, c, err
+	}
+
+	end := gate.BeginPlayback(gateKey, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	filled := make(chan error, 1)
+	go func() { filled <- m.Fill(ctx, file, []int{0}) }()
+
+	// four times the timeout, parked the whole time
+	time.Sleep(1200 * time.Millisecond)
+	select {
+	case err := <-filled:
+		t.Fatalf("Fill returned during playback: %v", err)
+	default:
+	}
+	if reqs, _, _ := s.stats(); reqs != 0 {
+		t.Errorf("%d request(s) while parked", reqs)
+	}
+	end()
+	select {
+	case err := <-filled:
+		if err != nil {
+			t.Fatalf("the parked task did not survive: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the task never resumed")
+	}
+	if !m.Cached(file, 0) {
+		t.Error("the resumed track is not on disk")
+	}
+	if opened == nil || opened.Parked() < 800*time.Millisecond {
+		t.Errorf("the source reports %v parked", func() time.Duration {
+			if opened == nil {
+				return 0
+			}
+			return opened.Parked()
+		}())
+	}
+}
+
+// And a task that really reads for longer than the timeout is still dropped.
+func TestATaskThatReadsForLongerThanTheTimeoutIsDropped(t *testing.T) {
+	oldT, oldC, oldG := taskTimeout, timeoutCheck, groupItems
+	taskTimeout, timeoutCheck, groupItems = 300*time.Millisecond, 20*time.Millisecond, 1
+	t.Cleanup(func() { taskTimeout, timeoutCheck, groupItems = oldT, oldC, oldG })
+
+	f := makeFilm(t)
+	s := serve(t, f.data)
+	s.delay = 80 * time.Millisecond // 60 blocks of it is far over the timeout
+	m := NewManager(Config{Dir: t.TempDir()})
+	file, _ := gatedManagerFile(t, s, f, 0, &stream.FileGate{}) // a limit of 0: not gated
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if err := m.Fill(ctx, file, []int{0}); err == nil {
+		t.Fatal("a task reading for far longer than the timeout finished")
+	}
+	if m.Cached(file, 0) {
+		t.Error("a dropped task left a track on disk")
+	}
+}

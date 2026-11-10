@@ -106,17 +106,6 @@ func gatedSource(storage any, path string, src subextract.Source) subextract.Sou
 	}
 }
 
-// holdPlayback registers a playback stream of path with the download gate, for
-// a storage that declares a limit; the returned function ends it (nil when the
-// storage is not limited).
-func holdPlayback(storage any, path string) func() {
-	n := driver.DownloadConnectionsPerFile(storage)
-	if n <= 0 {
-		return nil
-	}
-	return stream.DownloadGate.BeginPlayback(path, n)
-}
-
 // wantsExtraction is true when the video has a source other than the original
 // to be played on: a driver with its own online-play sources, or OpenList's
 // transcoder. With only the original, its embedded tracks already work and

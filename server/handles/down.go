@@ -69,7 +69,7 @@ func Proxy(c *gin.Context) {
 		common.ApplyProxyUserAgent(c.Request, storage.GetStorage())
 		// A storage that allows one download connection per file: background
 		// reads of this file (subtitle extraction) give way while it streams.
-		if end := holdPlayback(storage, rawPath); end != nil {
+		if end := common.HoldPlayback(storage, rawPath); end != nil {
 			defer end()
 		}
 		link, file, err := fs.Link(c.Request.Context(), rawPath, model.LinkArgs{

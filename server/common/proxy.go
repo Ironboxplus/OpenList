@@ -10,12 +10,26 @@ import (
 	"maps"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/net"
 	"github.com/OpenListTeam/OpenList/v4/internal/sign"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 )
+
+// HoldPlayback registers a playback stream of path with the download gate, for a
+// storage whose driver declares a limit on download connections per file
+// (driver.DownloadLimited); OpenList's own background reads of the file then give
+// way to it. The returned function ends the playback; it is nil, and nothing is
+// registered, for a storage with no limit.
+func HoldPlayback(storage any, path string) func() {
+	n := driver.DownloadConnectionsPerFile(storage)
+	if n <= 0 {
+		return nil
+	}
+	return stream.DownloadGate.BeginPlayback(path, n)
+}
 
 func Proxy(w http.ResponseWriter, r *http.Request, link *model.Link, file model.Obj) error {
 	// if link.MFile != nil {

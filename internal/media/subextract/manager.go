@@ -5,13 +5,24 @@ import (
 	"errors"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
 )
 
-// taskTimeout is how long one file may be read before the task is dropped.
-const taskTimeout = 15 * time.Minute
+// taskTimeout is how long one file may be read before the task is dropped. It is
+// the time spent reading: a task parked behind a playback of the same file (see
+// stream.FileGate) is not running out of it. A variable so that a test can
+// shorten it, with timeoutCheck how often it is looked at.
+var (
+	taskTimeout  = 15 * time.Minute
+	timeoutCheck = time.Second
+)
+
+// parker is a Source that knows how long it has spent waiting rather than
+// reading (stream.GatedSource).
+type parker interface{ Parked() time.Duration }
 
 // File is one file the manager can extract from. Key identifies the file's
 // revision (storage mount, path, size, modification time), so that a replaced
@@ -302,10 +313,35 @@ func (m *Manager) taskFor(f File) (*Task, error) {
 		<-e.ready
 		return e.task, e.err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), taskTimeout)
+	ctx, cancel := context.WithCancel(context.Background())
 	e := &entry{ready: make(chan struct{}), cancel: cancel}
 	m.tasks[f.Key] = e
 	m.mu.Unlock()
+
+	// The deadline: taskTimeout of reading, from now.
+	var opened atomic.Value // holds struct{ Source }
+	go func() {
+		start := time.Now()
+		tick := time.NewTicker(timeoutCheck)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+				var parked time.Duration
+				if o, ok := opened.Load().(struct{ Source }); ok {
+					if p, ok := o.Source.(parker); ok {
+						parked = p.Parked()
+					}
+				}
+				if time.Since(start)-parked > taskTimeout {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
 
 	var closeFn func()
 	fail := func(err error) (*Task, error) {
@@ -324,6 +360,7 @@ func (m *Manager) taskFor(f File) (*Task, error) {
 	if err != nil {
 		return fail(err)
 	}
+	opened.Store(struct{ Source }{src})
 	gate := func(ctx context.Context) (func(), error) { return m.gate.acquire(ctx, m.cfg.MaxFiles) }
 	onDone := func(order int, format string, data []byte) {
 		if err := m.disk.Put(f.Key, order, format, data); err != nil {

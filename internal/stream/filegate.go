@@ -188,6 +188,13 @@ func (g *FileGate) RunBackground(ctx context.Context, key string, limit func() i
 // GatedSource is a reader of a file (subextract.Source, structurally) whose reads
 // are background reads of Key.
 type GatedSource struct {
+	// reads are one at a time, as an extraction's are, so the time can be told
+	// between waiting for a slot and reading
+	readMu  sync.Mutex
+	mu      sync.Mutex
+	parked  time.Duration // waiting, over the reads that are over
+	waiting bool          // a read is in progress and is not reading now
+	since   time.Time     // when that wait began
 	Inner interface {
 		Size() int64
 		ReadAt(ctx context.Context, off int64, n int) ([]byte, error)
@@ -200,9 +207,41 @@ type GatedSource struct {
 
 func (s *GatedSource) Size() int64 { return s.Inner.Size() }
 
+// Parked is the time the reads have spent waiting for a slot rather than
+// reading, the wait in progress included, so that a deadline on the work can
+// leave it out.
+func (s *GatedSource) Parked() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.waiting {
+		return s.parked + time.Since(s.since)
+	}
+	return s.parked
+}
+
+func (s *GatedSource) park(on bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if on == s.waiting {
+		return
+	}
+	if on {
+		s.since = time.Now()
+	} else {
+		s.parked += time.Since(s.since)
+	}
+	s.waiting = on
+}
+
 func (s *GatedSource) ReadAt(ctx context.Context, off int64, n int) ([]byte, error) {
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
 	var out []byte
+	s.park(true)
+	defer s.park(false)
 	err := s.Gate.RunBackground(ctx, s.Key, s.Limit, func(c context.Context) error {
+		s.park(false)
+		defer s.park(true)
 		var err error
 		out, err = s.Inner.ReadAt(c, off, n)
 		return err

@@ -353,6 +353,10 @@ func (h *Handler) handleGetHeadPost(w http.ResponseWriter, r *http.Request) (sta
 	// Override the upstream User-Agent before resolving the link (see down.go);
 	// no-op when proxy_user_agent is unset.
 	common.ApplyProxyUserAgent(r, storage.GetStorage())
+	// A player on a WebDAV mount is a playback like any other: see HoldPlayback.
+	if end := common.HoldPlayback(storage, reqPath); end != nil {
+		defer end()
+	}
 	link, _, err := fs.Link(ctx, reqPath, model.LinkArgs{Header: r.Header})
 	if err != nil {
 		return http.StatusInternalServerError, err
