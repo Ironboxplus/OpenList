@@ -42,6 +42,9 @@ type Result struct {
 	// and valid but only covers part of the film, Done being the share read.
 	Partial bool
 	Done    float64
+	// Gaps: the track was read to the end but some of it could not be decoded.
+	// It is served, not cached; asking again reads it again.
+	Gaps bool
 }
 
 type entry struct {
@@ -252,7 +255,7 @@ func (m *Manager) Get(ctx context.Context, f File, order int, atMs int64, wait t
 		if err != nil && !complete {
 			return Result{}, err
 		}
-		return Result{Data: data, Format: format, Partial: !complete, Done: done}, nil
+		return Result{Data: data, Format: format, Partial: !complete, Done: done, Gaps: complete && task.Gaps(order)}, nil
 	}
 	return Result{}, lastErr
 }

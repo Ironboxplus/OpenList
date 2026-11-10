@@ -90,6 +90,8 @@ type container interface {
 	Header(order int) []byte
 	// Items lists every unit of one track, ordered by time.
 	Items(order int) ([]Item, error)
-	// Fetch reads and decodes a group of items that lie close together.
-	Fetch(ctx context.Context, w *window, items []Item) ([]Cue, error)
+	// Fetch reads and decodes a group of items that lie close together. An item
+	// that cannot be decoded is returned in failed and the others go on; err is
+	// a failure of the Source (or of ctx), which ends the group.
+	Fetch(ctx context.Context, w *window, items []Item) (cues []Cue, failed []Item, err error)
 }

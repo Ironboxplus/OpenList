@@ -117,6 +117,39 @@ func libraryVideoPaths() ([]string, error) {
 	return paths, nil
 }
 
+// openPrefetchTarget resolves a library path for the prefetch: the storage, the
+// file, and the tracks its provider already supplies.
+func openPrefetchTarget(ctx context.Context, path string) (*subextract.Target, error) {
+	storage, err := fs.GetStorage(path, &fs.GetStoragesArgs{})
+	if err != nil {
+		return nil, err
+	}
+	if !wantsExtraction(storage, stdpath.Base(path)) {
+		return nil, nil
+	}
+	obj, err := fs.Get(ctx, path, &fs.GetArgs{NoLog: true})
+	if err != nil || obj.IsDir() {
+		return nil, err
+	}
+	file := extractFile(storage, path, obj)
+	vsp, ok := storage.(driver.VideoSubtitleProvider)
+	if !ok {
+		return &subextract.Target{File: file}, nil
+	}
+	return &subextract.Target{File: file, Cover: func(ctx context.Context) (func(subextract.TrackInfo) bool, error) {
+		provided, err := vsp.VideoSubtitle(ctx, obj)
+		if err != nil {
+			return nil, err
+		}
+		return func(t subextract.TrackInfo) bool { return trackCovered(t, provided) }, nil
+	}}, nil
+}
+
+var (
+	prefetcherOnce sync.Once
+	prefetcher     *subextract.Prefetcher
+)
+
 func runPrefetchPass(ctx context.Context) {
 	paths, err := libraryVideoPaths()
 	prefetchUpdate(func(p *SubtitlePrefetchProgress) {
@@ -129,71 +162,19 @@ func runPrefetchPass(ctx context.Context) {
 		log.Warnf("subtitle prefetch: listing the library: %v", err)
 		return
 	}
-	mgr := SubtitleExtractor()
-	for _, path := range paths {
-		for mgr.Busy() && ctx.Err() == nil {
-			select {
-			case <-ctx.Done():
-			case <-time.After(prefetchBusyWait):
-			}
-		}
-		if ctx.Err() != nil {
-			break
-		}
-		prefetchUpdate(func(p *SubtitlePrefetchProgress) { p.Current = path })
-		n, err := prefetchFile(ctx, path)
-		failed := err != nil && ctx.Err() == nil
-		if failed {
-			log.Debugf("subtitle prefetch: %s: %v", path, err)
-		}
+	prefetcherOnce.Do(func() {
+		prefetcher = subextract.NewPrefetcher(SubtitleExtractor(), openPrefetchTarget)
+	})
+	prefetcher.Run(ctx, paths, func(st subextract.PrefetchState) {
 		prefetchUpdate(func(p *SubtitlePrefetchProgress) {
-			p.Files++
-			p.Tracks += n
-			if failed {
-				p.Failed++
-				p.Error = err.Error()
+			p.Files, p.Tracks, p.Failed, p.Current = st.Files, st.Tracks, st.Failed, st.Current
+			p.Running = st.Current != "" || st.Files < len(paths)
+			if st.Err != nil {
+				p.Error = st.Err.Error()
 			}
 		})
-	}
+	})
 	prefetchUpdate(func(p *SubtitlePrefetchProgress) { p.Running, p.Current = false, "" })
-}
-
-// prefetchFile extracts the tracks of one video that no provider file covers
-// and returns how many it put on disk.
-func prefetchFile(ctx context.Context, path string) (int, error) {
-	storage, err := fs.GetStorage(path, &fs.GetStoragesArgs{})
-	if err != nil {
-		return 0, err
-	}
-	if !wantsExtraction(storage, stdpath.Base(path)) {
-		return 0, nil
-	}
-	obj, err := fs.Get(ctx, path, &fs.GetArgs{NoLog: true})
-	if err != nil || obj.IsDir() {
-		return 0, err
-	}
-	mgr := SubtitleExtractor()
-	file := extractFile(storage, path, obj)
-	tracks, err := mgr.Tracks(ctx, file)
-	if err != nil {
-		return 0, err
-	}
-	var provided []driver.VideoSubtitleInfo
-	if vsp, ok := storage.(driver.VideoSubtitleProvider); ok {
-		if provided, err = vsp.VideoSubtitle(ctx, obj); err != nil {
-			return 0, err
-		}
-	}
-	var todo []int
-	for _, o := range missingTracks(tracks, provided) {
-		if !mgr.Cached(file, o) {
-			todo = append(todo, o)
-		}
-	}
-	if err := mgr.Fill(ctx, file, todo); err != nil {
-		return 0, err
-	}
-	return len(todo), nil
 }
 
 // missingTracks are the orders of the tracks that can be extracted and that none

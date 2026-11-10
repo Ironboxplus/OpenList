@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/media/ebml"
+	log "github.com/sirupsen/logrus"
 )
 
 // headRead is the first read of a Matroska file: the EBML header, the Segment
@@ -454,9 +455,9 @@ func (m *mkvFile) Items(order int) ([]Item, error) {
 // read goes before the block's own size is known.
 const blockHeadroom = 4096
 
-func (m *mkvFile) Fetch(ctx context.Context, w *window, items []Item) ([]Cue, error) {
+func (m *mkvFile) Fetch(ctx context.Context, w *window, items []Item) ([]Cue, []Item, error) {
 	if len(items) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	first, last := items[0].Pos, items[0].Pos
 	for _, it := range items {
@@ -468,17 +469,24 @@ func (m *mkvFile) Fetch(ctx context.Context, w *window, items []Item) ([]Cue, er
 		}
 	}
 	if _, err := w.get(ctx, first, int(last-first)+blockHeadroom); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var out []Cue
+	var failed []Item
 	for _, it := range items {
 		cues, err := m.readBlock(ctx, w, it)
+		var se *SourceError
+		if errors.As(err, &se) {
+			return nil, nil, err
+		}
 		if err != nil {
-			return nil, err
+			log.Warnf("subextract: block at byte %d: %v", it.Pos, err)
+			failed = append(failed, it)
+			continue
 		}
 		out = append(out, cues...)
 	}
-	return out, nil
+	return out, failed, nil
 }
 
 func validBlockStart(b []byte) bool {

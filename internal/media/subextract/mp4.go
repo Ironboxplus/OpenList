@@ -10,6 +10,7 @@ import (
 	"unicode/utf16"
 
 	mp4 "github.com/abema/go-mp4"
+	log "github.com/sirupsen/logrus"
 )
 
 // mp4Track is one subtitle track of an MP4/MOV file with its sample table
@@ -334,9 +335,9 @@ func (m *mp4File) Items(order int) ([]Item, error) {
 	return items, nil
 }
 
-func (m *mp4File) Fetch(ctx context.Context, w *window, items []Item) ([]Cue, error) {
+func (m *mp4File) Fetch(ctx context.Context, w *window, items []Item) ([]Cue, []Item, error) {
 	if len(items) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	first, end := items[0].Pos, items[0].Pos+items[0].Size
 	for _, it := range items {
@@ -348,18 +349,21 @@ func (m *mp4File) Fetch(ctx context.Context, w *window, items []Item) ([]Cue, er
 		}
 	}
 	if _, err := w.get(ctx, first, int(end-first)); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var out []Cue
+	var failed []Item
 	for _, it := range items {
 		t := m.subs[it.Track]
 		s := t.samples[it.ref.(int)]
 		data, err := w.get(ctx, it.Pos, int(it.Size))
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if int64(len(data)) < it.Size {
-			return nil, fmt.Errorf("subextract: sample at %d is cut off", it.Pos)
+			log.Warnf("subextract: %v", fmt.Errorf("sample at %d is cut off", it.Pos))
+			failed = append(failed, it)
+			continue
 		}
 		c := Cue{Track: it.Track, Start: s.startMs, End: s.startMs + s.durMs, PTS: s.startMs * 90}
 		switch t.sample {
@@ -377,7 +381,7 @@ func (m *mp4File) Fetch(ctx context.Context, w *window, items []Item) ([]Cue, er
 		}
 		out = append(out, c)
 	}
-	return out, nil
+	return out, failed, nil
 }
 
 // movTextSample is the text of a tx3g sample: a 16-bit length, then that many

@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"sort"
 	"sync"
-
-	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -69,6 +67,9 @@ type trackState struct {
 	cues   []Cue
 	hot    bool
 	err    error
+	// gaps is set when a unit of the track could not be read or decoded: what
+	// there is can be served, but it is not the whole track and is never kept.
+	gaps bool
 	// rendered is the file for the cues so far, kept until more arrive.
 	rendered   []byte
 	renderedAt int
@@ -245,6 +246,15 @@ func (t *Task) Wait(ctx context.Context, order int) {
 	}
 }
 
+// Gaps is true when the track is whole except for units that could not be read
+// or decoded.
+func (t *Task) Gaps(order int) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	st := t.tracks[order]
+	return st != nil && st.gaps
+}
+
 // Done is true once nothing is left to read for the tracks asked for.
 func (t *Task) Done() bool {
 	t.mu.Lock()
@@ -347,18 +357,22 @@ func (t *Task) run() {
 		}
 		t.mu.Unlock()
 
-		cues, err := t.c.Fetch(t.ctx, w, group)
-		var se *SourceError
-		if err != nil && (errors.As(err, &se) || t.ctx.Err() != nil) {
+		cues, failed, err := t.c.Fetch(t.ctx, w, group)
+		if err != nil || t.ctx.Err() != nil {
+			if err == nil {
+				err = t.ctx.Err()
+			}
 			t.fail(err)
 			return
-		}
-		if err != nil {
-			log.Warnf("subextract: skipping %d unit(s) near byte %d: %v", len(group), group[0].Pos, err)
 		}
 
 		var finished []int
 		t.mu.Lock()
+		for _, it := range failed {
+			if st := t.tracks[it.Track]; st != nil {
+				st.gaps = true
+			}
+		}
 		for _, c := range cues {
 			if st := t.tracks[c.Track]; st != nil {
 				st.cues = append(st.cues, c)
@@ -372,7 +386,7 @@ func (t *Task) run() {
 			if !st.taken[it.idx] {
 				st.taken[it.idx] = true
 				st.nTaken++
-				if st.done() {
+				if st.done() && !st.gaps {
 					finished = append(finished, it.Track)
 				}
 			}

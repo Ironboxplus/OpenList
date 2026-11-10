@@ -211,6 +211,10 @@ func SubtitleExtract(c *gin.Context) {
 	if res.Partial {
 		c.Header(ExtractHeader, fmt.Sprintf("partial; done=%.2f", res.Done))
 		c.Header("Cache-Control", "no-store")
+	} else if res.Gaps {
+		// Whole, bar what could not be decoded: not kept, so not cached either.
+		c.Header(ExtractHeader, "complete; gaps")
+		c.Header("Cache-Control", "no-store")
 	} else {
 		c.Header(ExtractHeader, "complete")
 		c.Header("Cache-Control", "private, max-age=600")
