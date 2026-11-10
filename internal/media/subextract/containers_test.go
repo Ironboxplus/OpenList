@@ -119,18 +119,12 @@ func TestUnsupportedCodecsAreListedNotExtracted(t *testing.T) {
 // the timestamps.
 func toVTT(srt []byte) []byte {
 	var b strings.Builder
-	b.WriteString("WEBVTT
-
-")
-	for _, l := range strings.Split(strings.ReplaceAll(string(srt), "
-", "
-"), "
-") {
+	b.WriteString("WEBVTT\n\n")
+	for _, l := range strings.Split(strings.ReplaceAll(string(srt), "\r\n", "\n"), "\n") {
 		if strings.Contains(l, "-->") {
 			l = strings.ReplaceAll(l, ",", ".")
 		}
-		b.WriteString(l + "
-")
+		b.WriteString(l + "\n")
 	}
 	return []byte(b.String())
 }
