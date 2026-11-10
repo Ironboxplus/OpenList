@@ -41,6 +41,11 @@ jobs:
             pkgs: ./internal/cluster ./drivers/115_open ./internal/op
           - name: handles
             pkgs: ./server/handles
+          # Subtitle extraction reads real MKV/MP4 files made by ffmpeg and
+          # mkvmerge and compares with what ffmpeg writes for the same track.
+          - name: subextract
+            pkgs: ./internal/media/ebml ./internal/media/check ./internal/media/subextract
+            apt: ffmpeg mkvtoolnix
           # Everything else, so a merge of upstream is checked against the
           # tests of every package it touched (blackbox needs its own tag and
           # runs in the job below).
@@ -61,6 +66,13 @@ jobs:
         run: |
           mkdir -p public/dist
           [ -e public/dist/index.html ] || echo '<!doctype html>' > public/dist/index.html
+      - name: Install media tools
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ${{ matrix.apt }}
+          ffmpeg -hide_banner -version | head -1
+          mkvmerge --version
       - name: go build, go vet
         env:
           TAGS: ${{ matrix.tags }}
@@ -72,6 +84,9 @@ jobs:
         env:
           TAGS: ${{ matrix.tags }}
           PKGS: ${{ matrix.pkgs }}
+          # the extraction tests fail, rather than skip, when ffmpeg or mkvmerge
+          # is missing; only the job that installs them asks for that
+          SUBEXTRACT_REQUIRE: ${{ matrix.apt != '' && '1' || '0' }}
         run: |
           set -o pipefail
           go test -count=1 -timeout 20m -tags "$TAGS" $PKGS 2>&1 | tee "$RUNNER_TEMP/test.log"

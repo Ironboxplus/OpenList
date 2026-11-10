@@ -214,6 +214,9 @@ const (
 	MediaDownloadCover     = "media_download_cover"   // 是否把远程封面下载到本地存储
 
 	// media library master switch & protocol switches
+	SubtitleCacheMaxMB         = "subtitle_cache_max_mb"        // 提取出的字幕在磁盘上的缓存上限（MiB）
+	SubtitleExtractConcurrency = "subtitle_extract_concurrency" // 同时从几个视频文件里抽字幕
+	SubtitlePrefetchLibrary    = "subtitle_prefetch_library"    // 后台按媒体库逐个文件预抽缺失的内嵌字幕（默认关）
 	MediaEnabled             = "media_enabled"                      // 媒体库总开关（PUBLIC，前端据此显示/隐藏）
 	MediaEmbyEnabled         = "media_emby_enabled"                 // Emby 兼容 API 开关
 	MediaSubsonicEnabled     = "media_subsonic_enabled"             // OpenSubsonic API 开关

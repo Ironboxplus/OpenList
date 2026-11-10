@@ -149,6 +149,10 @@ func Init(e *gin.Engine) {
 	api.GET("/plugin/manifest", handles.PluginManifest)
 	api.GET("/plugin/asset/:name", handles.PluginAsset)
 
+	// An extracted subtitle track: fetched by the player itself, so it is
+	// authorised by its signed URL rather than a login.
+	api.GET("/fs/subtitle_extract", handles.SubtitleExtract)
+
 	// Cluster storage-sync peer endpoint: a persistent WebSocket so NAT'd nodes
 	// can dial out and stay connected. Authentication/encryption come from the
 	// cluster pre-shared key (per-frame AEAD), not the HTTP layer.

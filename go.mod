@@ -8,6 +8,7 @@ require (
 	github.com/Ironboxplus/cfs v0.0.0-20261109150204-a5b966d5a400
 	github.com/KarpelesLab/reflink v1.0.2
 	github.com/KirCute/zip v1.0.1
+	github.com/abema/go-mp4 v1.7.4
 	github.com/OpenListTeam/115-sdk-go v0.2.6
 	github.com/OpenListTeam/go-cache v0.1.0
 	github.com/OpenListTeam/gofakes3 v0.8.2
@@ -306,6 +307,7 @@ require (
 	github.com/sorairolake/lzip-go v0.3.8 // indirect
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/stangelandcl/ppmd v0.1.1 // indirect
+	github.com/sunfish-shogi/bufseekio v0.0.0-20210207115823-a4185644b365 // indirect
 	github.com/taruti/bytepool v0.0.0-20160310082835-5e3a9ea56543 // indirect
 	github.com/templexxx/cpu v0.1.1 // indirect
 	github.com/templexxx/xorsimd v0.4.3 // indirect

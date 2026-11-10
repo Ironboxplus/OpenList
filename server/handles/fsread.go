@@ -553,6 +553,10 @@ func FsVideoSubtitle(c *gin.Context) {
 	// frontend doesn't have to compute it from `related`.
 	subs := resolveSidecarSubtitles(c, reqPath, obj)
 	subs = append(subs, providerSubtitles(c, storage, obj, req.SidecarOnly)...)
+	// In-band tracks no provider file stands in for, extracted by OpenList itself.
+	if !req.SidecarOnly {
+		subs = append(subs, extractedSubtitles(c, storage, reqPath, obj, subs)...)
+	}
 	common.SuccessResp(c, subs)
 }
 

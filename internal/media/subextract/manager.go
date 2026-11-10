@@ -1,0 +1,309 @@
+package subextract
+
+import (
+	"context"
+	"errors"
+	"path/filepath"
+	"sync"
+	"time"
+
+	log "github.com/sirupsen/logrus"
+)
+
+// taskTimeout is how long one file may be read before the task is dropped.
+const taskTimeout = 15 * time.Minute
+
+// File is one file the manager can extract from. Key identifies the file's
+// revision (storage mount, path, size, modification time), so that a replaced
+// file is not served from the cache of the one before it.
+type File struct {
+	Key string
+	// Open makes the Source and a function that releases whatever backs it (the
+	// link). It is called once per task.
+	Open func(ctx context.Context) (Source, func(), error)
+}
+
+// Config is the manager's settings, read when they matter so that a change in
+// the settings page takes effect without a restart.
+type Config struct {
+	// Dir is where finished tracks are kept.
+	Dir string
+	// MaxCacheBytes bounds the files under Dir.
+	MaxCacheBytes func() int64
+	// MaxFiles is how many files are read at once.
+	MaxFiles func() int
+}
+
+// Result is what a request for a track gets.
+type Result struct {
+	Data   []byte
+	Format string
+	// Partial is true while the track is still being read: Data is complete
+	// and valid but only covers part of the film, Done being the share read.
+	Partial bool
+	Done    float64
+}
+
+type entry struct {
+	ready chan struct{}
+	task  *Task
+	err   error
+}
+
+// Manager runs one task per file, however many requests ask for it.
+type Manager struct {
+	cfg   Config
+	disk  *diskCache
+	gate  limiter
+	mu    sync.Mutex
+	tasks map[string]*entry
+	probe map[string][]TrackInfo
+	order []string // probe keys, oldest first
+}
+
+const probeCacheMax = 256
+
+// NewManager builds a manager. Zero settings get defaults: 512 MiB of cache,
+// two files at a time.
+func NewManager(cfg Config) *Manager {
+	if cfg.MaxCacheBytes == nil {
+		cfg.MaxCacheBytes = func() int64 { return 512 << 20 }
+	}
+	if cfg.MaxFiles == nil {
+		cfg.MaxFiles = func() int { return 2 }
+	}
+	return &Manager{
+		cfg:   cfg,
+		disk:  &diskCache{dir: filepath.Clean(cfg.Dir), max: cfg.MaxCacheBytes},
+		gate:  limiter{wake: make(chan struct{})},
+		tasks: map[string]*entry{},
+		probe: map[string][]TrackInfo{},
+	}
+}
+
+// Tracks lists the subtitle tracks of the file, remembering the answer.
+func (m *Manager) Tracks(ctx context.Context, f File) ([]TrackInfo, error) {
+	m.mu.Lock()
+	if t, ok := m.probe[f.Key]; ok {
+		m.mu.Unlock()
+		return t, nil
+	}
+	if e := m.tasks[f.Key]; e != nil && e.task != nil {
+		tracks := e.task.Tracks()
+		m.mu.Unlock()
+		return tracks, nil
+	}
+	m.mu.Unlock()
+
+	src, closeFn, err := f.Open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer closeFn()
+	tracks, err := Probe(ctx, src)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	if _, ok := m.probe[f.Key]; !ok {
+		m.probe[f.Key] = tracks
+		m.order = append(m.order, f.Key)
+		if len(m.order) > probeCacheMax {
+			delete(m.probe, m.order[0])
+			m.order = m.order[1:]
+		}
+	}
+	m.mu.Unlock()
+	return tracks, nil
+}
+
+// Cached reports whether a track of the file is already a finished file on disk.
+func (m *Manager) Cached(f File, order int) bool {
+	_, _, ok := m.disk.Get(f.Key, order)
+	return ok
+}
+
+// Prepare starts reading the given tracks in the background, behind any track a
+// viewer asks for. Tracks already on disk are skipped.
+func (m *Manager) Prepare(f File, orders []int) {
+	var todo []int
+	for _, o := range orders {
+		if !m.Cached(f, o) {
+			todo = append(todo, o)
+		}
+	}
+	if len(todo) == 0 {
+		return
+	}
+	go func() {
+		for attempt := 0; attempt < 2; attempt++ {
+			task, err := m.taskFor(f)
+			if err != nil {
+				log.Debugf("subextract: prepare: %v", err)
+				return
+			}
+			closed := false
+			for _, o := range todo {
+				if err := task.Want(o, false, -1); errors.Is(err, errTaskClosed) {
+					closed = true
+					break
+				} else if err != nil {
+					log.Debugf("subextract: prepare track %d: %v", o, err)
+				}
+			}
+			if !closed {
+				return
+			}
+		}
+	}()
+}
+
+// Get returns a track, waiting up to wait for it to have something to show. at
+// is the playback position in milliseconds: reading starts there.
+func (m *Manager) Get(ctx context.Context, f File, order int, atMs int64, wait time.Duration) (Result, error) {
+	if data, format, ok := m.disk.Get(f.Key, order); ok {
+		return Result{Data: data, Format: format, Done: 1}, nil
+	}
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		task, err := m.taskFor(f)
+		if err != nil {
+			return Result{}, err
+		}
+		if err := task.Want(order, true, atMs); errors.Is(err, errTaskClosed) {
+			lastErr = err
+			continue
+		} else if err != nil {
+			return Result{}, err
+		}
+		wctx, cancel := context.WithTimeout(ctx, wait)
+		task.Wait(wctx, order)
+		cancel()
+		data, format, done, complete, err := task.Snapshot(order)
+		if err != nil && !complete {
+			return Result{}, err
+		}
+		return Result{Data: data, Format: format, Partial: !complete, Done: done}, nil
+	}
+	return Result{}, lastErr
+}
+
+// Busy is true while a track a viewer asked for is being read: work that can
+// wait (reading a whole library ahead) waits for it.
+func (m *Manager) Busy() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, e := range m.tasks {
+		if e.task != nil && e.task.Hot() {
+			return true
+		}
+	}
+	return false
+}
+
+// taskFor returns the file's running task, making it if there is none. Only
+// one caller makes it; the others wait for the same result.
+func (m *Manager) taskFor(f File) (*Task, error) {
+	m.mu.Lock()
+	if e, ok := m.tasks[f.Key]; ok {
+		m.mu.Unlock()
+		<-e.ready
+		return e.task, e.err
+	}
+	e := &entry{ready: make(chan struct{})}
+	m.tasks[f.Key] = e
+	m.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), taskTimeout)
+	var closeFn func()
+	fail := func(err error) (*Task, error) {
+		cancel()
+		if closeFn != nil {
+			closeFn()
+		}
+		m.mu.Lock()
+		delete(m.tasks, f.Key)
+		m.mu.Unlock()
+		e.err = err
+		close(e.ready)
+		return nil, err
+	}
+	src, closeFn, err := f.Open(ctx)
+	if err != nil {
+		return fail(err)
+	}
+	gate := func(ctx context.Context) (func(), error) { return m.gate.acquire(ctx, m.cfg.MaxFiles) }
+	onDone := func(order int, format string, data []byte) {
+		if err := m.disk.Put(f.Key, order, format, data); err != nil {
+			log.Warnf("subextract: cache write: %v", err)
+		}
+	}
+	task, err := newTask(ctx, src, gate, onDone)
+	if err != nil {
+		return fail(err)
+	}
+	e.task = task
+	close(e.ready)
+	// Release the file when the work is done: the task and its link do not
+	// outlive the last track asked for.
+	go func() {
+		defer cancel()
+		defer closeFn()
+		for {
+			select {
+			case <-task.Idle():
+				m.mu.Lock()
+				if task.Done() {
+					task.Close()
+					delete(m.tasks, f.Key)
+					m.mu.Unlock()
+					return
+				}
+				m.mu.Unlock()
+				// Asked again while this ran down: the loop restarted.
+				time.Sleep(10 * time.Millisecond)
+			case <-ctx.Done():
+				task.Close()
+				m.mu.Lock()
+				delete(m.tasks, f.Key)
+				m.mu.Unlock()
+				return
+			}
+		}
+	}()
+	return task, nil
+}
+
+// limiter is a counting semaphore whose limit is read at each attempt.
+type limiter struct {
+	mu     sync.Mutex
+	active int
+	wake   chan struct{}
+}
+
+func (l *limiter) acquire(ctx context.Context, max func() int) (func(), error) {
+	for {
+		l.mu.Lock()
+		if limit := max(); l.active < limit || limit <= 0 && l.active == 0 {
+			l.active++
+			l.mu.Unlock()
+			return l.release, nil
+		}
+		ch := l.wake
+		l.mu.Unlock()
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func (l *limiter) release() {
+	l.mu.Lock()
+	l.active--
+	close(l.wake)
+	l.wake = make(chan struct{})
+	l.mu.Unlock()
+}

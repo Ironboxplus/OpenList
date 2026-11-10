@@ -4,21 +4,23 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/OpenListTeam/OpenList/v4/internal/media/ebml"
 )
 
 // Matroska element ids this probe cares about.
 const (
-	idEBML      = 0x1A45DFA3
-	idSegment   = 0x18538067
-	idTracks    = 0x1654AE6B
-	idCluster   = 0x1F43B675
-	idTrackEnt  = 0xAE
-	idTrackNum  = 0xD7
-	idTrackType = 0x83
-	idCodecID   = 0x86
-	idLanguage  = 0x22B59C
-	idLangBCP47 = 0x22B59D
-	idTrackName = 0x536E
+	idEBML      = ebml.IDEBML
+	idSegment   = ebml.IDSegment
+	idTracks    = ebml.IDTracks
+	idCluster   = ebml.IDCluster
+	idTrackEnt  = ebml.IDTrackEntry
+	idTrackNum  = ebml.IDTrackNumber
+	idTrackType = ebml.IDTrackType
+	idCodecID   = ebml.IDCodecID
+	idLanguage  = ebml.IDLanguage
+	idLangBCP47 = ebml.IDLanguageBCP47
+	idTrackName = ebml.IDTrackName
 )
 
 // TrackSubtitle is the Matroska TrackType of a subtitle track.
@@ -36,58 +38,13 @@ type Track struct {
 // ErrNoTracks means the head of the file ended before the Tracks element.
 var ErrNoTracks = errors.New("no Tracks element in the bytes read")
 
-func readID(b []byte, pos int) (id uint32, n int, ok bool) {
-	if pos >= len(b) {
-		return 0, 0, false
-	}
-	first := b[pos]
-	n = 1
-	for mask := byte(0x80); mask != 0 && first&mask == 0; mask >>= 1 {
-		n++
-	}
-	if n > 4 || pos+n > len(b) {
-		return 0, 0, false
-	}
-	for i := 0; i < n; i++ {
-		id = id<<8 | uint32(b[pos+i])
-	}
-	return id, n, true
-}
-
-// readSize returns the payload size; unknown is true for the reserved
-// all-ones value (a live-streamed Segment or Cluster).
-func readSize(b []byte, pos int) (size int64, n int, unknown, ok bool) {
-	if pos >= len(b) {
-		return 0, 0, false, false
-	}
-	first := b[pos]
-	n = 1
-	mask := byte(0x80)
-	for mask != 0 && first&mask == 0 {
-		mask >>= 1
-		n++
-	}
-	if mask == 0 || pos+n > len(b) {
-		return 0, 0, false, false
-	}
-	v := int64(first & (mask - 1))
-	allOnes := first&(mask-1) == mask-1
-	for i := 1; i < n; i++ {
-		v = v<<8 | int64(b[pos+i])
-		if b[pos+i] != 0xFF {
-			allOnes = false
-		}
-	}
-	return v, n, allOnes, true
-}
-
-func readUint(b []byte) int {
-	v := 0
-	for _, x := range b {
-		v = v<<8 | int(x)
-	}
-	return v
-}
+// The EBML framing lives in internal/media/ebml, shared with the subtitle
+// extractor; these keep the probe below readable.
+var (
+	readID   = ebml.ReadID
+	readSize = ebml.ReadSize
+	readUint = ebml.ReadUint
+)
 
 // ParseMKVTracks reads the Tracks element out of the first bytes of a
 // Matroska file. A Tracks element cut off by the end of b yields the tracks
