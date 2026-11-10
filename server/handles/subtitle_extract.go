@@ -219,9 +219,12 @@ func SubtitleExtract(c *gin.Context) {
 		common.ErrorStrResp(c, "track is invalid", 400)
 		return
 	}
-	at, _ := strconv.ParseFloat(c.Query("at"), 64)
-	if at < 0 {
-		at = 0
+	// Where reading starts: the playback position when the player says it, and
+	// otherwise wherever it already is (a request without one must not pull a
+	// read that follows a viewer back to the start).
+	atMs := int64(-1)
+	if at, err := strconv.ParseFloat(c.Query("at"), 64); err == nil && at >= 0 {
+		atMs = int64(at * 1000)
 	}
 	storage, err := fs.GetStorage(path, &fs.GetStoragesArgs{})
 	if err != nil {
@@ -237,7 +240,7 @@ func SubtitleExtract(c *gin.Context) {
 		common.ErrorStrResp(c, "not a video container", 400)
 		return
 	}
-	res, err := SubtitleExtractor().Get(c.Request.Context(), extractFile(storage, path, obj), order, int64(at*1000), extractFirstWait)
+	res, err := SubtitleExtractor().Get(c.Request.Context(), extractFile(storage, path, obj), order, atMs, extractFirstWait)
 	if err != nil {
 		common.ErrorResp(c, err, 500)
 		return
