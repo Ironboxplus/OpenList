@@ -2,6 +2,7 @@ package subextract
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -13,12 +14,17 @@ import (
 type Target struct {
 	File  File
 	Cover func(ctx context.Context) (func(TrackInfo) bool, error)
+	// Streaming reports that a viewer may be reading the file right now: the
+	// storage lets a file be read over one connection at a time, so it is left
+	// for a later pass. nil means never.
+	Streaming func() bool
 }
 
 // PrefetchState is what a pass reports after each file.
 type PrefetchState struct {
-	// Files looked at so far; Tracks put on disk by this pass; Failed files.
-	Files, Tracks, Failed int
+	// Files looked at so far; Tracks put on disk by this pass; Failed files;
+	// Skipped files, which a viewer was reading.
+	Files, Tracks, Failed, Skipped int
 	// Current is the file being worked on, "" between files.
 	Current string
 	Err     error
@@ -36,6 +42,9 @@ type Prefetcher struct {
 	mu       sync.Mutex
 	done     map[string]bool
 }
+
+// errStreaming: the file is left for a later pass.
+var errStreaming = errors.New("subextract: a viewer is reading the file")
 
 func NewPrefetcher(m *Manager, open func(ctx context.Context, path string) (*Target, error)) *Prefetcher {
 	return &Prefetcher{m: m, Open: open, busyWait: 2 * time.Second, done: map[string]bool{}}
@@ -59,6 +68,10 @@ func (p *Prefetcher) Run(ctx context.Context, paths []string, report func(Prefet
 		st.Current = path
 		report(st)
 		n, err := p.one(ctx, path)
+		if err == errStreaming {
+			st.Skipped++
+			err = nil
+		}
 		st.Files++
 		st.Tracks += n
 		if err != nil && ctx.Err() == nil {
@@ -80,6 +93,9 @@ func (p *Prefetcher) one(ctx context.Context, path string) (int, error) {
 	p.mu.Unlock()
 	if done {
 		return 0, nil
+	}
+	if target.Streaming != nil && target.Streaming() {
+		return 0, errStreaming
 	}
 	tracks, err := p.m.Tracks(ctx, target.File)
 	if err != nil {

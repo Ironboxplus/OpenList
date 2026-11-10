@@ -65,6 +65,7 @@ type served struct {
 	bytes    int64
 	offsets  []int64
 	fail     func(n int) bool // makes the nth request (1-based) answer 403
+	delay    time.Duration    // added to every answer, for a storage that is slow
 }
 
 var rangeRe = regexp.MustCompile(`^bytes=(\d+)-(\d*)$`)
@@ -87,7 +88,7 @@ func serve(t *testing.T, data []byte) *served {
 			s.mu.Unlock()
 		}()
 		// long enough that two overlapping requests would be seen as such
-		time.Sleep(2 * time.Millisecond)
+		time.Sleep(2*time.Millisecond + s.delay)
 		if s.fail != nil && s.fail(n) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return

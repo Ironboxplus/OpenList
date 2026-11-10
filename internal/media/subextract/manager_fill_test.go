@@ -116,3 +116,57 @@ func TestDiskCacheDropsTheLeastRecentlyUsed(t *testing.T) {
 		t.Errorf("%d files in the cache directory, want 2", len(m))
 	}
 }
+
+func TestListingDoesNotWaitForASlowProbeAndReadsNothingElse(t *testing.T) {
+	f := makeFilm(t)
+	s := serve(t, f.data)
+	s.delay = 400 * time.Millisecond
+	m := NewManager(Config{Dir: t.TempDir()})
+	file := filmFile(s, f)
+
+	start := time.Now()
+	tracks, ready, err := m.TracksWithin(context.Background(), file, 30*time.Millisecond)
+	if err != nil || ready || tracks != nil {
+		t.Fatalf("a slow probe answered at once: ready=%v err=%v", ready, err)
+	}
+	if time.Since(start) > 300*time.Millisecond {
+		t.Errorf("TracksWithin waited %v for a probe it was told not to wait for", time.Since(start))
+	}
+
+	// asked again while the probe runs, it is the same probe, and it finishes
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		tracks, ready, err = m.TracksWithin(context.Background(), file, 50*time.Millisecond)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ready {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the background probe never finished")
+		}
+	}
+	if len(tracks) != 5 {
+		t.Fatalf("%d tracks", len(tracks))
+	}
+	// once: one probe for all the asking, and no block of any track read after it
+	n, _, maxIn := s.stats()
+	time.Sleep(300 * time.Millisecond)
+	if after, _, _ := s.stats(); after != n || maxIn != 1 {
+		t.Errorf("requests went from %d to %d, %d in flight at once: listing read more than the head", n, after, maxIn)
+	}
+	if n > 2 {
+		t.Errorf("%d requests for one probe", n)
+	}
+	for o := range tracks {
+		if m.Cached(file, o) {
+			t.Errorf("track %d is on disk after a listing", o)
+		}
+	}
+
+	// known now: answered at once
+	if _, ready, _ := m.TracksWithin(context.Background(), file, time.Nanosecond); !ready {
+		t.Error("a probed file is not answered from memory")
+	}
+}

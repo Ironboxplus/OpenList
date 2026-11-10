@@ -208,3 +208,33 @@ func TestPrefetchLooksAgainAtAFileThatFailed(t *testing.T) {
 		t.Fatalf("second pass: %+v", st)
 	}
 }
+
+func TestPrefetchLeavesAFileAViewerIsReadingForALaterPass(t *testing.T) {
+	data := assFile(5)
+	s := serve(t, data)
+	viewing := true
+	m := NewManager(Config{Dir: t.TempDir()})
+	p := NewPrefetcher(m, func(ctx context.Context, path string) (*Target, error) {
+		return &Target{
+			File: File{Key: "viewed|1", Open: func(ctx context.Context) (Source, func(), error) {
+				src, err := NewLinkSource(linkTo(s), int64(len(data)))
+				return src, func() {}, err
+			}},
+			Streaming: func() bool { return viewing },
+		}, nil
+	})
+	p.busyWait = time.Millisecond
+	var st PrefetchState
+	p.Run(context.Background(), []string{"/a.mkv"}, func(s PrefetchState) { st = s })
+	if reqs, _, _ := s.stats(); reqs != 0 {
+		t.Fatalf("%d request(s) for a file a viewer is reading", reqs)
+	}
+	if st.Skipped != 1 || st.Failed != 0 || st.Tracks != 0 {
+		t.Fatalf("first pass: %+v", st)
+	}
+	viewing = false
+	p.Run(context.Background(), []string{"/a.mkv"}, func(s PrefetchState) { st = s })
+	if st.Skipped != 0 || st.Tracks != 1 {
+		t.Fatalf("second pass: %+v", st)
+	}
+}

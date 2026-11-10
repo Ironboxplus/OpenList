@@ -62,6 +62,8 @@ type Manager struct {
 	mu    sync.Mutex
 	tasks map[string]*entry
 	probe map[string][]TrackInfo
+	// probing are the probes TracksWithin has running, by file.
+	probing map[string]*probeCall
 	order []string // probe keys, oldest first
 }
 
@@ -77,11 +79,12 @@ func NewManager(cfg Config) *Manager {
 		cfg.MaxFiles = func() int { return 2 }
 	}
 	return &Manager{
-		cfg:   cfg,
-		disk:  &diskCache{dir: filepath.Clean(cfg.Dir), max: cfg.MaxCacheBytes},
-		gate:  limiter{wake: make(chan struct{})},
-		tasks: map[string]*entry{},
-		probe: map[string][]TrackInfo{},
+		cfg:     cfg,
+		disk:    &diskCache{dir: filepath.Clean(cfg.Dir), max: cfg.MaxCacheBytes},
+		gate:    limiter{wake: make(chan struct{})},
+		tasks:   map[string]*entry{},
+		probe:   map[string][]TrackInfo{},
+		probing: map[string]*probeCall{},
 	}
 }
 
@@ -121,45 +124,62 @@ func (m *Manager) Tracks(ctx context.Context, f File) ([]TrackInfo, error) {
 	return tracks, nil
 }
 
+// probeCall is a probe running in the background for TracksWithin.
+type probeCall struct {
+	done   chan struct{}
+	tracks []TrackInfo
+	err    error
+}
+
+// probeBudget is how long a background probe may take.
+const probeBudget = 2 * time.Minute
+
+// TracksWithin is Tracks for a caller that cannot wait: when the file's tracks
+// are not known yet and the probe takes longer than wait, it returns ready=false
+// and the probe carries on in the background, so that the next call has them.
+// Calls for the same file share one probe.
+func (m *Manager) TracksWithin(ctx context.Context, f File, wait time.Duration) (tracks []TrackInfo, ready bool, err error) {
+	m.mu.Lock()
+	_, known := m.probe[f.Key]
+	if e := m.tasks[f.Key]; e != nil && e.task != nil {
+		known = true
+	}
+	m.mu.Unlock()
+	if known {
+		tracks, err = m.Tracks(ctx, f)
+		return tracks, err == nil, err
+	}
+
+	m.mu.Lock()
+	call := m.probing[f.Key]
+	if call == nil {
+		call = &probeCall{done: make(chan struct{})}
+		m.probing[f.Key] = call
+		go func() {
+			bg, cancel := context.WithTimeout(context.Background(), probeBudget)
+			defer cancel()
+			call.tracks, call.err = m.Tracks(bg, f)
+			m.mu.Lock()
+			delete(m.probing, f.Key)
+			m.mu.Unlock()
+			close(call.done)
+		}()
+	}
+	m.mu.Unlock()
+	select {
+	case <-call.done:
+		return call.tracks, call.err == nil, call.err
+	case <-time.After(wait):
+		return nil, false, nil
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
+}
+
 // Cached reports whether a track of the file is already a finished file on disk.
 func (m *Manager) Cached(f File, order int) bool {
 	_, _, ok := m.disk.Get(f.Key, order)
 	return ok
-}
-
-// Prepare starts reading the given tracks in the background, behind any track a
-// viewer asks for. Tracks already on disk are skipped.
-func (m *Manager) Prepare(f File, orders []int) {
-	var todo []int
-	for _, o := range orders {
-		if !m.Cached(f, o) {
-			todo = append(todo, o)
-		}
-	}
-	if len(todo) == 0 {
-		return
-	}
-	go func() {
-		for attempt := 0; attempt < 2; attempt++ {
-			task, err := m.taskFor(f)
-			if err != nil {
-				log.Debugf("subextract: prepare: %v", err)
-				return
-			}
-			closed := false
-			for _, o := range todo {
-				if err := task.Want(o, false, -1); errors.Is(err, errTaskClosed) {
-					closed = true
-					break
-				} else if err != nil {
-					log.Debugf("subextract: prepare track %d: %v", o, err)
-				}
-			}
-			if !closed {
-				return
-			}
-		}
-	}()
 }
 
 // Fill reads the given tracks of the file to the end, in the background's

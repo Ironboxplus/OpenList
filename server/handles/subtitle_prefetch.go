@@ -13,6 +13,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/media"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/subextract"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
+	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
@@ -27,6 +28,9 @@ const (
 	prefetchPoll     = 5 * time.Second
 	prefetchRepeat   = time.Hour
 	prefetchBusyWait = 2 * time.Second
+	// prefetchStreamGrace is how long after OpenList last handed a file to a
+	// viewer the prefetch leaves it alone.
+	prefetchStreamGrace = 5 * time.Minute
 )
 
 // SubtitlePrefetchProgress is what the settings page shows.
@@ -132,11 +136,12 @@ func openPrefetchTarget(ctx context.Context, path string) (*subextract.Target, e
 		return nil, err
 	}
 	file := extractFile(storage, path, obj)
+	streaming := func() bool { return stream.ServedWithin(path, prefetchStreamGrace) }
 	vsp, ok := storage.(driver.VideoSubtitleProvider)
 	if !ok {
-		return &subextract.Target{File: file}, nil
+		return &subextract.Target{File: file, Streaming: streaming}, nil
 	}
-	return &subextract.Target{File: file, Cover: func(ctx context.Context) (func(subextract.TrackInfo) bool, error) {
+	return &subextract.Target{File: file, Streaming: streaming, Cover: func(ctx context.Context) (func(subextract.TrackInfo) bool, error) {
 		provided, err := vsp.VideoSubtitle(ctx, obj)
 		if err != nil {
 			return nil, err
