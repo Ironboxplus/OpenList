@@ -20,6 +20,13 @@ type Pan115Share struct {
 	limiter *rate.Limiter
 }
 
+// MaxDownloadConnectionsPerFile is the max_conns_per_file setting, 2 when the
+// storage has none: the 115 CDN refuses (403) a connection beyond its limit for
+// one file, from another IP of the same account as well.
+func (d *Pan115Share) MaxDownloadConnectionsPerFile() int {
+	return driver.ConnectionsSetting(d.MaxConnsPerFile)
+}
+
 func (d *Pan115Share) Config() driver.Config {
 	return config
 }

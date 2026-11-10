@@ -267,10 +267,7 @@ func (d *Open115) List(ctx context.Context, dir model.Obj, args model.ListArgs) 
 // one file, from another IP of the same account as well (measured with links from
 // DownURL, where the second concurrent connection was refused).
 func (d *Open115) MaxDownloadConnectionsPerFile() int {
-	if d.MaxConnsPerFile == nil {
-		return 2
-	}
-	return *d.MaxConnsPerFile
+	return driver.ConnectionsSetting(d.MaxConnsPerFile)
 }
 
 func (d *Open115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
