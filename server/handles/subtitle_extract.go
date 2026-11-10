@@ -159,48 +159,11 @@ func embeddedAgrees(t subextract.TrackInfo, s driver.VideoSubtitleInfo) bool {
 	if s.EmbeddedTitle != "" && t.Title != "" {
 		return sameText(s.EmbeddedTitle, t.Title)
 	}
-	return sameLanguage(t.Language, s.Language)
+	return subextract.SameLanguage(t.Language, s.Language)
 }
 
 func sameText(a, b string) bool {
 	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
-}
-
-// languageGroups lists the codes one language goes by: ISO 639-2/B, 639-2/T and
-// 639-1, for the languages that matter here. A code in no group stands for
-// itself.
-var languageGroups = [][]string{
-	{"chi", "zho", "zh", "cmn", "yue"}, {"eng", "en"}, {"jpn", "ja"}, {"kor", "ko"},
-	{"spa", "es"}, {"fre", "fra", "fr"}, {"ger", "deu", "de"}, {"ita", "it"},
-	{"por", "pt"}, {"rus", "ru"}, {"ara", "ar"}, {"tha", "th"}, {"vie", "vi"},
-	{"may", "msa", "ms"}, {"ind", "id"}, {"hin", "hi"}, {"tur", "tr"}, {"pol", "pl"},
-	{"dut", "nld", "nl"}, {"swe", "sv"}, {"dan", "da"}, {"nor", "no", "nob"}, {"fin", "fi"},
-	{"cze", "ces", "cs"}, {"gre", "ell", "el"}, {"heb", "he"}, {"hun", "hu"}, {"ukr", "uk"},
-}
-
-func languageKey(l string) string {
-	l = strings.ToLower(strings.TrimSpace(l))
-	if i := strings.IndexAny(l, "-_"); i > 0 {
-		l = l[:i]
-	}
-	for _, g := range languageGroups {
-		for _, code := range g {
-			if code == l {
-				return g[0]
-			}
-		}
-	}
-	return l
-}
-
-// sameLanguage compares two language codes; one that is missing or "und" says
-// nothing, so it does not disagree.
-func sameLanguage(a, b string) bool {
-	ka, kb := languageKey(a), languageKey(b)
-	if ka == "" || kb == "" || ka == "und" || kb == "und" {
-		return true
-	}
-	return ka == kb
 }
 
 // SubtitleExtract serves one subtitle track extracted from a video, as a file

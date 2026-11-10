@@ -256,10 +256,11 @@ func (m *mkvFile) parseTracks(b []byte) {
 			return true
 		})
 		// The ISO 639-2 Language is what FFmpeg and mkvmerge list for a track
-		// and what an MP4 track's mdhd holds; the BCP 47 tag (which mkvmerge
-		// writes next to it, as "en") only stands in when there is none.
+		// and what an MP4 track's mdhd holds. mkvmerge leaves it out when it is
+		// the default "eng" and writes the BCP 47 tag ("en") instead, which then
+		// stands in, in the same 639-2 spelling.
 		if bcp != "" && (!haveLang || t.Lang == "und") {
-			t.Lang = bcp
+			t.Lang = LanguageKey(bcp)
 		}
 		sort.SliceStable(t.enc, func(i, j int) bool { return t.enc[i].order > t.enc[j].order })
 		if t.Type == subtitleType {
