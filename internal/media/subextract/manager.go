@@ -291,6 +291,7 @@ func (m *Manager) Fill(ctx context.Context, f File, orders []int) error {
 			complete = complete && c
 		}
 		if complete {
+			task.Persisted() // Fill leaves the tracks on disk
 			return nil
 		}
 		select {

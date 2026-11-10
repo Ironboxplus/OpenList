@@ -3,10 +3,12 @@ package frp
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	frpclient "github.com/fatedier/frp/client"
+	v1 "github.com/fatedier/frp/pkg/config/v1"
 	"github.com/fatedier/frp/pkg/config/source"
 	frplog "github.com/fatedier/frp/pkg/util/log"
 	golog "github.com/fatedier/golib/log"
@@ -24,6 +26,10 @@ const (
 	StateError      = "error"
 
 	stopWait = 5 * time.Second
+
+	// takenRetryFor is how long a new run looks for proxies the server still
+	// holds for the run before it.
+	takenRetryFor = 40 * time.Second
 )
 
 // ProxyStatus is what frps reports for one proxy.
@@ -159,6 +165,7 @@ func (m *Manager) startLocked(cfg *Config) error {
 	m.cfg, m.svr, m.cancel, m.web, m.raw = cfg, svr, cancel, web, raw
 	m.done = make(chan struct{})
 	done := m.done
+	go m.retryTaken(ctx, svr, cfg, web.addr, raw.addr)
 	m.state, m.message = StateConnecting, ""
 	m.ring.Addf("starting (" + cfg.ServerAddr + ")")
 	go func() {
@@ -320,4 +327,63 @@ func (m *Manager) GatewayAddrs() (web, raw string) {
 		raw = m.raw.addr
 	}
 	return
+}
+
+// retryTaken registers again the proxies a start could not: the client can
+// reach the server before it has dropped the proxies of the run that has just
+// stopped ("proxy [x] already exists"), and frp itself tries such a proxy again
+// only after 30 s. The proxy is taken out of the client and put back, which
+// makes a new registration.
+func (m *Manager) retryTaken(ctx context.Context, svr *frpclient.Service, cfg *Config, web, raw string) {
+	tick := time.NewTicker(500 * time.Millisecond)
+	defer tick.Stop()
+	end := time.After(takenRetryFor)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-end:
+			return
+		case <-tick.C:
+		}
+		exp := svr.StatusExporter()
+		taken := map[string]bool{}
+		running := 0
+		names := cfg.proxyNames()
+		for _, name := range names {
+			w, ok := exp.GetProxyStatus(name)
+			switch {
+			case !ok:
+			case w.Phase == "running":
+				running++
+			case w.Phase == "start error" && strings.Contains(w.Err, "already exists"):
+				taken[name] = true
+			}
+		}
+		if running == len(names) {
+			return
+		}
+		if len(taken) == 0 {
+			continue
+		}
+		common, proxies, err := cfg.Build(web, raw)
+		if err != nil {
+			return
+		}
+		rest := make([]v1.ProxyConfigurer, 0, len(proxies))
+		for _, p := range proxies {
+			if !taken[p.GetBaseConfig().Name] {
+				rest = append(rest, p)
+			}
+		}
+		if err := svr.UpdateConfigSource(common, rest, nil); err != nil {
+			m.ring.Addf("register again: " + m.ring.Redact(err.Error()))
+			return
+		}
+		if err := svr.UpdateConfigSource(common, proxies, nil); err != nil {
+			m.ring.Addf("register again: " + m.ring.Redact(err.Error()))
+			return
+		}
+		m.ring.Addf("registered the proxies the server still held for the previous run again")
+	}
 }

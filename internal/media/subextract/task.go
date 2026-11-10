@@ -98,6 +98,9 @@ type Task struct {
 	gate    func(context.Context) (func(), error)
 	// onDone is called, outside the lock, with a track's finished file.
 	onDone func(order int, format string, data []byte)
+	// persisting counts the finished files whose onDone has not returned: a
+	// track is complete in Snapshot before its file is written.
+	persisting sync.WaitGroup
 	err    error
 	closed bool
 	// idle is closed each time a run of the reading loop ends.
@@ -391,12 +394,16 @@ func (t *Task) run() {
 				}
 			}
 		}
+		if t.onDone != nil {
+			t.persisting.Add(len(finished))
+		}
 		t.signalLocked()
 		t.mu.Unlock()
 		if t.onDone != nil {
 			for _, order := range finished {
 				data, format, _, _, _ := t.Snapshot(order)
 				t.onDone(order, format, data)
+				t.persisting.Done()
 			}
 		}
 	}
@@ -420,3 +427,7 @@ func (t *Task) fail(err error) {
 	t.signalLocked()
 	t.mu.Unlock()
 }
+
+// Persisted waits until the files of the tracks that have finished are written
+// (onDone has returned for each of them).
+func (t *Task) Persisted() { t.persisting.Wait() }
