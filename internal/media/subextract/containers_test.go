@@ -169,8 +169,17 @@ func TestMP4TracksMatchFFmpeg(t *testing.T) {
 				}
 			}
 			got := extractAll(t, s.source(t), 0, 1)
-			for i := 0; i < 2; i++ {
-				ref := reference(t, out, i, tc.refArgs, tc.refFormat)
+			for i, n := range []string{"en", "zh"} {
+				var ref []byte
+				if tc.codec == "webvtt" {
+					// FFmpeg's mov demuxer does not list a wvtt track as a stream, so
+					// the reference is the WebVTT file MP4Box was given.
+					if ref, err = os.ReadFile(filepath.Join(dir, n+".vtt")); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					ref = reference(t, out, i, tc.refArgs, tc.refFormat)
+				}
 				sameCues(t, fmt.Sprintf("%s track %d", tc.name, i), parseCues(got[i]), parseCues(ref))
 			}
 			if _, nbytes, maxIn := s.stats(); maxIn != 1 || nbytes > int64(len(data))/4 {
