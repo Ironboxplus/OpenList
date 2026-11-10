@@ -10,6 +10,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/fs"
+	"github.com/OpenListTeam/OpenList/v4/internal/lane"
 	"github.com/OpenListTeam/OpenList/v4/internal/media"
 	"github.com/OpenListTeam/OpenList/v4/internal/media/subextract"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
@@ -86,7 +87,8 @@ func prefetchLoop() {
 		if !lastPass.IsZero() && time.Since(lastPass) < prefetchRepeat {
 			continue
 		}
-		ctx, cancel := context.WithCancel(context.Background())
+		// Bulk work: the storage's rate limit serves a person browsing first.
+		ctx, cancel := context.WithCancel(lane.WithBackground(context.Background()))
 		go func() {
 			defer cancel()
 			for ctx.Err() == nil {

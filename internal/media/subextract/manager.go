@@ -113,6 +113,11 @@ func (m *Manager) Tracks(ctx context.Context, f File) ([]TrackInfo, error) {
 	}
 	m.mu.Unlock()
 
+	// What an earlier run of the process learned about this revision of the file.
+	if r, ok := m.disk.GetRecord(f.Key); ok {
+		m.remember(f.Key, r.Tracks)
+		return r.Tracks, nil
+	}
 	src, closeFn, err := f.Open(ctx)
 	if err != nil {
 		return nil, err
@@ -122,17 +127,62 @@ func (m *Manager) Tracks(ctx context.Context, f File) ([]TrackInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	m.remember(f.Key, tracks)
+	if err := m.disk.PutRecord(f.Key, fileRecord{Tracks: tracks}); err != nil {
+		log.Warnf("subextract: keeping the tracks of a file: %v", err)
+	}
+	return tracks, nil
+}
+
+func (m *Manager) remember(key string, tracks []TrackInfo) {
 	m.mu.Lock()
-	if _, ok := m.probe[f.Key]; !ok {
-		m.probe[f.Key] = tracks
-		m.order = append(m.order, f.Key)
-		if len(m.order) > probeCacheMax {
-			delete(m.probe, m.order[0])
-			m.order = m.order[1:]
+	defer m.mu.Unlock()
+	if _, ok := m.probe[key]; ok {
+		return
+	}
+	m.probe[key] = tracks
+	m.order = append(m.order, key)
+	if len(m.order) > probeCacheMax {
+		delete(m.probe, m.order[0])
+		m.order = m.order[1:]
+	}
+}
+
+// Done reports whether MarkDone was called for this revision of the file, in
+// this run of the process or an earlier one, and the tracks it left on disk are
+// still there. It reads nothing from the file.
+func (m *Manager) Done(f File) bool {
+	r, ok := m.disk.GetRecord(f.Key)
+	if !ok || !r.Done {
+		return false
+	}
+	for _, o := range r.Cached {
+		if !m.Cached(f, o) {
+			return false
 		}
 	}
-	m.mu.Unlock()
-	return tracks, nil
+	return true
+}
+
+// MarkDone records that the file needs no further reading: the tracks it was
+// probed to have were put on disk, covered by something else, or read with gaps
+// and not worth reading again.
+func (m *Manager) MarkDone(f File) error {
+	r, _ := m.disk.GetRecord(f.Key)
+	if r.Tracks == nil {
+		tracks, err := m.Tracks(context.Background(), f)
+		if err != nil {
+			return err
+		}
+		r.Tracks = tracks
+	}
+	r.Done, r.Cached = true, nil
+	for _, t := range r.Tracks {
+		if m.Cached(f, t.Order) {
+			r.Cached = append(r.Cached, t.Order)
+		}
+	}
+	return m.disk.PutRecord(f.Key, r)
 }
 
 // probeCall is a probe running in the background for TracksWithin.

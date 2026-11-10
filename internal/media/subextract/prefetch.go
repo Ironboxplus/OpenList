@@ -5,6 +5,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 // Target is a file the prefetch looks at: how to read it, and which of its
@@ -91,7 +93,7 @@ func (p *Prefetcher) one(ctx context.Context, path string) (int, error) {
 	p.mu.Lock()
 	done := p.done[target.File.Key]
 	p.mu.Unlock()
-	if done {
+	if done || p.m.Done(target.File) {
 		return 0, nil
 	}
 	if target.Streaming != nil && target.Streaming() {
@@ -121,5 +123,9 @@ func (p *Prefetcher) one(ctx context.Context, path string) (int, error) {
 	p.mu.Lock()
 	p.done[target.File.Key] = true
 	p.mu.Unlock()
+	// Kept with the cache, so that a restart does not go through the library again.
+	if err := p.m.MarkDone(target.File); err != nil {
+		log.Warnf("subextract: recording a finished file: %v", err)
+	}
 	return len(todo), nil
 }

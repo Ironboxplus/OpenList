@@ -3,6 +3,7 @@ package subextract
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -236,5 +237,94 @@ func TestPrefetchLeavesAFileAViewerIsReadingForALaterPass(t *testing.T) {
 	p.Run(context.Background(), []string{"/a.mkv"}, func(s PrefetchState) { st = s })
 	if st.Skipped != 0 || st.Tracks != 1 {
 		t.Fatalf("second pass: %+v", st)
+	}
+}
+
+// A restart: a new Manager and Prefetcher on the same cache directory. The
+// files the earlier run finished (the one with a gap included) cost no read and
+// no question to the provider; a file whose cached track was evicted, or that
+// changed, is read again.
+func TestPrefetchDoneFilesSurviveARestart(t *testing.T) {
+	film := makeFilm(t)
+	type entry struct {
+		data []byte
+		s    *served
+	}
+	lib := map[string]*entry{}
+	for name, data := range map[string][]byte{
+		"/film.mkv":   film.data,
+		"/plain.mkv":  assFile(10),
+		"/broken.mkv": assFile(10, 4),
+	} {
+		lib[name] = &entry{data: data, s: serve(t, data)}
+	}
+	revision := map[string]string{}
+	covers := 0
+	open := func(ctx context.Context, path string) (*Target, error) {
+		e := lib[path]
+		tg := &Target{File: File{
+			Key: "lib|" + path + "|" + revision[path],
+			Open: func(ctx context.Context) (Source, func(), error) {
+				src, err := NewLinkSource(linkTo(e.s), int64(len(e.data)))
+				return src, func() {}, err
+			},
+		}}
+		if path == "/film.mkv" {
+			tg.Cover = func(context.Context) (func(TrackInfo) bool, error) {
+				covers++
+				return func(ti TrackInfo) bool { return ti.Order == 0 }, nil
+			}
+		}
+		return tg, nil
+	}
+	requests := func() (n int) {
+		for _, e := range lib {
+			r, _, _ := e.s.stats()
+			n += r
+		}
+		return n
+	}
+	dir := t.TempDir()
+	paths := []string{"/film.mkv", "/plain.mkv", "/broken.mkv"}
+	pass := func() (PrefetchState, *Manager) {
+		m := NewManager(Config{Dir: dir})
+		p := NewPrefetcher(m, open)
+		p.busyWait = time.Millisecond
+		var st PrefetchState
+		p.Run(context.Background(), paths, func(s PrefetchState) { st = s })
+		return st, m
+	}
+
+	if st, _ := pass(); st.Tracks != 6 || st.Failed != 0 {
+		t.Fatalf("first run: %+v", st)
+	}
+	before, coversBefore := requests(), covers
+	st, m := pass()
+	if after := requests(); after != before {
+		t.Errorf("the run after a restart made %d range request(s)", after-before)
+	}
+	if covers != coversBefore {
+		t.Error("the provider was asked about a file that was done")
+	}
+	if st.Files != 3 || st.Tracks != 0 || st.Failed != 0 {
+		t.Errorf("after the restart: %+v", st)
+	}
+	// the track list is known without reading too: a viewer's listing is free
+	if tracks, err := m.Tracks(context.Background(), File{Key: "lib|/plain.mkv|"}); err != nil || len(tracks) != 1 {
+		t.Errorf("tracks after the restart: %v %v", tracks, err)
+	}
+
+	// an evicted track: that file is not done any more
+	plain := File{Key: "lib|/plain.mkv|"}
+	for _, ext := range cacheExts {
+		_ = os.Remove(m.disk.name(plain.Key, 0) + "." + ext)
+	}
+	if st, _ = pass(); st.Tracks != 1 {
+		t.Errorf("after an eviction: %+v, want the one track read again", st)
+	}
+	// a changed file is another file
+	revision["/plain.mkv"] = "2"
+	if st, _ = pass(); st.Tracks != 1 {
+		t.Errorf("after a change: %+v", st)
 	}
 }
