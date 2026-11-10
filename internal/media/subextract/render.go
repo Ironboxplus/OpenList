@@ -24,6 +24,13 @@ func Render(format string, header []byte, cues []Cue) []byte {
 	return nil
 }
 
+// lines is s with its line breaks as "\n": a Matroska payload may break lines with
+// CRLF (or a lone CR), while the framing of every output format here is LF, and
+// one file must not have both.
+func lines(s string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(s, "\r\n", "\n"), "\r", "\n")
+}
+
 func sortedByStart(cues []Cue) []Cue {
 	out := append([]Cue(nil), cues...)
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Start < out[j].Start })
@@ -40,14 +47,14 @@ func clock(ms int64, sep byte) string {
 func renderSRT(cues []Cue) []byte {
 	var b bytes.Buffer
 	for i, c := range sortedByStart(cues) {
-		fmt.Fprintf(&b, "%d\n%s --> %s\n%s\n\n", i+1, clock(c.Start, ','), clock(c.End, ','), c.Text)
+		fmt.Fprintf(&b, "%d\n%s --> %s\n%s\n\n", i+1, clock(c.Start, ','), clock(c.End, ','), lines(c.Text))
 	}
 	return b.Bytes()
 }
 
 func renderVTT(header []byte, cues []Cue) []byte {
 	var b bytes.Buffer
-	h := strings.TrimRight(strings.ReplaceAll(string(header), "\r\n", "\n"), "\n")
+	h := strings.TrimRight(lines(string(header)), "\n")
 	if !strings.HasPrefix(h, "WEBVTT") {
 		h = "WEBVTT"
 	}
@@ -60,7 +67,7 @@ func renderVTT(header []byte, cues []Cue) []byte {
 		if c.Settings != "" {
 			b.WriteString(" " + c.Settings)
 		}
-		fmt.Fprintf(&b, "\n%s\n\n", c.Text)
+		fmt.Fprintf(&b, "\n%s\n\n", lines(c.Text))
 	}
 	return b.Bytes()
 }
@@ -78,7 +85,7 @@ func assClock(cs int64) string {
 // write_packet: start and duration are rounded to centiseconds separately).
 func renderASS(header []byte, cues []Cue) []byte {
 	var b bytes.Buffer
-	h := strings.ReplaceAll(string(header), "\r\n", "\n")
+	h := lines(string(header))
 	b.WriteString(h)
 	if h != "" && !strings.HasSuffix(h, "\n") {
 		b.WriteByte('\n')
@@ -89,7 +96,7 @@ func renderASS(header []byte, cues []Cue) []byte {
 	ordered := append([]Cue(nil), cues...)
 	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Order < ordered[j].Order })
 	for _, c := range ordered {
-		layer, rest, _ := strings.Cut(c.Text, ",")
+		layer, rest, _ := strings.Cut(lines(c.Text), ",")
 		startCS := (c.Start + 5) / 10
 		endCS := startCS + (c.End-c.Start+5)/10
 		fmt.Fprintf(&b, "Dialogue: %s,%s,%s,%s\n", layer, assClock(startCS), assClock(endCS), rest)

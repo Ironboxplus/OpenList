@@ -136,7 +136,9 @@ func openPrefetchTarget(ctx context.Context, path string) (*subextract.Target, e
 		return nil, err
 	}
 	file := extractFile(storage, path, obj)
-	streaming := func() bool { return stream.ServedWithin(path, prefetchStreamGrace) }
+	streaming := func() bool {
+		return stream.DownloadGate.Playing(path) || stream.ServedWithin(path, prefetchStreamGrace)
+	}
 	vsp, ok := storage.(driver.VideoSubtitleProvider)
 	if !ok {
 		return &subextract.Target{File: file, Streaming: streaming}, nil

@@ -2,6 +2,8 @@ package subextract
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -206,5 +208,58 @@ func TestMP4TracksMatchFFmpeg(t *testing.T) {
 				t.Errorf("max in flight %d, read %d of %d bytes", maxIn, nbytes, len(data))
 			}
 		})
+	}
+}
+
+// A payload that breaks its lines with CRLF (as many muxers' sources do) comes
+// out with LF only, in the cue text and in the ASS header, in every text format.
+func TestCRLFInThePayloadIsLFInTheOutput(t *testing.T) {
+	text := func(s string) []byte { return []byte(s) }
+	blocks := []bBlock{
+		{track: 1, ms: 100, dur: 700, frames: [][]byte{text("first\r\nsecond")}},
+		{track: 1, ms: 1100, dur: 700, frames: [][]byte{text("lone\rcarriage")}},
+		{track: 2, ms: 100, dur: 700, frames: [][]byte{text("0,0,Default,,0,0,0,,top\\Nline")}},
+		{track: 3, ms: 100, dur: 700, frames: [][]byte{text("\n\nvtt one\r\nvtt two")}},
+	}
+	tracks := []bTrack{
+		{num: 1, codec: "S_TEXT/UTF8", lang: "eng"},
+		{num: 2, codec: "S_TEXT/ASS", lang: "eng", private: []byte(strings.ReplaceAll(assHeader, "\n", "\r\n"))},
+		{num: 3, codec: "S_TEXT/WEBVTT", lang: "eng", private: []byte("WEBVTT\r\n")},
+	}
+	data := buildMKV(tracks, blocks, 4000, true)
+	s := serve(t, data)
+	got := extractAll(t, s.source(t), 0, 1, 2)
+	for n, name := range []string{"SRT", "ASS", "VTT"} {
+		if out := got[n]; strings.Contains(string(out), "\r") {
+			t.Errorf("%s output has a CR: %q", name, out)
+		}
+	}
+	srt := parseCues(got[0])
+	if len(srt) != 2 || srt[0].text != "first\nsecond" || srt[1].text != "lone\ncarriage" {
+		t.Errorf("SRT cues: %+v", srt)
+	}
+	if d := dialogues(got[1]); len(d) != 1 || !strings.HasSuffix(d[0], `top\Nline`) {
+		t.Errorf("ASS dialogue lines: %q", d)
+	}
+	if !strings.HasPrefix(string(got[1]), "[Script Info]\nScriptType: v4.00+\n") {
+		t.Errorf("ASS header: %q", got[1])
+	}
+	if !strings.HasPrefix(string(got[2]), "WEBVTT\n\n") {
+		t.Errorf("VTT header: %q", got[2])
+	}
+}
+
+func TestACachedTrackOfAnOlderExtractorIsNotServed(t *testing.T) {
+	if ExtractorVersion == "1" {
+		t.Fatal("the extractor version was not raised after the line-ending change")
+	}
+	c := &diskCache{dir: t.TempDir(), max: func() int64 { return 1 << 20 }}
+	// a file written under version 1's name for the same key and track
+	old := sha256.Sum256([]byte("k" + "\x00" + "0" + "\x00" + "1"))
+	if err := os.WriteFile(filepath.Join(c.dir, hex.EncodeToString(old[:])+".srt"), []byte("1\r\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := c.Get("k", 0); ok {
+		t.Error("a track cached by extractor version 1 was served")
 	}
 }

@@ -13,7 +13,7 @@ import (
 
 // ExtractorVersion is part of every cache key: a change in what the extractor
 // writes must not be served from files an older one wrote.
-const ExtractorVersion = "1"
+const ExtractorVersion = "2"
 
 // diskCache keeps finished tracks as files under dir, least recently used
 // removed first once they add up to more than max bytes.

@@ -67,6 +67,11 @@ func Proxy(c *gin.Context) {
 		// sign the download URL with it (e.g. 115) get the configured UA, not the
 		// passthrough client UA. No-op when proxy_user_agent is unset.
 		common.ApplyProxyUserAgent(c.Request, storage.GetStorage())
+		// A storage that allows one download connection per file: background
+		// reads of this file (subtitle extraction) give way while it streams.
+		if end := holdPlayback(storage, rawPath); end != nil {
+			defer end()
+		}
 		link, file, err := fs.Link(c.Request.Context(), rawPath, model.LinkArgs{
 			Header: c.Request.Header,
 			Type:   c.Query("type"),

@@ -262,6 +262,11 @@ func (d *Open115) List(ctx context.Context, dir model.Obj, args model.ListArgs) 
 	return res, nil
 }
 
+// MaxDownloadConnectionsPerFile is 1: a second concurrent connection to the same
+// file is answered 403, from another IP of the same account as well (measured on
+// the 115 CDN with links from DownURL).
+func (d *Open115) MaxDownloadConnectionsPerFile() int { return 1 }
+
 func (d *Open115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
 	start := time.Now()
 	log.Infof("[115] Link request started for file: %s", file.GetName())

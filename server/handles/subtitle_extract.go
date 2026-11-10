@@ -18,6 +18,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/setting"
 	"github.com/OpenListTeam/OpenList/v4/internal/sign"
+	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/internal/transcode"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server/common"
@@ -85,9 +86,30 @@ func extractFile(storage driver.Driver, path string, obj model.Obj) subextract.F
 				_ = link.Close()
 				return nil, nil, err
 			}
-			return src, func() { _ = link.Close() }, nil
+			return gatedSource(storage, path, src), func() { _ = link.Close() }, nil
 		},
 	}
+}
+
+// gatedSource makes src's reads background reads of path when the storage
+// declares a limit on download connections per file, so that they wait for, and
+// give way to, a playback of the same file. A storage without a limit is read as
+// before.
+func gatedSource(storage any, path string, src subextract.Source) subextract.Source {
+	if driver.DownloadConnectionsPerFile(storage) <= 0 {
+		return src
+	}
+	return &stream.GatedSource{Inner: src, Key: path, Gate: stream.DownloadGate}
+}
+
+// holdPlayback registers a playback stream of path with the download gate, for
+// a storage that declares a limit; the returned function ends it (nil when the
+// storage is not limited).
+func holdPlayback(storage any, path string) func() {
+	if driver.DownloadConnectionsPerFile(storage) <= 0 {
+		return nil
+	}
+	return stream.DownloadGate.BeginPlayback(path)
 }
 
 // wantsExtraction is true when the video has a source other than the original

@@ -1285,3 +1285,10 @@ func TestGetReturnsObjForExistingFolder(t *testing.T) {
 		t.Fatalf("unexpected obj: id=%s name=%s", obj.GetID(), obj.GetName())
 	}
 }
+
+func TestOpen115DeclaresOneDownloadConnectionPerFile(t *testing.T) {
+	var d any = &Open115{}
+	if n := driverpkg.DownloadConnectionsPerFile(d); n != 1 {
+		t.Fatalf("download connections per file = %d, want 1 (a second one is answered 403)", n)
+	}
+}

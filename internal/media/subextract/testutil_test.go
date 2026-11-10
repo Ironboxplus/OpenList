@@ -82,13 +82,24 @@ func serve(t *testing.T, data []byte) *served {
 		s.requests++
 		n := s.requests
 		s.mu.Unlock()
-		defer func() {
-			s.mu.Lock()
-			s.inflight--
-			s.mu.Unlock()
-		}()
+		// A request is over for the origin when its handler returns or its client
+		// has gone, whichever comes first.
+		var over sync.Once
+		finish := func() {
+			over.Do(func() {
+				s.mu.Lock()
+				s.inflight--
+				s.mu.Unlock()
+			})
+		}
+		defer context.AfterFunc(r.Context(), finish)()
+		defer finish()
 		// long enough that two overlapping requests would be seen as such
-		time.Sleep(2*time.Millisecond + s.delay)
+		select {
+		case <-time.After(2*time.Millisecond + s.delay):
+		case <-r.Context().Done():
+			return
+		}
 		if s.fail != nil && s.fail(n) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
@@ -123,6 +134,12 @@ func (s *served) source(t *testing.T) Source {
 		t.Fatal(err)
 	}
 	return src
+}
+
+func (s *served) inFlightNow() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inflight
 }
 
 func (s *served) stats() (requests int, bytes int64, maxInflight int) {
