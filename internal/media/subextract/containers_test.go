@@ -138,11 +138,22 @@ func TestMP4TracksMatchFFmpeg(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out := filepath.Join(dir, tc.name+".mp4")
-			run(t, "ffmpeg", "-v", "error", "-y", "-i", base, "-i", en, "-i", zh,
-				"-map", "0:v", "-map", "0:a", "-map", "1", "-map", "2",
-				"-c:v", "copy", "-c:a", "copy", "-c:s", tc.codec,
-				"-metadata:s:s:0", "language=eng", "-metadata:s:s:1", "language=chi",
-				"-movflags", "+faststart", out)
+			if tc.codec == "webvtt" {
+				// ffmpeg's mp4 muxer has no tag for WebVTT; GPAC's MP4Box writes wvtt.
+				needTools(t, "MP4Box")
+				for _, n := range []string{"en", "zh"} {
+					run(t, "ffmpeg", "-v", "error", "-y", "-i", filepath.Join(dir, n+".srt"), filepath.Join(dir, n+".vtt"))
+				}
+				_ = os.Remove(out)
+				run(t, "MP4Box", "-add", base,
+					"-add", filepath.Join(dir, "en.vtt")+":lang=eng", "-add", filepath.Join(dir, "zh.vtt")+":lang=chi", out)
+			} else {
+				run(t, "ffmpeg", "-v", "error", "-y", "-i", base, "-i", en, "-i", zh,
+					"-map", "0:v", "-map", "0:a", "-map", "1", "-map", "2",
+					"-c:v", "copy", "-c:a", "copy", "-c:s", tc.codec,
+					"-metadata:s:s:0", "language=eng", "-metadata:s:s:1", "language=chi",
+					"-movflags", "+faststart", out)
+			}
 			data, err := os.ReadFile(out)
 			if err != nil {
 				t.Fatal(err)

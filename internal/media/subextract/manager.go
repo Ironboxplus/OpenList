@@ -45,9 +45,10 @@ type Result struct {
 }
 
 type entry struct {
-	ready chan struct{}
-	task  *Task
-	err   error
+	ready  chan struct{}
+	task   *Task
+	err    error
+	cancel context.CancelFunc
 }
 
 // Manager runs one task per file, however many requests ask for it.
@@ -158,6 +159,74 @@ func (m *Manager) Prepare(f File, orders []int) {
 	}()
 }
 
+// Fill reads the given tracks of the file to the end, in the background's
+// place: behind any track a viewer asked for, and it returns when they are all
+// on disk, one fails, or ctx ends. Whatever ctx's end leaves unread is dropped
+// unless a viewer has asked for it meanwhile.
+func (m *Manager) Fill(ctx context.Context, f File, orders []int) error {
+	var todo []int
+	for _, o := range orders {
+		if !m.Cached(f, o) {
+			todo = append(todo, o)
+		}
+	}
+	if len(todo) == 0 {
+		return nil
+	}
+	var task *Task
+	for attempt := 0; ; attempt++ {
+		var err error
+		if task, err = m.taskFor(f); err != nil {
+			return err
+		}
+		closed := false
+		for _, o := range todo {
+			if err := task.Want(o, false, -1); errors.Is(err, errTaskClosed) {
+				closed = true
+				break
+			} else if err != nil {
+				return err
+			}
+		}
+		if !closed {
+			break
+		}
+		if attempt > 0 {
+			return errTaskClosed
+		}
+	}
+	defer m.abandon(f.Key, task)
+	for {
+		idle := task.Idle()
+		complete := true
+		for _, o := range todo {
+			_, _, _, c, err := task.Snapshot(o)
+			if err != nil {
+				return err
+			}
+			complete = complete && c
+		}
+		if complete {
+			return nil
+		}
+		select {
+		case <-idle:
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
+// abandon stops reading a file nobody is watching any more.
+func (m *Manager) abandon(key string, task *Task) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if e := m.tasks[key]; e != nil && e.task == task && !task.Hot() && !task.Done() {
+		e.cancel()
+	}
+}
+
 // Get returns a track, waiting up to wait for it to have something to show. at
 // is the playback position in milliseconds: reading starts there.
 func (m *Manager) Get(ctx context.Context, f File, order int, atMs int64, wait time.Duration) (Result, error) {
@@ -210,11 +279,11 @@ func (m *Manager) taskFor(f File) (*Task, error) {
 		<-e.ready
 		return e.task, e.err
 	}
-	e := &entry{ready: make(chan struct{})}
+	ctx, cancel := context.WithTimeout(context.Background(), taskTimeout)
+	e := &entry{ready: make(chan struct{}), cancel: cancel}
 	m.tasks[f.Key] = e
 	m.mu.Unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), taskTimeout)
 	var closeFn func()
 	fail := func(err error) (*Task, error) {
 		cancel()

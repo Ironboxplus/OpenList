@@ -45,7 +45,7 @@ jobs:
           # mkvmerge and compares with what ffmpeg writes for the same track.
           - name: subextract
             pkgs: ./internal/media/ebml ./internal/media/check ./internal/media/subextract
-            apt: ffmpeg mkvtoolnix
+            apt: ffmpeg mkvtoolnix gpac
           # Everything else, so a merge of upstream is checked against the
           # tests of every package it touched (blackbox needs its own tag and
           # runs in the job below).
@@ -73,6 +73,7 @@ jobs:
           sudo apt-get install -y -qq ${{ matrix.apt }}
           ffmpeg -hide_banner -version | head -1
           mkvmerge --version
+          MP4Box -version 2>&1 | head -1
       - name: go build, go vet
         env:
           TAGS: ${{ matrix.tags }}

@@ -200,11 +200,18 @@ func buildMKV(tracks []bTrack, blocks []bBlock, clusterMs int64, withCues bool) 
 	flush()
 
 	// Positions: Segment children start after the SeekHead, which has a fixed
-	// size (three entries, 8-byte positions).
+	// size (8-byte positions).
 	seekEntry := func(id uint32, pos int) []byte {
 		return elem(0x4DBB, elem(0x53AB, idBytes(id)), uint8Elem(0x53AC, uint64(pos)))
 	}
-	seekLen := len(elem(0x114D9B74, seekEntry(0x1549A966, 0), seekEntry(0x1654AE6B, 0), seekEntry(0x1C53BB6B, 0)))
+	seekHead := func(infoPos, tracksPos, cuesPos int) []byte {
+		entries := [][]byte{seekEntry(0x1549A966, infoPos), seekEntry(0x1654AE6B, tracksPos)}
+		if withCues {
+			entries = append(entries, seekEntry(0x1C53BB6B, cuesPos))
+		}
+		return elem(0x114D9B74, entries...)
+	}
+	seekLen := len(seekHead(0, 0, 0))
 	infoPos := seekLen
 	tracksPos := infoPos + len(info)
 	clustersPos := tracksPos + len(tracksEl)
@@ -228,7 +235,7 @@ func buildMKV(tracks []bTrack, blocks []bBlock, clusterMs int64, withCues bool) 
 		cues = elem(0x1C53BB6B, cps...)
 	}
 
-	seek := elem(0x114D9B74, seekEntry(0x1549A966, infoPos), seekEntry(0x1654AE6B, tracksPos), seekEntry(0x1C53BB6B, cuesPos))
+	seek := seekHead(infoPos, tracksPos, cuesPos)
 	var seg bytes.Buffer
 	seg.Write(seek)
 	seg.Write(info)

@@ -339,6 +339,7 @@ func admin(g *gin.RouterGroup) {
 	mediaAdmin.GET("/scan/progress", handles.GetMediaScanProgress)
 	mediaAdmin.POST("/scrape/start", handles.StartMediaScrape)
 	mediaAdmin.GET("/scrape/stats", handles.GetMediaScrapeStats)
+	mediaAdmin.GET("/subtitle_prefetch", handles.GetSubtitlePrefetchProgress)
 	mediaAdmin.POST("/clear", handles.ClearMediaDB)
 	mediaAdmin.POST("/clear_scrape", handles.ClearMediaScrape)
 	mediaAdmin.POST("/delete_invalid", handles.DeleteInvalidMedia)

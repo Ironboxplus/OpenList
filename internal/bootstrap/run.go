@@ -24,6 +24,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/transcode"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	"github.com/OpenListTeam/OpenList/v4/server"
+	"github.com/OpenListTeam/OpenList/v4/server/handles"
 	"github.com/OpenListTeam/OpenList/v4/server/middlewares"
 	"github.com/OpenListTeam/sftpd-openlist"
 	ftpserver "github.com/fclairamb/ftpserverlib"
@@ -160,6 +161,7 @@ func Start() {
 	r.Use(gin.RecoveryWithWriter(log.StandardLogger().Out))
 
 	server.Init(r)
+	handles.StartSubtitlePrefetch()
 	var httpHandler http.Handler = r
 	if conf.Conf.Scheme.EnableH2c {
 		httpHandler = h2c.NewHandler(r, &http2.Server{})

@@ -118,12 +118,9 @@ func extractedSubtitles(c *gin.Context, storage driver.Driver, reqPath string, o
 	apiURL := common.GetApiUrl(c)
 	s := sign.Sign(reqPath)
 	var out []driver.VideoSubtitleInfo
-	var orders []int
-	for _, t := range tracks {
-		if !t.Supported || trackCovered(t, subs) {
-			continue
-		}
-		order := t.Order
+	orders := missingTracks(tracks, subs)
+	for _, order := range orders {
+		t := tracks[order]
 		q := url.Values{"path": {reqPath}, "track": {strconv.Itoa(order)}, "sign": {s}}
 		out = append(out, driver.VideoSubtitleInfo{
 			Language:      t.Language,
@@ -134,7 +131,6 @@ func extractedSubtitles(c *gin.Context, storage driver.Driver, reqPath string, o
 			EmbeddedTitle: t.Title,
 			EmbeddedOrder: &order,
 		})
-		orders = append(orders, order)
 	}
 	mgr.Prepare(file, orders)
 	return out

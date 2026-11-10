@@ -154,14 +154,18 @@ func openMKV(ctx context.Context, src Source, withCues bool) (*mkvFile, error) {
 
 	if withCues && len(m.subs) > 0 {
 		if at, ok := found[ebml.IDCues]; ok {
+			// A SeekHead that points at no Cues is a file without them.
 			body, _, err := m.elementBody(ctx, w, at)
-			if err != nil {
+			var se *SourceError
+			if errors.As(err, &se) {
 				return nil, err
 			}
-			m.parseCues(body)
-			m.haveCues = true
-			if err := m.learnClusterHeader(ctx, w); err != nil {
-				return nil, err
+			if err == nil {
+				m.parseCues(body)
+				m.haveCues = true
+				if err := m.learnClusterHeader(ctx, w); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -222,7 +226,7 @@ func (m *mkvFile) parseTracks(b []byte) {
 			return true
 		}
 		t := &mkvTrack{Lang: "eng"} // Matroska's default when absent
-		bcp := ""
+		bcp, haveLang := "", false
 		ebml.Children(p, func(e ebml.Element, v []byte) bool {
 			switch e.ID {
 			case ebml.IDTrackNumber:
@@ -234,7 +238,7 @@ func (m *mkvFile) parseTracks(b []byte) {
 			case ebml.IDCodecPrivate:
 				t.Private = append([]byte(nil), v...)
 			case ebml.IDLanguage:
-				t.Lang = strings.TrimRight(string(v), "\x00")
+				t.Lang, haveLang = strings.TrimRight(string(v), "\x00"), true
 			case ebml.IDLanguageBCP47:
 				bcp = strings.TrimRight(string(v), "\x00")
 			case ebml.IDTrackName:
@@ -251,7 +255,10 @@ func (m *mkvFile) parseTracks(b []byte) {
 			}
 			return true
 		})
-		if bcp != "" {
+		// The ISO 639-2 Language is what FFmpeg and mkvmerge list for a track
+		// and what an MP4 track's mdhd holds; the BCP 47 tag (which mkvmerge
+		// writes next to it, as "en") only stands in when there is none.
+		if bcp != "" && (!haveLang || t.Lang == "und") {
 			t.Lang = bcp
 		}
 		sort.SliceStable(t.enc, func(i, j int) bool { return t.enc[i].order > t.enc[j].order })

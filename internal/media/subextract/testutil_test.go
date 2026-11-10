@@ -167,11 +167,14 @@ func extractAll(t *testing.T, src Source, orders ...int) map[int][]byte {
 	return out
 }
 
-// reference is what ffmpeg writes for subtitle stream n of the file.
+// reference is what ffmpeg writes for subtitle stream n of the file. -copyts
+// keeps the container's own timestamps: without it ffmpeg shifts every stream
+// by the file's start time, which the AAC priming of the test video makes
+// negative.
 func reference(t *testing.T, file string, n int, codecArgs []string, format string) []byte {
 	t.Helper()
 	out := filepath.Join(t.TempDir(), "ref."+format)
-	args := []string{"-v", "error", "-y", "-i", file, "-map", fmt.Sprintf("0:s:%d", n)}
+	args := []string{"-v", "error", "-y", "-copyts", "-i", file, "-map", fmt.Sprintf("0:s:%d", n)}
 	args = append(args, codecArgs...)
 	args = append(args, "-f", format, out)
 	run(t, "ffmpeg", args...)
