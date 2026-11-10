@@ -115,6 +115,26 @@ func TestUnsupportedCodecsAreListedNotExtracted(t *testing.T) {
 	}
 }
 
+// toVTT is an SRT file as WebVTT: the header, and a full stop for the comma in
+// the timestamps.
+func toVTT(srt []byte) []byte {
+	var b strings.Builder
+	b.WriteString("WEBVTT
+
+")
+	for _, l := range strings.Split(strings.ReplaceAll(string(srt), "
+", "
+"), "
+") {
+		if strings.Contains(l, "-->") {
+			l = strings.ReplaceAll(l, ",", ".")
+		}
+		b.WriteString(l + "
+")
+	}
+	return []byte(b.String())
+}
+
 func TestMP4TracksMatchFFmpeg(t *testing.T) {
 	needTools(t, "ffmpeg")
 	dir := t.TempDir()
@@ -142,7 +162,13 @@ func TestMP4TracksMatchFFmpeg(t *testing.T) {
 				// ffmpeg's mp4 muxer has no tag for WebVTT; GPAC's MP4Box writes wvtt.
 				needTools(t, "MP4Box")
 				for _, n := range []string{"en", "zh"} {
-					run(t, "ffmpeg", "-v", "error", "-y", "-i", filepath.Join(dir, n+".srt"), filepath.Join(dir, n+".vtt"))
+					srt, err := os.ReadFile(filepath.Join(dir, n+".srt"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(dir, n+".vtt"), toVTT(srt), 0o644); err != nil {
+						t.Fatal(err)
+					}
 				}
 				_ = os.Remove(out)
 				run(t, "MP4Box", "-add", base,
