@@ -1286,9 +1286,29 @@ func TestGetReturnsObjForExistingFolder(t *testing.T) {
 	}
 }
 
-func TestOpen115DeclaresOneDownloadConnectionPerFile(t *testing.T) {
-	var d any = &Open115{}
-	if n := driverpkg.DownloadConnectionsPerFile(d); n != 1 {
-		t.Fatalf("download connections per file = %d, want 1 (a second one is answered 403)", n)
+func TestOpen115DownloadConnectionsPerFileIsASettingThatDefaultsToTwo(t *testing.T) {
+	// a storage saved before the setting existed
+	d := &Open115{}
+	if n := driverpkg.DownloadConnectionsPerFile(d); n != 2 {
+		t.Fatalf("a storage with no setting allows %d connections per file, want 2", n)
+	}
+	var saved Open115
+	if err := json.Unmarshal([]byte(`{"access_token":"a"}`), &saved.Addition); err != nil {
+		t.Fatal(err)
+	}
+	if n := driverpkg.DownloadConnectionsPerFile(&saved); n != 2 {
+		t.Fatalf("addition without the field: %d, want 2", n)
+	}
+	for _, c := range []struct {
+		json string
+		want int
+	}{{`{"max_conns_per_file":1}`, 1}, {`{"max_conns_per_file":3}`, 3}, {`{"max_conns_per_file":0}`, 0}} {
+		var o Open115
+		if err := json.Unmarshal([]byte(c.json), &o.Addition); err != nil {
+			t.Fatal(err)
+		}
+		if n := driverpkg.DownloadConnectionsPerFile(&o); n != c.want {
+			t.Errorf("%s: %d, want %d", c.json, n, c.want)
+		}
 	}
 }

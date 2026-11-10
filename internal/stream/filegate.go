@@ -7,20 +7,25 @@ import (
 )
 
 // FileGate keeps background reads of a file (subtitle extraction, the library
-// prefetch) off a storage that lets a file be downloaded over one connection at a
-// time (driver.DownloadLimited), without ever slowing playback down.
+// prefetch) within the number of simultaneous download connections a storage
+// allows for one file (driver.DownloadLimited), without ever slowing playback.
+// With N connections allowed, the file has N slots:
+//   - a playback (a proxy stream of the file) takes a slot when it starts. It
+//     never waits: for another playback, or for a background read. If every slot
+//     is taken and a background read holds one, that read is cancelled at once
+//     and its slot goes to the playback. If playbacks alone hold more than N
+//     (a player that seeks with several ranges open) they all go ahead, as they
+//     did before the gate: stalling playback is the worse mistake.
+//   - a background read takes a slot only while one is free, and, after the file
+//     was last played, once Grace has passed (a player's requests come with gaps
+//     and a seek ends one before it starts the next). A read that was cancelled
+//     by a playback is made again when a slot is free, so the work goes on from
+//     where it was.
 //
-// There are two kinds of holder, by file:
-//   - playback: a proxy stream of the file. Playbacks never wait for one another
-//     or for anything else, as before.
-//   - background: one read at a time. It waits while a playback holds the file
-//     and for a grace period after the last one let go (a player's requests come
-//     with gaps, and a seek ends one before it starts the next). A playback that
-//     starts while a background read is in flight cancels it at once; the read is
-//     made again when the way is clear, so the work goes on from where it was.
+// A storage with no limit is not put through the gate at all.
 type FileGate struct {
-	// Grace is how long the file must have had no playback before background
-	// reads resume.
+	// Grace is how long the file must have had no playback before a background
+	// read may start.
 	Grace time.Duration
 
 	mu    sync.Mutex
@@ -31,7 +36,7 @@ type gateFile struct {
 	playing   int
 	idleSince time.Time
 	bg        map[*bgRun]struct{}
-	changed   chan struct{} // closed, and replaced, when playing changes
+	changed   chan struct{} // closed, and replaced, when a slot changes hands
 }
 
 type bgRun struct {
@@ -43,8 +48,8 @@ type bgRun struct {
 // DownloadGate is the process's gate.
 var DownloadGate = &FileGate{Grace: 10 * time.Second}
 
-// preemptWait bounds how long a starting playback waits for the background read it
-// cancelled to let go of its connection.
+// preemptWait bounds how long a starting playback waits for the background reads
+// it cancelled to let go of their connections.
 const preemptWait = 2 * time.Second
 
 func (g *FileGate) file(key string) *gateFile {
@@ -64,18 +69,25 @@ func (f *gateFile) signal() {
 	f.changed = make(chan struct{})
 }
 
-// BeginPlayback registers a playback of key and returns the function that ends
-// it. It does not wait for any other playback; it returns once the background
-// reads of the file it cancelled have let go.
-func (g *FileGate) BeginPlayback(key string) (end func()) {
+// BeginPlayback registers a playback of key on a storage that allows limit
+// connections per file, and returns the function that ends it. It returns once
+// the background reads it had to cancel for a slot have let go.
+func (g *FileGate) BeginPlayback(key string, limit int) (end func()) {
 	g.mu.Lock()
 	f := g.file(key)
 	f.playing++
 	var wait []chan struct{}
-	for r := range f.bg {
-		r.preempted = true
-		r.cancel()
-		wait = append(wait, r.done)
+	if limit > 0 {
+		excess := f.playing + len(f.bg) - limit
+		for r := range f.bg {
+			if excess <= 0 {
+				break
+			}
+			r.preempted = true
+			r.cancel()
+			wait = append(wait, r.done)
+			excess--
+		}
 	}
 	f.signal()
 	g.mu.Unlock()
@@ -120,19 +132,24 @@ func (g *FileGate) Playing(key string) bool {
 	return f != nil && (f.playing > 0 || time.Since(f.idleSince) < g.Grace)
 }
 
-// RunBackground runs one background read of key. It waits until no playback holds
-// the file; fn gets a context that a starting playback cancels, and is then run
-// again when the way is clear. An error from fn that the cancellation did not
-// cause is returned as it is.
-func (g *FileGate) RunBackground(ctx context.Context, key string, fn func(ctx context.Context) error) error {
+// RunBackground runs one background read of key, when a slot is free (limit is
+// read at each try, so a setting can change under it; a limit of 0 or less runs
+// fn at once). fn gets a context that a starting playback cancels when it needs
+// the slot, and is then run again when one is free. An error from fn that the
+// cancellation did not cause is returned as it is.
+func (g *FileGate) RunBackground(ctx context.Context, key string, limit func() int, fn func(ctx context.Context) error) error {
 	for {
+		n := limit()
+		if n <= 0 {
+			return fn(ctx)
+		}
 		g.mu.Lock()
 		f := g.file(key)
 		var wait time.Duration
 		if f.playing == 0 {
 			wait = g.Grace - time.Since(f.idleSince)
 		}
-		if f.playing == 0 && wait <= 0 {
+		if f.playing+len(f.bg) < n && wait <= 0 {
 			cctx, cancel := context.WithCancel(ctx)
 			run := &bgRun{cancel: cancel, done: make(chan struct{})}
 			f.bg[run] = struct{}{}
@@ -144,6 +161,7 @@ func (g *FileGate) RunBackground(ctx context.Context, key string, fn func(ctx co
 			delete(f.bg, run)
 			preempted := run.preempted
 			close(run.done)
+			f.signal()
 			g.mu.Unlock()
 			cancel()
 			if err != nil && preempted && ctx.Err() == nil {
@@ -176,13 +194,15 @@ type GatedSource struct {
 	}
 	Key  string
 	Gate *FileGate
+	// Limit is the connections per file the storage allows.
+	Limit func() int
 }
 
 func (s *GatedSource) Size() int64 { return s.Inner.Size() }
 
 func (s *GatedSource) ReadAt(ctx context.Context, off int64, n int) ([]byte, error) {
 	var out []byte
-	err := s.Gate.RunBackground(ctx, s.Key, func(c context.Context) error {
+	err := s.Gate.RunBackground(ctx, s.Key, s.Limit, func(c context.Context) error {
 		var err error
 		out, err = s.Inner.ReadAt(c, off, n)
 		return err

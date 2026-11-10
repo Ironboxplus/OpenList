@@ -99,17 +99,22 @@ func gatedSource(storage any, path string, src subextract.Source) subextract.Sou
 	if driver.DownloadConnectionsPerFile(storage) <= 0 {
 		return src
 	}
-	return &stream.GatedSource{Inner: src, Key: path, Gate: stream.DownloadGate}
+	return &stream.GatedSource{
+		Inner: src, Key: path, Gate: stream.DownloadGate,
+		// read at every read: the setting can change while a track is extracted
+		Limit: func() int { return driver.DownloadConnectionsPerFile(storage) },
+	}
 }
 
 // holdPlayback registers a playback stream of path with the download gate, for
 // a storage that declares a limit; the returned function ends it (nil when the
 // storage is not limited).
 func holdPlayback(storage any, path string) func() {
-	if driver.DownloadConnectionsPerFile(storage) <= 0 {
+	n := driver.DownloadConnectionsPerFile(storage)
+	if n <= 0 {
 		return nil
 	}
-	return stream.DownloadGate.BeginPlayback(path)
+	return stream.DownloadGate.BeginPlayback(path, n)
 }
 
 // wantsExtraction is true when the video has a source other than the original

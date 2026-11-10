@@ -40,6 +40,9 @@ func TestAStorageWithALimitGatesBackgroundReadsAndRegistersPlaybacks(t *testing.
 	if !ok || got.Key != "/g/a.mkv" || got.Gate != stream.DownloadGate {
 		t.Fatalf("gatedSource: %#v", got)
 	}
+	if got.Limit() != 1 {
+		t.Errorf("the source's limit is %d, want the storage's 1", got.Limit())
+	}
 	end := holdPlayback(st, "/g/a.mkv")
 	if end == nil || !stream.DownloadGate.Playing("/g/a.mkv") {
 		t.Fatal("a playback on a limited storage is not registered")

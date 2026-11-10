@@ -100,6 +100,11 @@ func serve(t *testing.T, data []byte) *served {
 		case <-r.Context().Done():
 			return
 		}
+		// a stream that stays open until its client lets go (a viewer's playback)
+		if r.Header.Get("X-Hold") != "" {
+			<-r.Context().Done()
+			return
+		}
 		if s.fail != nil && s.fail(n) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return

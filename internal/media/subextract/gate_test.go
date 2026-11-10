@@ -11,19 +11,19 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 )
 
-// The storage allows one download connection per file: extraction reads through
+// The storage allows N download connections per file: extraction reads through
 // the gate as background reads, and a playback of the same file (a proxy stream
-// OpenList is serving) comes first.
+// OpenList is serving) takes slots first.
 
 const gateKey = "/film.mkv"
 
-func gatedFilm(t *testing.T, grace time.Duration, delay time.Duration) (f film, s *served, gate *stream.FileGate, src Source) {
+func gatedFilm(t *testing.T, limit int, grace, delay time.Duration) (f film, s *served, gate *stream.FileGate, src Source) {
 	t.Helper()
 	f = makeFilm(t)
 	s = serve(t, f.data)
 	s.delay = delay
 	gate = &stream.FileGate{Grace: grace}
-	src = &stream.GatedSource{Inner: s.source(t), Key: gateKey, Gate: gate}
+	src = &stream.GatedSource{Inner: s.source(t), Key: gateKey, Gate: gate, Limit: func() int { return limit }}
 	return
 }
 
@@ -68,12 +68,44 @@ func extractInBackground(ctx context.Context, src Source, order int) <-chan extr
 	return out
 }
 
-func TestWhileAFileIsPlayedExtractionAsksTheOriginForNothing(t *testing.T) {
-	_, s, gate, src := gatedFilm(t, 50*time.Millisecond, 0)
+// stream is a proxy stream of the file as the origin sees it: a request that
+// stays open until released.
+func openStream(t *testing.T, s *served) (release func()) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, "GET", s.ts.URL, nil)
+	req.Header.Set("Range", "bytes=0-1023")
+	req.Header.Set("X-Hold", "1")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+func waitInFlight(t *testing.T, s *served, n int) {
+	t.Helper()
+	for i := 0; s.inFlightNow() != n; i++ {
+		if i > 5000 {
+			t.Fatalf("%d origin requests in flight, waited for %d", s.inFlightNow(), n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestWithOneSlotAPlayedFileIsNotReadByExtraction(t *testing.T) {
+	_, s, gate, src := gatedFilm(t, 1, 50*time.Millisecond, 0)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
-	end := gate.BeginPlayback(gateKey)
+	end := gate.BeginPlayback(gateKey, 1)
 	done := extractInBackground(ctx, src, 0)
 	time.Sleep(400 * time.Millisecond)
 	if reqs, _, _ := s.stats(); reqs != 0 {
@@ -100,8 +132,12 @@ func TestWhileAFileIsPlayedExtractionAsksTheOriginForNothing(t *testing.T) {
 	}
 }
 
-func TestAStartingPlaybackCancelsTheReadInFlightAndExtractionResumesIdentically(t *testing.T) {
-	f, s, gate, src := gatedFilm(t, 100*time.Millisecond, 40*time.Millisecond)
+// interrupted runs an extraction with limit slots, lets playbacks take them one
+// by one (each a held request at the origin) and checks that the origin never saw
+// more than limit connections to the file and that the finished track is the one
+// an uninterrupted run writes.
+func interrupted(t *testing.T, limit int) {
+	f, s, gate, src := gatedFilm(t, limit, 100*time.Millisecond, 40*time.Millisecond)
 	old := groupItems
 	groupItems = 1 // many small reads, so that one is surely in flight
 	t.Cleanup(func() { groupItems = old })
@@ -109,7 +145,6 @@ func TestAStartingPlaybackCancelsTheReadInFlightAndExtractionResumesIdentically(
 	defer cancel()
 
 	done := extractInBackground(ctx, src, 0)
-	// a few blocks in, with a read in flight
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		if reqs, _, _ := s.stats(); reqs >= 8 && s.inFlightNow() == 1 {
@@ -121,34 +156,48 @@ func TestAStartingPlaybackCancelsTheReadInFlightAndExtractionResumesIdentically(
 		time.Sleep(time.Millisecond)
 	}
 
-	// a viewer starts playing the file: the origin serves that stream too
-	started := time.Now()
-	end := gate.BeginPlayback(gateKey)
-	if took := time.Since(started); took > time.Second {
-		t.Errorf("starting playback took %v to get the extraction's read out of the way", took)
-	}
-	// the cancelled read is gone from the origin within a moment
-	for i := 0; s.inFlightNow() != 0; i++ {
-		if i > 500 {
-			t.Fatalf("%d origin request(s) still in flight half a second after playback began", s.inFlightNow())
+	var releases []func()
+	var ends []func()
+	for i := 0; i < limit; i++ {
+		started := time.Now()
+		end := gate.BeginPlayback(gateKey, limit)
+		if took := time.Since(started); took > time.Second {
+			t.Errorf("playback %d took %v to begin", i+1, took)
 		}
-		time.Sleep(time.Millisecond)
+		ends = append(ends, end)
+		if i < limit-1 {
+			// a slot is still free for extraction: it goes on beside the stream
+			releases = append(releases, openStream(t, s))
+			waitInFlight(t, s, i+2)
+			before, _, _ := s.stats()
+			time.Sleep(200 * time.Millisecond)
+			if after, _, _ := s.stats(); after == before {
+				t.Errorf("with %d of %d slots taken by playback extraction stood still", i+1, limit)
+			}
+			continue
+		}
+		// the last slot: extraction's read in flight is cancelled for it, and the
+		// stream is the only connection to the file
+		for j := 0; s.inFlightNow() > i; j++ {
+			if j > 500 {
+				t.Fatalf("%d origin requests in flight half a second after the last slot was taken", s.inFlightNow())
+			}
+			time.Sleep(time.Millisecond)
+		}
+		releases = append(releases, openStream(t, s))
+		waitInFlight(t, s, limit)
 	}
-	req, _ := http.NewRequest("GET", s.ts.URL, nil)
-	req.Header.Set("Range", "bytes=0-1023")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	// no further read of the extraction reaches the origin while it plays
 	before, _, _ := s.stats()
 	time.Sleep(300 * time.Millisecond)
 	if after, _, _ := s.stats(); after != before {
-		t.Errorf("extraction read %d time(s) during playback", after-before)
+		t.Errorf("extraction read %d time(s) with every slot held by playback", after-before)
 	}
-	end()
+	for _, r := range releases {
+		r()
+	}
+	for _, e := range ends {
+		e()
+	}
 
 	var got extractResult
 	select {
@@ -159,11 +208,10 @@ func TestAStartingPlaybackCancelsTheReadInFlightAndExtractionResumesIdentically(
 	if got.err != nil {
 		t.Fatal(got.err)
 	}
-	if _, _, maxIn := s.stats(); maxIn != 1 {
-		t.Errorf("the origin saw %d connections to the file at once", maxIn)
+	if _, _, maxIn := s.stats(); maxIn > limit {
+		t.Errorf("the origin saw %d connections to the file at once, the limit is %d", maxIn, limit)
 	}
 
-	// the same bytes an uninterrupted run gives, and ffmpeg's cues
 	plain := serve(t, f.data)
 	want, err := extractTrack(ctx, plain.source(t), 0)
 	if err != nil {
@@ -176,12 +224,21 @@ func TestAStartingPlaybackCancelsTheReadInFlightAndExtractionResumesIdentically(
 	sameCues(t, "interrupted extraction", parseCues(got.data), parseCues(ref))
 }
 
+func TestWithOneSlotAStartingPlaybackCancelsTheReadInFlightAndExtractionResumesIdentically(t *testing.T) {
+	interrupted(t, 1)
+}
+
+func TestWithTwoSlotsExtractionRunsBesideOneStreamAndGivesWayToTheSecond(t *testing.T) {
+	interrupted(t, 2)
+}
+
 func TestPlaybacksNeverWaitForOneAnotherOrForBackground(t *testing.T) {
 	g := &stream.FileGate{Grace: time.Hour}
 	start := time.Now()
-	ends := []func(){g.BeginPlayback("/a"), g.BeginPlayback("/a"), g.BeginPlayback("/a")}
+	// more playbacks than slots: none of them waits
+	ends := []func(){g.BeginPlayback("/a", 2), g.BeginPlayback("/a", 2), g.BeginPlayback("/a", 2), g.BeginPlayback("/a", 2)}
 	if time.Since(start) > 200*time.Millisecond {
-		t.Errorf("three playbacks took %v to begin", time.Since(start))
+		t.Errorf("four playbacks on two slots took %v to begin", time.Since(start))
 	}
 	for _, e := range ends {
 		e()
@@ -190,12 +247,18 @@ func TestPlaybacksNeverWaitForOneAnotherOrForBackground(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 	ran := false
-	err := g.RunBackground(ctx, "/a", func(context.Context) error { ran = true; return nil })
+	err := g.RunBackground(ctx, "/a", func() int { return 2 }, func(context.Context) error { ran = true; return nil })
 	if err == nil || ran {
 		t.Errorf("background ran inside the grace: err=%v ran=%v", err, ran)
 	}
 	// another file is not held by it
-	if err := g.RunBackground(context.Background(), "/b", func(context.Context) error { return nil }); err != nil {
+	if err := g.RunBackground(context.Background(), "/b", func() int { return 2 }, func(context.Context) error { return nil }); err != nil {
 		t.Errorf("another file's background read: %v", err)
+	}
+	// no limit: no gate, even on a file being played
+	end := g.BeginPlayback("/c", 0)
+	defer end()
+	if err := g.RunBackground(context.Background(), "/c", func() int { return 0 }, func(context.Context) error { return nil }); err != nil {
+		t.Errorf("a storage with no limit was held: %v", err)
 	}
 }

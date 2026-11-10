@@ -262,10 +262,16 @@ func (d *Open115) List(ctx context.Context, dir model.Obj, args model.ListArgs) 
 	return res, nil
 }
 
-// MaxDownloadConnectionsPerFile is 1: a second concurrent connection to the same
-// file is answered 403, from another IP of the same account as well (measured on
-// the 115 CDN with links from DownURL).
-func (d *Open115) MaxDownloadConnectionsPerFile() int { return 1 }
+// MaxDownloadConnectionsPerFile is the max_conns_per_file setting, 2 when the
+// storage has none. The 115 CDN answers 403 to a connection beyond its limit for
+// one file, from another IP of the same account as well (measured with links from
+// DownURL, where the second concurrent connection was refused).
+func (d *Open115) MaxDownloadConnectionsPerFile() int {
+	if d.MaxConnsPerFile == nil {
+		return 2
+	}
+	return *d.MaxConnsPerFile
+}
 
 func (d *Open115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) (*model.Link, error) {
 	start := time.Now()
