@@ -73,7 +73,7 @@ type Manager struct {
 	mu    sync.Mutex
 	tasks map[string]*entry
 	probe map[string][]TrackInfo
-	// probing are the probes TracksWithin has running, by file.
+	// probing are the probes TracksShared has running, by file.
 	probing map[string]*probeCall
 	order []string // probe keys, oldest first
 }
@@ -185,21 +185,22 @@ func (m *Manager) MarkDone(f File) error {
 	return m.disk.PutRecord(f.Key, r)
 }
 
-// probeCall is a probe running in the background for TracksWithin.
+// probeCall is a probe running for TracksShared.
 type probeCall struct {
 	done   chan struct{}
 	tracks []TrackInfo
 	err    error
 }
 
-// probeBudget is how long a background probe may take.
+// probeBudget is how long a probe may take, however many callers wait for it.
 const probeBudget = 2 * time.Minute
 
-// TracksWithin is Tracks for a caller that cannot wait: when the file's tracks
-// are not known yet and the probe takes longer than wait, it returns ready=false
-// and the probe carries on in the background, so that the next call has them.
-// Calls for the same file share one probe.
-func (m *Manager) TracksWithin(ctx context.Context, f File, wait time.Duration) (tracks []TrackInfo, ready bool, err error) {
+// TracksShared is Tracks for callers that arrive together, a listing opened by
+// several viewers or tabs at once: calls for the same file share one probe, so
+// the file's head is read once. The probe is not tied to the first caller, which
+// may go away: a caller whose ctx ends returns ctx's error and the probe carries
+// on for the others (and for the next call, which then finds the tracks known).
+func (m *Manager) TracksShared(ctx context.Context, f File) ([]TrackInfo, error) {
 	m.mu.Lock()
 	_, known := m.probe[f.Key]
 	if e := m.tasks[f.Key]; e != nil && e.task != nil {
@@ -207,8 +208,7 @@ func (m *Manager) TracksWithin(ctx context.Context, f File, wait time.Duration) 
 	}
 	m.mu.Unlock()
 	if known {
-		tracks, err = m.Tracks(ctx, f)
-		return tracks, err == nil, err
+		return m.Tracks(ctx, f)
 	}
 
 	m.mu.Lock()
@@ -229,11 +229,9 @@ func (m *Manager) TracksWithin(ctx context.Context, f File, wait time.Duration) 
 	m.mu.Unlock()
 	select {
 	case <-call.done:
-		return call.tracks, call.err == nil, call.err
-	case <-time.After(wait):
-		return nil, false, nil
+		return call.tracks, call.err
 	case <-ctx.Done():
-		return nil, false, ctx.Err()
+		return nil, ctx.Err()
 	}
 }
 

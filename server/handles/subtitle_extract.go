@@ -34,10 +34,6 @@ const subtitleSourceExtracted = "extracted"
 // while it is being read, "complete" once it is whole (and cached).
 const ExtractHeader = "X-OpenList-Extract"
 
-// probeWait is how long a listing waits for the track probe of a file it has
-// not probed before.
-const probeWait = 2 * time.Second
-
 // extractFirstWait is how long a request waits for the first cues of a track
 // that has only just started being read.
 const extractFirstWait = 4 * time.Second
@@ -122,23 +118,18 @@ func wantsExtraction(storage any, name string) bool {
 
 // extractedSubtitles lists the container's subtitle tracks that no other entry
 // of subs stands in for, as files OpenList will extract on request. Listing
-// reads nothing but the file's head, and not even that when it is slow: the
-// viewer may be streaming this very file from the storage, which allows one
-// connection per file, so the tracks are only read once one is asked for.
+// reads nothing but the file's head, however slow that is: the player does not
+// wait for the listing, so the whole list is given once, and the tracks
+// themselves are only read once one is asked for.
 func extractedSubtitles(c *gin.Context, storage driver.Driver, reqPath string, obj model.Obj, subs []driver.VideoSubtitleInfo) []driver.VideoSubtitleInfo {
 	if !wantsExtraction(storage, obj.GetName()) {
 		return nil
 	}
 	mgr := SubtitleExtractor()
 	file := extractFile(storage, reqPath, obj)
-	tracks, ready, err := mgr.TracksWithin(c.Request.Context(), file, probeWait)
+	tracks, err := mgr.TracksShared(c.Request.Context(), file)
 	if err != nil {
 		log.Debugf("subtitle extract: probing %s: %v", reqPath, err)
-		return nil
-	}
-	if !ready {
-		// The probe finishes in the background: the next listing has the tracks.
-		log.Debugf("subtitle extract: probing %s takes over %v, listed without it", reqPath, probeWait)
 		return nil
 	}
 	apiURL := common.GetApiUrl(c)
