@@ -9,6 +9,7 @@ func TestStorageDetailsMarshalIncludesDriverName(t *testing.T) {
 	d := StorageDetails{
 		DiskUsage:  DiskUsage{TotalSpace: 100, UsedSpace: 40},
 		DriverName: "BaiduNetdisk",
+		MountPath:  "/disk/baidu",
 	}
 	b, err := json.Marshal(d)
 	if err != nil {
@@ -20,6 +21,9 @@ func TestStorageDetailsMarshalIncludesDriverName(t *testing.T) {
 	}
 	if m["driver_name"] != "BaiduNetdisk" {
 		t.Fatalf("expected driver_name in JSON, got %v", m["driver_name"])
+	}
+	if m["mount_path"] != "/disk/baidu" {
+		t.Fatalf("expected mount_path in JSON, got %v", m["mount_path"])
 	}
 	if m["total_space"].(float64) != 100 || m["free_space"].(float64) != 60 {
 		t.Fatalf("disk fields wrong: %v", m)

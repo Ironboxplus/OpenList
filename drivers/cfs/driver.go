@@ -199,11 +199,14 @@ func mapErr(err error) error {
 }
 
 // Other: "maintain" (administrators only) takes the writer lease, writes the log
-// of everything committed, uploads a checkpoint, deletes the log an old enough
-// checkpoint makes garbage, and hands the lease back, so that the next start of
-// any volume of the drive reads that checkpoint and next to no log. It fails while
-// another writer holds the lease. The answer: the sequence number the checkpoint
-// covers, the segments and checkpoints deleted, the seconds it took.
+// of everything committed, uploads a checkpoint unless the drive's newest one
+// already covers it, deletes the log an old enough checkpoint on the drive makes
+// garbage (also when the upload fails), and hands the lease back, so that the next
+// start of any volume of the drive reads that checkpoint and next to no log. It
+// fails while another writer holds the lease. The answer: whether a checkpoint was
+// written, the sequence number the newest checkpoint covers, the segments and
+// checkpoints deleted, the deletes that failed, the seconds it took. When the
+// upload fails the error says what the cleanup did.
 func (d *Cfs) Other(ctx context.Context, args model.OtherArgs) (interface{}, error) {
 	switch args.Method {
 	case "maintain":
@@ -217,12 +220,20 @@ func (d *Cfs) Other(ctx context.Context, args model.OtherArgs) (interface{}, err
 		// The work does not stop with the request that asked for it.
 		rep, err := vol.MaintainLog(context.WithoutCancel(ctx))
 		if err != nil {
+			// The cleanup runs whether or not the checkpoint was written; what it
+			// did goes with the error.
+			if rep.SegmentsDeleted+rep.CheckpointsDeleted+rep.DeletesFailed > 0 {
+				err = fmt.Errorf("%w (cleanup done anyway: %d segments and %d checkpoints deleted, %d deletes failed)",
+					err, rep.SegmentsDeleted, rep.CheckpointsDeleted, rep.DeletesFailed)
+			}
 			return nil, mapErr(err)
 		}
 		return map[string]any{
+			"checkpoint_written":  rep.CheckpointWritten,
 			"checkpoint_seq":      rep.CheckpointSeq,
 			"segments_deleted":    rep.SegmentsDeleted,
 			"checkpoints_deleted": rep.CheckpointsDeleted,
+			"deletes_failed":      rep.DeletesFailed,
 			"seconds":             rep.Elapsed.Seconds(),
 		}, nil
 	}

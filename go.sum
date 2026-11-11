@@ -39,8 +39,8 @@ github.com/IBM/go-sdk-core/v5 v5.23.1 h1:fxLusCG+GlGY1SM7BYAAiiSFhzKUs5zqs0P8knD
 github.com/IBM/go-sdk-core/v5 v5.23.1/go.mod h1:yO+OQpByKDLTvpEcsFFexgzpeR8eRfCFWAYzxkAu4bk=
 github.com/Ironboxplus/115-sdk-go v0.2.19 h1:lvI37mWHTNPJSnC0OzbP7ZJeR3pufFWR+qaL3bFgwIk=
 github.com/Ironboxplus/115-sdk-go v0.2.19/go.mod h1:cfvitk2lwe6036iNi2h+iNxwxWDifKZsSvNtrur5BqU=
-github.com/Ironboxplus/cfs v0.0.0-20261110185734-ddae19a666dc h1:UHq5A5z3GXCv6g1NchNrKoyXmRKEh1AbK3FjoVJg/FA=
-github.com/Ironboxplus/cfs v0.0.0-20261110185734-ddae19a666dc/go.mod h1:NHQHrFbq59+bybMlrTi9fnII9cndXb0z1Hhuv1TUYXQ=
+github.com/Ironboxplus/cfs v0.0.0-20261111053028-46ad716006c8 h1:0a4YsoFaXkvr56rj4vtH8vvFFl/LOV2WFJOG6wITqkk=
+github.com/Ironboxplus/cfs v0.0.0-20261111053028-46ad716006c8/go.mod h1:NHQHrFbq59+bybMlrTi9fnII9cndXb0z1Hhuv1TUYXQ=
 github.com/Ironboxplus/rclone v0.0.0-20261109144521-b59dcabf8d75 h1:UlzkKVtPpDX2LoytltG0kdbq2aIHmh3G1IcQKPQ45W0=
 github.com/Ironboxplus/rclone v0.0.0-20261109144521-b59dcabf8d75/go.mod h1:YmKNkhnFIoIwLsEZl7FSN756Iq5ZXy3LPDuypnuFocA=
 github.com/KirCute/zip v1.0.1 h1:L/tVZglOiDVKDi9Ud+fN49htgKdQ3Z0H80iX8OZk13c=

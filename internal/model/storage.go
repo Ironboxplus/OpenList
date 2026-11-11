@@ -84,6 +84,9 @@ type StorageDetails struct {
 	// DriverName is the storage's driver/type (e.g. "Local", "BaiduNetdisk"),
 	// surfaced to the UI so it can label which storage a mount belongs to.
 	DriverName string
+	// MountPath is where the storage is mounted (e.g. "/115"); its last segment
+	// is the name the user gave the storage.
+	MountPath string
 }
 
 func (s StorageDetails) MarshalJSON() ([]byte, error) {
@@ -92,6 +95,7 @@ func (s StorageDetails) MarshalJSON() ([]byte, error) {
 		"used_space":  s.UsedSpace,
 		"free_space":  s.FreeSpace(),
 		"driver_name": s.DriverName,
+		"mount_path":  s.MountPath,
 	})
 }
 

@@ -48,6 +48,9 @@ func TestCfsMaintainIsForAdministratorsAndCheckpointsTheVolume(t *testing.T) {
 	if seq, _ := m["checkpoint_seq"].(uint64); seq == 0 {
 		t.Errorf("checkpoint_seq in %v", m)
 	}
+	if w, _ := m["checkpoint_written"].(bool); !w {
+		t.Errorf("checkpoint_written in %v", m)
+	}
 	cks, _ := os.ReadDir(filepath.Join(under, "vol", ".cfs", "ckpt"))
 	if len(cks) < 1 {
 		t.Errorf("no checkpoint on the drive after maintain")

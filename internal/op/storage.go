@@ -500,6 +500,7 @@ func GetStorageDetails(ctx context.Context, storage driver.Driver, refresh ...bo
 		// Label the details with the storage's driver type so the UI can show
 		// which kind of storage the current mount is.
 		ret.DriverName = storage.Config().Name
+		ret.MountPath = utils.GetActualMountPath(storage.GetStorage().MountPath)
 		Cache.SetStorageDetails(storage, ret)
 		return ret, nil
 	})
