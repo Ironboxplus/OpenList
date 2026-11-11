@@ -69,17 +69,17 @@ jobs:
       - name: Install media tools
         if: matrix.apt != ''
         run: |
-          # The runner's apt reads mirror+file:/etc/apt/apt-mirrors.txt, which
-          # tries the mirrors by priority and moves on to the next when one
-          # fails (apt-transport-mirror(1)). On 2026-11-11 the runners could
-          # not resolve *.ubuntu.com for over an hour and apt hung the job:
-          # kernel.org's Ubuntu mirror goes first, the runner's own after it.
-          if [ -f /etc/apt/apt-mirrors.txt ]; then
-            { printf 'http://mirrors.edge.kernel.org/ubuntu/\tpriority:1\n'; cat /etc/apt/apt-mirrors.txt; } > /tmp/apt-mirrors.txt
-            sudo cp /tmp/apt-mirrors.txt /etc/apt/apt-mirrors.txt
-          fi
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ${{ matrix.apt }}
+          # Ubuntu's own archive only, from kernel.org's mirror, and none of the
+          # runner's other sources (Microsoft, PPAs on launchpad): on 2026-11-11
+          # the runners could not resolve *.ubuntu.com or launchpad for over an
+          # hour, and apt waited on each of them until the job was cancelled.
+          c=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          for p in "$c" "$c-updates" "$c-security"; do
+            echo "deb http://mirrors.edge.kernel.org/ubuntu/ $p main universe"
+          done > /tmp/apt-sources.list
+          apt_opts="-o Dir::Etc::sourcelist=/tmp/apt-sources.list -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0"
+          sudo apt-get $apt_opts update
+          sudo apt-get $apt_opts install -y -qq ${{ matrix.apt }}
           ffmpeg -hide_banner -version | head -1
           mkvmerge --version
           MP4Box -version 2>&1 | head -1
