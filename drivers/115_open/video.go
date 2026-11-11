@@ -38,6 +38,11 @@ const embeddedSubtitlePrefix = "[内置字幕]"
 // any with neither a title nor a language (115 lists a blank entry after the
 // real tracks). A track with a language but no title is titled by its language.
 //
+// An entry with a FileID is a subtitle file stored in the drive: 115 lists every
+// subtitle file in the video's folder for each video in it (all episodes' files
+// for every episode), so these are dropped. The video's own same-name files are
+// listed by OpenList's sidecar matching from the folder listing.
+//
 // An entry whose title carries embeddedSubtitlePrefix is a container track:
 // EmbeddedTitle is the title without it, and EmbeddedOrder the entry's position
 // among the prefixed entries in the order 115 returned them, which is the order
@@ -57,7 +62,7 @@ func toVideoSubtitleInfos(list []sdk.SubtitleItem) []driver.VideoSubtitleInfo {
 				embeddedOrder = &order
 			}
 		}
-		if s.URL == "" || s.IsCaptionMap == 1 || (s.Title == "" && s.Language == "") {
+		if s.URL == "" || s.FileID != "" || s.IsCaptionMap == 1 || (s.Title == "" && s.Language == "") {
 			continue
 		}
 		title := s.Title

@@ -118,6 +118,22 @@ func pendingSubtitleDirs(videoName string, listing map[string]dirListing) []stri
 	return want
 }
 
+// sidecarTitle names a subtitle file of the video: for a same-name file, the
+// part between the video's name and the extension ("Show E01.chs.ass" → "chs"),
+// which is all that tells one video's files apart (Jellyfin's ExternalPathParser
+// reads language and flags from the same part); any other file, its name
+// without the extension.
+func sidecarTitle(videoName, name string) string {
+	title := strings.TrimSuffix(name, stdpath.Ext(name))
+	stem := videoStem(videoName)
+	if _, ok := matchSidecarSubtitle(videoName, name); ok && len(title) >= len(stem) && strings.EqualFold(title[:len(stem)], stem) {
+		if rest := strings.Trim(title[len(stem):], "."); rest != "" {
+			return rest
+		}
+	}
+	return title
+}
+
 func videoStem(videoName string) string {
 	return strings.TrimSuffix(videoName, stdpath.Ext(videoName))
 }
@@ -255,7 +271,7 @@ func resolveSidecar(videoName string, src sidecarSource) []driver.VideoSubtitleI
 	var subs []driver.VideoSubtitleInfo
 	for _, m := range collectSidecarSubtitles(videoName, listing) {
 		subs = append(subs, driver.VideoSubtitleInfo{
-			Title:  strings.TrimSuffix(m.Name, stdpath.Ext(m.Name)),
+			Title:  sidecarTitle(videoName, m.Name),
 			Type:   m.Ext,
 			URL:    src.url(m.Dir, objs[m.Dir+"/"+m.Name]),
 			Source: subtitleSourceSidecar,
