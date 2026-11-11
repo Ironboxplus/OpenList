@@ -31,6 +31,9 @@ jobs:
 
   build:
     strategy:
+      # Each target stands alone: windows-arm64 installs zig from the snap store,
+      # and when that is unreachable (2026-11-11) the others are not cancelled.
+      fail-fast: false
       matrix:
         target:
           - darwin-amd64
