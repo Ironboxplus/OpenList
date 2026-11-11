@@ -117,6 +117,26 @@ func TestDiskCacheDropsTheLeastRecentlyUsed(t *testing.T) {
 	}
 }
 
+// listTracks is what a listing does to learn a file's tracks.
+func listTracks(ctx context.Context, m *Manager, f File) ([]TrackInfo, bool, error) {
+	return m.TracksWithin(ctx, f, 2*time.Second)
+}
+
+// A probe slower than the 2 s the listing used to wait is still listed whole
+// the first time.
+func TestListingHasEveryTrackOfASlowProbeTheFirstTime(t *testing.T) {
+	f := makeFilm(t)
+	s := serve(t, f.data)
+	s.delay = 2200 * time.Millisecond
+	m := NewManager(Config{Dir: t.TempDir()})
+	file := filmFile(s, f)
+
+	tracks, ready, err := listTracks(context.Background(), m, file)
+	if err != nil || !ready || len(tracks) != 5 {
+		t.Fatalf("first listing: ready=%v err=%v, %d tracks, want 5", ready, err, len(tracks))
+	}
+}
+
 func TestListingDoesNotWaitForASlowProbeAndReadsNothingElse(t *testing.T) {
 	f := makeFilm(t)
 	s := serve(t, f.data)
