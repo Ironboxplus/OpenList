@@ -2,8 +2,8 @@ package handles
 
 import (
 	"context"
-	"net/url"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"testing"
 
@@ -226,6 +226,27 @@ func TestResolveSidecarSameNameAndSubtitleFolder(t *testing.T) {
 	}
 	if want := []string{"", "Subs"}; !reflect.DeepEqual(calls, want) {
 		t.Errorf("listed %v, want %v", calls, want)
+	}
+}
+
+// A same-name file is titled by what follows the video's name (what tells the
+// files of one video apart, as in Jellyfin's ExternalPathParser); any other
+// file keeps its whole name.
+func TestResolveSidecarTitles(t *testing.T) {
+	useVideoTypes(t)
+	var calls []string
+	tree := map[string][]model.Obj{
+		"":                          {memFile("[G] Show E01 [1080p].mkv"), memFile("[G] Show E01 [1080p].chs.ass"), memFile("[G] Show E01 [1080p].CHT&JPN.ass"), memDir("Subs")},
+		"Subs":                      {memDir("[G] Show E01 [1080p]")},
+		"Subs/[G] Show E01 [1080p]": {memFile("2_English.srt")},
+	}
+	subs := resolveSidecar("[G] Show E01 [1080p].mkv", memSource(tree, &calls))
+	var got []string
+	for _, s := range subs {
+		got = append(got, s.Title)
+	}
+	if want := []string{"CHT&JPN", "chs", "2_English"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("titles %q, want %q", got, want)
 	}
 }
 

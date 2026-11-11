@@ -102,6 +102,28 @@ func TestToVideoSubtitleInfos_OnlyPrefixedEntriesAreEmbedded(t *testing.T) {
 	}
 }
 
+func TestToVideoSubtitleInfos_FilesOfTheFolderAreDropped(t *testing.T) {
+	// Shape of a real 115 answer (S05E01 of a 39-episode folder): the
+	// container track, then every subtitle file in the video's folder, each
+	// carrying the file's id: all 39 episodes' files for every episode.
+	list := []sdk.SubtitleItem{
+		{SID: "x-builtin", Title: "[内置字幕]字幕1", Type: "ass", URL: "http://example.com/builtin"},
+		{SID: "a___ass", Title: "Show S05E01.chs.ass", Type: "ass", URL: "http://example.com/e01",
+			FileID: "3344519746214615148", FileName: "Show S05E01.chs.ass", PickCode: "pc1"},
+		{SID: "b___ass", Title: "Show S05E02.chs.ass", Type: "ass", URL: "http://example.com/e02",
+			FileID: "3344519783871076541", FileName: "Show S05E02.chs.ass", PickCode: "pc2"},
+	}
+
+	got := toVideoSubtitleInfos(list)
+
+	if len(got) != 1 {
+		t.Fatalf("expected only the container track, got %d: %+v", len(got), got)
+	}
+	if got[0].EmbeddedTitle != "字幕1" || got[0].EmbeddedOrder == nil || *got[0].EmbeddedOrder != 0 {
+		t.Errorf("container track = %+v, want 字幕1 at order 0", got[0])
+	}
+}
+
 func TestToVideoSubtitleInfos_DroppedTrackKeepsItsSlot(t *testing.T) {
 	list := []sdk.SubtitleItem{
 		{Title: "[内置字幕]A", Type: "srt", URL: "http://example.com/a"},
