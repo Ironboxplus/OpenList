@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/OpenListTeam/OpenList/v4/internal/conf"
+	"sort"
 	"testing"
 
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
@@ -57,6 +58,7 @@ func TestListSeesWhatOthersWroteSinceTheLastListing(t *testing.T) {
 		for _, e := range ents {
 			out = append(out, e.Remote())
 		}
+		sort.Strings(out) // a fresh listing comes in the drive's order
 		return fmt.Sprint(out)
 	}
 	if got := names(); got != "[1.json]" {

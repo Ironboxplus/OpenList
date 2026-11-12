@@ -81,13 +81,15 @@ jobs:
             go-mod-${{ steps.go-paths.outputs.year-week }}-
             go-mod-
       # One build cache per job (what a job compiles depends on its packages and
-      # tags); a go.sum change restores the last one and compiles only what changed.
+      # tags), saved by every run under its commit and restored from the newest:
+      # a run compiles, and tests, only what changed since the last one.
       - name: Build cache
         uses: actions/cache@v4
         with:
           path: ${{ steps.go-paths.outputs.build-cache }}
-          key: go-build-${{ matrix.name }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.go-paths.outputs.year-week }}-${{ hashFiles('go.sum') }}
+          key: go-build-${{ matrix.name }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.go-paths.outputs.year-week }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
           restore-keys: |
+            go-build-${{ matrix.name }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.go-paths.outputs.year-week }}-${{ hashFiles('go.sum') }}-
             go-build-${{ matrix.name }}-go${{ steps.setup-go.outputs.go-version }}-${{ steps.go-paths.outputs.year-week }}-
             go-build-${{ matrix.name }}-go${{ steps.setup-go.outputs.go-version }}-
       - name: Embedded frontend placeholder
@@ -132,7 +134,7 @@ jobs:
           SUBEXTRACT_REQUIRE: ${{ matrix.apt != '' && '1' || '0' }}
         run: |
           set -o pipefail
-          go test -count=1 -timeout 20m -tags "$TAGS" $PKGS 2>&1 | tee "$RUNNER_TEMP/test.log"
+          go test -timeout 20m -tags "$TAGS" $PKGS 2>&1 | tee "$RUNNER_TEMP/test.log"
       - name: Tail of the log
         if: failure()
         run: tail -c 200000 "$RUNNER_TEMP/test.log" > "$RUNNER_TEMP/test-tail.log" || true
@@ -179,13 +181,15 @@ jobs:
             go-mod-${{ steps.go-paths.outputs.year-week }}-
             go-mod-
       # One build cache per job (what a job compiles depends on its packages and
-      # tags); a go.sum change restores the last one and compiles only what changed.
+      # tags), saved by every run under its commit and restored from the newest:
+      # a run compiles, and tests, only what changed since the last one.
       - name: Build cache
         uses: actions/cache@v4
         with:
           path: ${{ steps.go-paths.outputs.build-cache }}
-          key: go-build-cluster-blackbox-go${{ steps.setup-go.outputs.go-version }}-${{ steps.go-paths.outputs.year-week }}-${{ hashFiles('go.sum') }}
+          key: go-build-cluster-blackbox-go${{ steps.setup-go.outputs.go-version }}-${{ steps.go-paths.outputs.year-week }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
           restore-keys: |
+            go-build-cluster-blackbox-go${{ steps.setup-go.outputs.go-version }}-${{ steps.go-paths.outputs.year-week }}-${{ hashFiles('go.sum') }}-
             go-build-cluster-blackbox-go${{ steps.setup-go.outputs.go-version }}-${{ steps.go-paths.outputs.year-week }}-
             go-build-cluster-blackbox-go${{ steps.setup-go.outputs.go-version }}-
       - name: Embedded frontend placeholder
