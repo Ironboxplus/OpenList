@@ -27,6 +27,47 @@ func mountFake(t *testing.T, mount string) *fakedriver.Driver {
 	return s.(*fakedriver.Driver)
 }
 
+// List shows what another process wrote since the last listing, however long
+// op's dir cache keeps that listing: a cfs volume over this Fs finds another
+// node's lease files and log segments only by listing.
+func TestListSeesWhatOthersWroteSinceTheLastListing(t *testing.T) {
+	ctx := context.WithValue(context.Background(), conf.SkipHookKey, struct{}{})
+	id, err := op.CreateStorage(ctx, model.Storage{Driver: fakedriver.DriverName, MountPath: "/fresh", Addition: "{}", CacheExpiration: 30})
+	if err != nil {
+		t.Fatalf("create storage: %v", err)
+	}
+	t.Cleanup(func() { _ = op.DeleteStorageById(context.Background(), id) })
+	s, err := op.GetStorageByMountPath("/fresh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := s.(*fakedriver.Driver)
+	d.AddDir("/vol")
+	d.AddFile("/vol/1.json", "one")
+	olFs, err := rclonefs.NewFs(ctx, "/fresh/vol")
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := func() string {
+		ents, err := olFs.List(ctx, "")
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		var out []string
+		for _, e := range ents {
+			out = append(out, e.Remote())
+		}
+		return fmt.Sprint(out)
+	}
+	if got := names(); got != "[1.json]" {
+		t.Fatalf("first listing %s", got)
+	}
+	d.AddFile("/vol/2.json", "two") // another node
+	if got := names(); got != "[1.json 2.json]" {
+		t.Fatalf("listing after another node wrote 2.json: %s", got)
+	}
+}
+
 // A driver whose Get costs a rate-limit slot (115) must not be asked about
 // the destination directory once per uploaded file, however stale op's own
 // dir cache is.
