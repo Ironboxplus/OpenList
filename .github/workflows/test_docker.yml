@@ -52,12 +52,52 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup Go
+        id: setup-go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
+          # Cached below, as rclone's CI does: setup-go's own cache keys only on
+          # go.sum with no fallback, so every dependency bump compiled everything.
           cache: false
 
+      - name: Go paths
+        id: go-paths
+        run: |
+          echo "build-cache=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+          echo "mod-cache=$(go env GOMODCACHE)" >> "$GITHUB_OUTPUT"
+          echo "year-week=$(date -u +%Y%V)" >> "$GITHUB_OUTPUT"
+
+      # Downloaded module source: a go.sum change restores the last cache and
+      # downloads only what is new.
+      - name: Module cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ steps.go-paths.outputs.mod-cache }}
+          key: go-mod-${{ steps.go-paths.outputs.year-week }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-mod-${{ steps.go-paths.outputs.year-week }}-
+            go-mod-
+
+      # Compiled packages (musl, amd64): only the packages that changed are compiled again.
+      - name: Build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ steps.go-paths.outputs.build-cache }}
+          key: go-build-docker-musl-amd64-go${{ steps.setup-go.outputs.go-version }}-${{ steps.go-paths.outputs.year-week }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-docker-musl-amd64-go${{ steps.setup-go.outputs.go-version }}-${{ steps.go-paths.outputs.year-week }}-
+            go-build-docker-musl-amd64-go${{ steps.setup-go.outputs.go-version }}-
+
+      # The musl cross compiler, as release_docker.yml keeps it.
+      - name: Cache musl toolchain
+        id: cache-musl
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: build/musl-libs
+          key: docker-musl-libs-v2
+
       - name: Download musl toolchain
+        if: steps.cache-musl.outputs.cache-hit != 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash build.sh prepare docker-multiplatform
