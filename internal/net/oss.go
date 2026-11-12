@@ -10,6 +10,10 @@ import (
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 )
 
+// ossIOTimeout is how long one read or write on an OSS upload connection may
+// make no progress.
+var ossIOTimeout = 60 * time.Second
+
 func NewOSSClient(endpoint, accessKeyID, accessKeySecret string, options ...oss.ClientOption) (*oss.Client, error) {
 	// NewOSSUploadHttpClient has the longer upload timeouts; the guard against
 	// cloud metadata addresses (safeTransport) is the same as NewHttpClient's.
