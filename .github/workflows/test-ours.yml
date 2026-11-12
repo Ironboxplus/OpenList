@@ -12,9 +12,9 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: test-ours-${{ github.ref }}
-  cancel-in-progress: true
+# No concurrency group: a push must not cancel the run of the commit before it.
+# The test that fails on the old code, the fix and a second run of the fix run
+# side by side.
 
 defaults:
   run:
