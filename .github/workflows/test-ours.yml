@@ -69,15 +69,20 @@ jobs:
       - name: Install media tools
         if: matrix.apt != ''
         run: |
-          # Ubuntu's own archive only, from kernel.org's mirror, and none of the
-          # runner's other sources (Microsoft, PPAs on launchpad): on 2026-11-11
-          # the runners could not resolve *.ubuntu.com or launchpad for over an
-          # hour, and apt waited on each of them until the job was cancelled.
+          # Ubuntu's own archive only, and none of the runner's other sources
+          # (Microsoft, PPAs on launchpad): on 2026-11-11 the runners could not
+          # resolve *.ubuntu.com or launchpad for over an hour, and apt waited on
+          # each of them until the job was cancelled. The archive is read through
+          # a mirror list (apt-transport-mirror(1)), tried by priority and the
+          # next one when one fails: on 2026-11-12 kernel.org's mirror stopped
+          # answering half way through the downloads.
+          printf '%s\tpriority:%s\n' http://mirrors.edge.kernel.org/ubuntu/ 1 \
+            http://azure.archive.ubuntu.com/ubuntu/ 2 http://archive.ubuntu.com/ubuntu/ 3 > /tmp/apt-mirrors.txt
           c=$(. /etc/os-release && echo "$VERSION_CODENAME")
           for p in "$c" "$c-updates" "$c-security"; do
-            echo "deb http://mirrors.edge.kernel.org/ubuntu/ $p main universe"
+            echo "deb mirror+file:/tmp/apt-mirrors.txt $p main universe"
           done > /tmp/apt-sources.list
-          apt_opts="-o Dir::Etc::sourcelist=/tmp/apt-sources.list -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0"
+          apt_opts="-o Dir::Etc::sourcelist=/tmp/apt-sources.list -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 -o Acquire::Retries=3"
           sudo apt-get $apt_opts update
           sudo apt-get $apt_opts install -y -qq ${{ matrix.apt }}
           ffmpeg -hide_banner -version | head -1
