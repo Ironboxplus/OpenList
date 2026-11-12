@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -55,8 +56,14 @@ func TestCfsMaintainIsForAdministratorsAndCheckpointsTheVolume(t *testing.T) {
 	if len(cks) < 1 {
 		t.Errorf("no checkpoint on the drive after maintain")
 	}
-	lease, err := os.ReadFile(filepath.Join(under, "vol", ".cfs", "lease.json"))
-	if err != nil || !strings.Contains(string(lease), `"released":true`) {
-		t.Errorf("the lease after maintain: %s %v", lease, err)
+	// The lease is the last file of the lease directory: <epoch>-<heartbeat>-<held|released>-<writer>.json.
+	ents, err := os.ReadDir(filepath.Join(under, "vol", ".cfs", "lease"))
+	var names []string
+	for _, e := range ents {
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	if err != nil || len(names) == 0 || !strings.Contains(names[len(names)-1], "-released-") {
+		t.Errorf("the lease after maintain: %v %v", names, err)
 	}
 }

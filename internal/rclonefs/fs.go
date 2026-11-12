@@ -118,7 +118,12 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 		}
 		f.rememberDir(full, obj)
 	}
-	objs, err := olfs.List(ctx, full, &olfs.ListArgs{NoLog: true})
+	// Fresh from the drive, as every rclone backend lists (caching is the VFS
+	// layer's business, above the Fs): op's dir cache lives for the storage's
+	// cache expiration and doesn't see what other processes wrote meanwhile, so
+	// a cfs volume over this Fs would miss another node's new lease files and
+	// log segments.
+	objs, err := olfs.List(ctx, full, &olfs.ListArgs{NoLog: true, Refresh: true})
 	if err != nil {
 		if isNotFound(err) {
 			// Removed behind this Fs's back: nothing may be put in it now.

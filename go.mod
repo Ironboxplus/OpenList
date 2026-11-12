@@ -5,10 +5,9 @@ go 1.27
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.1
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.8.1
-	github.com/Ironboxplus/cfs v0.0.0-20261111053028-46ad716006c8
+	github.com/Ironboxplus/cfs v0.0.0-20261112055832-af4eb6be4464
 	github.com/KarpelesLab/reflink v1.0.2
 	github.com/KirCute/zip v1.0.1
-	github.com/abema/go-mp4 v1.7.4
 	github.com/OpenListTeam/115-sdk-go v0.2.6
 	github.com/OpenListTeam/go-cache v0.1.0
 	github.com/OpenListTeam/gofakes3 v0.8.2
@@ -19,6 +18,7 @@ require (
 	github.com/ProtonMail/go-crypto v1.4.1
 	github.com/ProtonMail/gopenpgp/v2 v2.10.0
 	github.com/SheltonZhu/115driver v1.3.5
+	github.com/abema/go-mp4 v1.7.4
 	github.com/aliyun/aliyun-oss-go-sdk v3.0.2+incompatible
 	github.com/antchfx/htmlquery v1.3.6
 	github.com/antchfx/xpath v1.3.8
