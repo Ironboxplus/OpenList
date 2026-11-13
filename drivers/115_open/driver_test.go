@@ -1230,14 +1230,18 @@ func TestGetReturnsObjectNotFoundForEmptyData(t *testing.T) {
 
 func TestCheckUploadCallbackSuccess(t *testing.T) {
 	body := []byte(`{"state":true,"code":0,"message":"success","data":{"pick_code":"abc","file_name":"test.txt","file_size":100,"file_id":"123","sha1":"da39a3ee","cid":"456"}}`)
-	if err := checkUploadCallback(body); err != nil {
+	id, err := checkUploadCallback(body)
+	if err != nil {
 		t.Fatalf("expected nil error, got: %v", err)
+	}
+	if id != "123" {
+		t.Fatalf("file id = %q, want 123", id)
 	}
 }
 
 func TestCheckUploadCallbackStateFalse(t *testing.T) {
 	body := []byte(`{"state":false,"code":990009,"message":"upload failed"}`)
-	err := checkUploadCallback(body)
+	_, err := checkUploadCallback(body)
 	if err == nil {
 		t.Fatal("expected error for state=false, got nil")
 	}
@@ -1247,7 +1251,7 @@ func TestCheckUploadCallbackStateFalse(t *testing.T) {
 }
 
 func TestCheckUploadCallbackEmptyBody(t *testing.T) {
-	err := checkUploadCallback([]byte{})
+	_, err := checkUploadCallback([]byte{})
 	if err == nil {
 		t.Fatal("expected error for empty body, got nil")
 	}
@@ -1257,7 +1261,7 @@ func TestCheckUploadCallbackEmptyBody(t *testing.T) {
 }
 
 func TestCheckUploadCallbackInvalidJSON(t *testing.T) {
-	err := checkUploadCallback([]byte(`not json`))
+	_, err := checkUploadCallback([]byte(`not json`))
 	if err == nil {
 		t.Fatal("expected error for invalid JSON, got nil")
 	}

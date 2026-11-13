@@ -35,18 +35,20 @@ type UploadCallbackResult struct {
 	} `json:"data"`
 }
 
-func checkUploadCallback(bodyBytes []byte) error {
+// checkUploadCallback reads 115's answer to an upload's OSS callback and returns
+// the id of the file it made.
+func checkUploadCallback(bodyBytes []byte) (string, error) {
 	if len(bodyBytes) == 0 {
-		return fmt.Errorf("115 upload callback returned empty response")
+		return "", fmt.Errorf("115 upload callback returned empty response")
 	}
 	var result UploadCallbackResult
 	if err := json.Unmarshal(bodyBytes, &result); err != nil {
-		return fmt.Errorf("115 upload callback response parse error: %w (body: %s)", err, string(bodyBytes))
+		return "", fmt.Errorf("115 upload callback response parse error: %w (body: %s)", err, string(bodyBytes))
 	}
 	if !result.State {
-		return fmt.Errorf("115 upload callback failed: code=%d, message=%s", result.Code, result.Message)
+		return "", fmt.Errorf("115 upload callback failed: code=%d, message=%s", result.Code, result.Message)
 	}
-	return nil
+	return result.Data.FileID, nil
 }
 
 // isTokenExpiredError 检测是否为OSS凭证过期错误
@@ -106,7 +108,8 @@ func (d *Open115) singleUpload(ctx context.Context, tempF model.File, tokenResp 
 	if err != nil {
 		return err
 	}
-	return checkUploadCallback(bodyBytes)
+	_, err = checkUploadCallback(bodyBytes)
+	return err
 }
 
 // retryExpiredToken retries only the rejected OSS operation, preserving the upload ID.
@@ -122,7 +125,8 @@ func retryExpiredToken(refresh func() error, operation func() error) error {
 	return operation()
 }
 
-func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer, up driver.UpdateProgress, tokenResp *sdk.UploadGetTokenResp, initResp *sdk.UploadInitResp) error {
+// multpartUpload uploads stream in parts and returns the id of the file 115 made.
+func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer, up driver.UpdateProgress, tokenResp *sdk.UploadGetTokenResp, initResp *sdk.UploadInitResp) (string, error) {
 	// 创建OSS客户端的辅助函数
 	createBucket := func(token *sdk.UploadGetTokenResp) (*oss.Bucket, error) {
 		ossClient, err := netutil.NewOSSClient(token.Endpoint, token.AccessKeyId, token.AccessKeySecret, oss.SecurityToken(token.SecurityToken))
@@ -134,7 +138,7 @@ func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer,
 
 	bucket, err := createBucket(tokenResp)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	// refresh swaps in a new OSS token through the shared token cache (rate-limited via waitAPI)
@@ -158,14 +162,14 @@ func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer,
 		return err
 	})
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	fileSize := stream.GetSize()
 	chunkSize := calPartSize(fileSize)
 	ss, err := streamPkg.NewStreamSectionReader(stream, int(chunkSize), &up)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	partNum := (stream.GetSize() + chunkSize - 1) / chunkSize
@@ -173,7 +177,7 @@ func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer,
 	offset := int64(0)
 	for i := int64(1); i <= partNum; i++ {
 		if utils.IsCanceled(ctx) {
-			return ctx.Err()
+			return "", ctx.Err()
 		}
 
 		partSize := chunkSize
@@ -182,7 +186,7 @@ func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer,
 		}
 		rd, err := ss.GetSectionReader(offset, partSize)
 		if err != nil {
-			return err
+			return "", err
 		}
 		err = retry.Do(func() error {
 			return retryExpiredToken(refresh, func() error {
@@ -234,7 +238,7 @@ func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer,
 			}))
 		ss.FreeSectionReader(rd)
 		if err != nil {
-			return err
+			return "", err
 		}
 
 		if i == partNum {
@@ -258,7 +262,7 @@ func (d *Open115) multpartUpload(ctx context.Context, stream model.FileStreamer,
 		return err
 	})
 	if err != nil {
-		return err
+		return "", err
 	}
 	return checkUploadCallback(bodyBytes)
 }

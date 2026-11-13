@@ -623,7 +623,36 @@ func matchRecycleBinEntry(obj *Obj, files map[string]sdk.RbListResp_FileInfo) *s
 	return nil
 }
 
+// Put uploads file into dstDir. An upload over a file of the same name
+// replaces it, as it does on every other storage: 115 itself keeps both, two
+// files with one name in one folder (measured 2026-11-13 on the 115 Open API:
+// a second upload of f.txt with other content left two f.txt, and OpenList went
+// on listing and reading the old one). So once the new file is in, the one it
+// replaces (op.Put hands it over as file.GetExist()) is removed. An instant
+// upload of the very same content under the same name answers with the existing
+// file's own id; that is no new file, and nothing is removed.
 func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress) error {
+	id, err := d.upload(ctx, dstDir, file, up)
+	if err != nil {
+		return err
+	}
+	old := file.GetExist()
+	if old == nil || old.IsDir() || old.GetID() == id {
+		return nil
+	}
+	if id == "" {
+		log.Warnf("[115] upload of %s did not say which file it made; the file it replaces is kept", file.GetName())
+		return nil
+	}
+	if err := d.Remove(ctx, old); err != nil {
+		return fmt.Errorf("uploaded %s, but the file it replaces could not be removed: %w", file.GetName(), err)
+	}
+	return nil
+}
+
+// upload uploads file into dstDir and returns the id of the file 115 holds for
+// it.
+func (d *Open115) upload(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress) (string, error) {
 	var err error
 	sha1 := file.GetHash().GetHash(utils.SHA1)
 	sha1128k := file.GetHash().GetHash(utils.SHA1_128K)
@@ -634,7 +663,7 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 	// 如果有预计算的 hash，先尝试秒传
 	if len(sha1) == utils.SHA1.Width && len(sha1128k) == utils.SHA1_128K.Width {
 		if err := d.waitAPI(ctx, "UploadInit"); err != nil {
-			return err
+			return "", err
 		}
 		resp, err := d.client.UploadInit(ctx, &sdk.UploadInitReq{
 			FileName: file.GetName(),
@@ -644,11 +673,11 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 			PreID:    strings.ToUpper(sha1128k),
 		})
 		if err != nil {
-			return err
+			return "", err
 		}
 		if resp.Status == 2 {
 			up(100)
-			return nil
+			return resp.FileID, nil
 		}
 		// 秒传失败，继续后续流程
 	}
@@ -658,7 +687,7 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		if len(sha1) != utils.SHA1.Width {
 			sha1, err = stream.StreamHashFile(file, utils.SHA1, 100, &up)
 			if err != nil {
-				return err
+				return "", err
 			}
 		}
 		// 计算 sha1_128k（如果没有预计算）
@@ -670,11 +699,11 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 			}
 			reader, err := file.RangeRead(http_range.Range{Start: 0, Length: hashSize})
 			if err != nil {
-				return err
+				return "", err
 			}
 			sha1128k, err = utils.HashReader(utils.SHA1, reader)
 			if err != nil {
-				return err
+				return "", err
 			}
 		}
 	} else {
@@ -684,20 +713,20 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 			// 秒传失败，需要缓存文件进行实际上传
 			_, err = file.CacheFullAndWriter(&up, nil)
 			if err != nil {
-				return err
+				return "", err
 			}
 		} else {
 			// 没有预计算的 hash，缓存整个文件并计算
 			if len(sha1) != utils.SHA1.Width {
 				_, sha1, err = stream.CacheFullAndHash(file, &up, utils.SHA1)
 				if err != nil {
-					return err
+					return "", err
 				}
 			} else if file.GetFile() == nil {
 				// 有 SHA1 但没有缓存，需要缓存以支持后续 RangeRead
 				_, err = file.CacheFullAndWriter(&up, nil)
 				if err != nil {
-					return err
+					return "", err
 				}
 			}
 			// 计算 sha1_128k
@@ -708,18 +737,18 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 			}
 			reader, err := file.RangeRead(http_range.Range{Start: 0, Length: hashSize})
 			if err != nil {
-				return err
+				return "", err
 			}
 			sha1128k, err = utils.HashReader(utils.SHA1, reader)
 			if err != nil {
-				return err
+				return "", err
 			}
 		}
 	}
 
 	// 1. Init（SeekableStream 或已缓存的 FileStream）
 	if err := d.waitAPI(ctx, "UploadInit"); err != nil {
-		return err
+		return "", err
 	}
 	resp, err := d.client.UploadInit(ctx, &sdk.UploadInitReq{
 		FileName: file.GetName(),
@@ -729,33 +758,33 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 		PreID:    strings.ToUpper(sha1128k),
 	})
 	if err != nil {
-		return err
+		return "", err
 	}
 	if resp.Status == 2 {
 		up(100)
-		return nil
+		return resp.FileID, nil
 	}
 	// 2. two way verify
 	if utils.SliceContains([]int{6, 7, 8}, resp.Status) {
 		signCheck := strings.Split(resp.SignCheck, "-") //"sign_check": "2392148-2392298" 取2392148-2392298之间的内容(包含2392148、2392298)的sha1
 		start, err := strconv.ParseInt(signCheck[0], 10, 64)
 		if err != nil {
-			return err
+			return "", err
 		}
 		end, err := strconv.ParseInt(signCheck[1], 10, 64)
 		if err != nil {
-			return err
+			return "", err
 		}
 		signReader, err := file.RangeRead(http_range.Range{Start: start, Length: end - start + 1})
 		if err != nil {
-			return err
+			return "", err
 		}
 		signVal, err := utils.HashReader(utils.SHA1, signReader)
 		if err != nil {
-			return err
+			return "", err
 		}
 		if err := d.waitAPI(ctx, "UploadInit"); err != nil {
-			return err
+			return "", err
 		}
 		resp, err = d.client.UploadInit(ctx, &sdk.UploadInitReq{
 			FileName: file.GetName(),
@@ -767,24 +796,20 @@ func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStre
 			SignVal:  strings.ToUpper(signVal),
 		})
 		if err != nil {
-			return err
+			return "", err
 		}
 		if resp.Status == 2 {
 			up(100)
-			return nil
+			return resp.FileID, nil
 		}
 	}
 	// 3. get upload token
 	tokenResp, err := d.uploadToken(ctx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	// 4. upload
-	err = d.multpartUpload(ctx, file, up, tokenResp, resp)
-	if err != nil {
-		return err
-	}
-	return nil
+	return d.multpartUpload(ctx, file, up, tokenResp, resp)
 }
 
 func (d *Open115) OfflineDownload(ctx context.Context, uris []string, dstDir model.Obj) ([]string, error) {
