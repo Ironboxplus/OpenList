@@ -47,6 +47,8 @@ github.com/Ironboxplus/cfs v0.0.0-20261112120435-448ad6fb585b h1:mJosQGsoxSLN+z0
 github.com/Ironboxplus/cfs v0.0.0-20261112120435-448ad6fb585b/go.mod h1:NHQHrFbq59+bybMlrTi9fnII9cndXb0z1Hhuv1TUYXQ=
 github.com/Ironboxplus/cfs v0.0.0-20261112121847-0999bd1aa9bc h1:maucqkjqKQTm+p+0iU5mqI9HT15FZ9kblHRKmqPu5PI=
 github.com/Ironboxplus/cfs v0.0.0-20261112121847-0999bd1aa9bc/go.mod h1:NHQHrFbq59+bybMlrTi9fnII9cndXb0z1Hhuv1TUYXQ=
+github.com/Ironboxplus/cfs v0.0.0-20261113141609-0e6db40f3427 h1:TlJ7LzQysU+ls2HybzfL/TNAiKDeD0npwJzNnEvg1y0=
+github.com/Ironboxplus/cfs v0.0.0-20261113141609-0e6db40f3427/go.mod h1:NHQHrFbq59+bybMlrTi9fnII9cndXb0z1Hhuv1TUYXQ=
 github.com/Ironboxplus/rclone v0.0.0-20261109144521-b59dcabf8d75 h1:UlzkKVtPpDX2LoytltG0kdbq2aIHmh3G1IcQKPQ45W0=
 github.com/Ironboxplus/rclone v0.0.0-20261109144521-b59dcabf8d75/go.mod h1:YmKNkhnFIoIwLsEZl7FSN756Iq5ZXy3LPDuypnuFocA=
 github.com/KirCute/zip v1.0.1 h1:L/tVZglOiDVKDi9Ud+fN49htgKdQ3Z0H80iX8OZk13c=

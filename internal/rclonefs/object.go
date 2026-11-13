@@ -83,10 +83,33 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}}, nil
 }
 
+// sameContent reports whether cur has the size of o and no hash both report
+// that differs.
+func (o *Object) sameContent(cur model.Obj) bool {
+	if o.size >= 0 && cur.GetSize() != o.size {
+		return false
+	}
+	for _, ht := range []*utils.HashType{utils.SHA1, utils.MD5} {
+		a, b := o.hashes.GetHash(ht), cur.GetHash().GetHash(ht)
+		if a != "" && b != "" && !strings.EqualFold(a, b) {
+			return false
+		}
+	}
+	return true
+}
+
 func (o *Object) openRange(ctx context.Context, r http_range.Range) (io.ReadCloser, error) {
-	link, _, err := olfs.Link(ctx, o.fs.fullPath(o.remote), model.LinkArgs{})
+	link, cur, err := olfs.Link(ctx, o.fs.fullPath(o.remote), model.LinkArgs{})
 	if err != nil {
 		return nil, err
+	}
+	// The file at the path may have been replaced since this Object was made
+	// (another node wrote it): reading the new one by the old size would hand out
+	// a prefix, or a tail, of it. Not the modification time: the Object of a Put
+	// carries the source's.
+	if cur != nil && !o.sameContent(cur) {
+		_ = link.Close()
+		return nil, ErrObjectChanged
 	}
 	rr, err := stream.GetRangeReaderFromLink(o.size, link)
 	if err != nil {

@@ -350,6 +350,58 @@ func GetUnwrap(ctx context.Context, storage driver.Driver, path string) (model.O
 
 var linkG = singleflight.Group[*objWithLink]{}
 
+// linkStillFor reports whether a cached link, made for cached, is still the link
+// of the file at path now. The cache is keyed by path, and another node can
+// replace the file at a path while the link (of a cloud drive, hours) is cached.
+// It is checked against what is known without a call to the drive: the cached
+// listing of the parent folder when the storage has one (a storage that lists
+// slowly is not asked per read; without a listing in the cache the link is used
+// as it is), and for a storage without a cache, whose Get reads the drive anyway
+// (local, smb, cfs, ...), the object Get returns. Like rclone's VFS, which drops
+// what it cached when the fingerprint of the remote object no longer matches
+// (vfs/vfscache/item.go _checkObject).
+func linkStillFor(ctx context.Context, storage driver.Driver, path string, cached model.Obj) bool {
+	if cached == nil {
+		return true
+	}
+	if storage.Config().NoCache {
+		cur, err := GetUnwrap(ctx, storage, path)
+		return err == nil && sameFile(cur, cached)
+	}
+	dir, name := stdpath.Split(utils.FixAndCleanPath(path))
+	dc, ok := Cache.dirCache.Get(Key(storage, dir))
+	if !ok {
+		return true
+	}
+	for _, f := range dc.GetSortedObjects(storage) {
+		if f.GetName() != name {
+			continue
+		}
+		// A placeholder of a file being uploaded has no identity yet.
+		return model.ObjHasMask(f, model.Temp) || sameFile(model.UnwrapObjName(f), cached)
+	}
+	return false
+}
+
+// sameFile reports whether a and b can be the same version of a file: the same
+// size, no hash both have that differs, and the same id when both have one,
+// otherwise the same modification time.
+func sameFile(a, b model.Obj) bool {
+	if a.GetSize() != b.GetSize() {
+		return false
+	}
+	for _, ht := range []*utils.HashType{utils.SHA1, utils.MD5} {
+		ha, hb := a.GetHash().GetHash(ht), b.GetHash().GetHash(ht)
+		if ha != "" && hb != "" && !strings.EqualFold(ha, hb) {
+			return false
+		}
+	}
+	if a.GetID() != "" && b.GetID() != "" {
+		return a.GetID() == b.GetID()
+	}
+	return a.ModTime().Equal(b.ModTime())
+}
+
 // Link get link, if is an url. should have an expiry time
 func Link(ctx context.Context, storage driver.Driver, path string, args model.LinkArgs) (*model.Link, model.Obj, error) {
 	if storage.Config().CheckStatus && storage.GetStorage().Status != WORK {
@@ -372,10 +424,10 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 	}
 	key := Key(storage, path)
 	if ol, exists := Cache.linkCache.GetType(key, typeKey); exists {
-		if ol.acquire() {
+		if linkStillFor(ctx, storage, path, ol.obj) && ol.acquire() {
 			return ol.link, ol.obj, nil
 		}
-		// SyncClosers 已关闭（文件句柄已关闭），删除缓存条目，重新获取
+		// SyncClosers 已关闭（文件句柄已关闭），或该路径上的文件已被替换，删除缓存条目，重新获取
 		Cache.linkCache.DeleteKey(key)
 	}
 
