@@ -28,7 +28,7 @@ env:
 jobs:
   test:
     name: ${{ matrix.name }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os || 'ubuntu-latest' }}
     timeout-minutes: 25
     strategy:
       fail-fast: false
@@ -46,6 +46,9 @@ jobs:
           - name: subextract
             pkgs: ./internal/media/ebml ./internal/media/check ./internal/media/subextract
             apt: ffmpeg mkvtoolnix gpac
+            # ubuntu-latest moved to 26.04 (resolute), which has no gpac
+            # (2026-11-13: "Package 'gpac' has no installation candidate").
+            os: ubuntu-24.04
           # Everything else, so a merge of upstream is checked against the
           # tests of every package it touched (blackbox needs its own tag and
           # runs in the job below).
