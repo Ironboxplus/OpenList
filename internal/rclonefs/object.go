@@ -2,6 +2,7 @@ package rclonefs
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"time"
@@ -14,6 +15,10 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/hash"
 )
+
+// ErrObjectChanged is what reading an Object returns when the file at its path
+// is no longer the one the Object was made from.
+var ErrObjectChanged = errors.New("rclonefs: the file changed since the object was listed")
 
 // Object is a file under an OpenList mount path.
 type Object struct {
