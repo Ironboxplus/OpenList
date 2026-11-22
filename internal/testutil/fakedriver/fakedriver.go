@@ -66,7 +66,11 @@ type Driver struct {
 	// OnMakeDir, when set, is called with the path of each MakeDir before it
 	// is carried out (to let another writer take the name first).
 	OnMakeDir func(path string)
-	seq       int
+	// OnRangeOpen, when set, is called each time Link's range reader opens a
+	// stream, with the driver-side path of the file and the start of the range;
+	// the function it returns is called once when that stream is closed.
+	OnRangeOpen func(path string, start int64) (closed func())
+	seq         int
 	ghosts    map[string]*model.Object
 }
 
@@ -198,6 +202,7 @@ func (d *Driver) Link(_ context.Context, file model.Obj, _ model.LinkArgs) (*mod
 	if !ok {
 		return nil, errs.NotSupport
 	}
+	path := file.GetPath()
 	return &model.Link{
 		ContentLength: int64(len(b)),
 		RangeReader: stream.RangeReaderFunc(func(_ context.Context, r http_range.Range) (io.ReadCloser, error) {
@@ -205,9 +210,25 @@ func (d *Driver) Link(_ context.Context, file model.Obj, _ model.LinkArgs) (*mod
 			if r.Length >= 0 && r.Start+r.Length < end {
 				end = r.Start + r.Length
 			}
-			return io.NopCloser(bytes.NewReader(b[min(r.Start, end):end])), nil
+			rc := io.NopCloser(bytes.NewReader(b[min(r.Start, end):end]))
+			if d.OnRangeOpen == nil {
+				return rc, nil
+			}
+			return &notifyClose{ReadCloser: rc, closed: d.OnRangeOpen(path, r.Start)}, nil
 		}),
 	}, nil
+}
+
+// notifyClose calls closed the first time it is closed.
+type notifyClose struct {
+	io.ReadCloser
+	once   sync.Once
+	closed func()
+}
+
+func (n *notifyClose) Close() error {
+	n.once.Do(n.closed)
+	return n.ReadCloser.Close()
 }
 
 func (d *Driver) MakeDir(_ context.Context, parent model.Obj, name string) (model.Obj, error) {

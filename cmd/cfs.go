@@ -74,13 +74,15 @@ var cfsMountCmd = &cobra.Command{
 	Short: "Mount a cfs storage as a drive or directory",
 	Long: `Mount a cfs storage with rclone's VFS (WinFsp on Windows, FUSE elsewhere).
 
-Needs a build with the cmount tag ("go build -tags cmount"), and WinFsp
-(https://winfsp.dev) installed on Windows. On Windows the mount point is a
-drive letter (X:) or a not yet existing directory.`,
+Linux builds have the mount built in (rclone's pure Go FUSE mount, no cgo; the
+kernel needs FUSE, and fusermount3 or fusermount must be installed). Windows
+and macOS need a build with the cmount tag ("go build -tags cmount", cgo), and
+WinFsp (https://winfsp.dev) installed on Windows. On Windows the mount point
+is a drive letter (X:) or a not yet existing directory.`,
 	Args: cobra.ExactArgs(2),
 	Run: func(cmd *cobra.Command, args []string) {
 		if _, fn := mountlib.ResolveMountMethod(""); fn == nil {
-			fmt.Fprintln(os.Stderr, "this openlist binary was built without mount support; rebuild with -tags cmount (Windows also needs WinFsp)")
+			fmt.Fprintln(os.Stderr, "this openlist binary was built without mount support; rebuild with -tags cmount (Windows also needs WinFsp; Linux builds have it built in)")
 			os.Exit(2)
 		}
 		runCfs(args[0], func(ctx context.Context) (func(), error) {
