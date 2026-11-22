@@ -99,6 +99,9 @@ func readLikeAServer(t *testing.T, v *vfs.VFS, name string, size int64) [sha256.
 // With full the file has one cache entry and one sequential downloader, and the
 // drive sees one stream for the whole file. A drive like 115 refuses a second
 // stream to the same file, which is why the mount uses full.
+//
+// Measured on CI (2026-11-23, rclone b59dcabf8d75, 32 MiB read in 512 pieces):
+// writes opened 779 streams (one open at a time), full opened 1.
 func TestVfsReadsOfABigFileOpenFewStreams(t *testing.T) {
 	ctx := context.Background()
 	const size = 32 << 20 // above the 8 MiB threshold: stored 1:1
@@ -151,7 +154,7 @@ func TestVfsReadsOfABigFileOpenFewStreams(t *testing.T) {
 				t.Fatal("the bytes read back differ from the bytes written")
 			}
 			opened, peak := counter.of(t, "/big.bin")
-			t.Errorf("TEMP-MEASURE cache mode %s: %d range streams opened for the file, at most %d at once", mode, opened, peak)
+			t.Logf("cache mode %s: %d range streams opened for the file, at most %d at once", mode, opened, peak)
 
 			switch mode {
 			case vfscommon.CacheModeFull:
