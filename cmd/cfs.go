@@ -86,11 +86,7 @@ is a drive letter (X:) or a not yet existing directory.`,
 			os.Exit(2)
 		}
 		runCfs(args[0], func(ctx context.Context) (func(), error) {
-			out, err := rc.Calls.Get("mount/mount").Fn(ctx, rc.Params{
-				"fs": cfsFsName, "mountPoint": args[1],
-				"vfs_cache_mode": cfsFlags.cacheMode,
-				"mountOpt":       rc.Params{"VolumeName": "cfs"},
-			})
+			out, err := rc.Calls.Get("mount/mount").Fn(ctx, cfsMountParams(args[1]))
 			if err != nil {
 				return nil, fmt.Errorf("mount %s: %w", args[1], err)
 			}
@@ -104,6 +100,26 @@ is a drive letter (X:) or a not yet existing directory.`,
 			}, nil
 		})
 	},
+}
+
+// cfsMountFlags are the options of `cfs mount` besides those it shares with
+// the servers.
+var cfsMountFlags struct {
+	cacheMaxSize  string
+	cacheMaxDirty string
+	allowOther    bool
+}
+
+// cfsMountParams are the parameters of rc mount/mount. rclone reads VFS and
+// mount options either flat at the top level, named as their CLI flags without
+// "--" and with "_" for "-", or inside the "vfsOpt" and "mountOpt" objects
+// (cmd/mountlib/rc.go mountRc, fs/rc ParseOptions); they are passed flat here.
+func cfsMountParams(mountPoint string) rc.Params {
+	return rc.Params{
+		"fs": cfsFsName, "mountPoint": mountPoint,
+		"vfs_cache_mode": cfsFlags.cacheMode,
+		"mountOpt":       rc.Params{"VolumeName": "cfs"},
+	}
 }
 
 var cfsWebdavCmd = &cobra.Command{
