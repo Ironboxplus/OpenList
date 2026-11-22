@@ -115,11 +115,16 @@ var cfsMountFlags struct {
 // "--" and with "_" for "-", or inside the "vfsOpt" and "mountOpt" objects
 // (cmd/mountlib/rc.go mountRc, fs/rc ParseOptions); they are passed flat here.
 func cfsMountParams(mountPoint string) rc.Params {
-	return rc.Params{
+	p := rc.Params{
 		"fs": cfsFsName, "mountPoint": mountPoint,
-		"vfs_cache_mode": cfsFlags.cacheMode,
-		"mountOpt":       rc.Params{"VolumeName": "cfs"},
+		"vfs_cache_mode":      cfsFlags.cacheMode,
+		"vfs_cache_max_size":  cfsMountFlags.cacheMaxSize,
+		"vfs_cache_max_dirty": cfsMountFlags.cacheMaxDirty,
+		"allow_other":         cfsMountFlags.allowOther,
+		"mountOpt":            rc.Params{"VolumeName": "cfs"},
 	}
+	cfsOwnership(p)
+	return p
 }
 
 var cfsWebdavCmd = &cobra.Command{
@@ -207,6 +212,11 @@ func init() {
 	for _, c := range []*cobra.Command{cfsMountCmd, cfsWebdavCmd} {
 		c.Flags().StringVar(&cfsFlags.cacheMode, "vfs-cache-mode", "writes", "VFS cache mode: off, minimal, writes, full")
 	}
+	mf := cfsMountCmd.Flags()
+	mf.StringVar(&cfsMountFlags.cacheMaxSize, "vfs-cache-max-size", "10G", "upper bound of the VFS cache on local disk")
+	mf.StringVar(&cfsMountFlags.cacheMaxDirty, "vfs-cache-max-dirty", "0", "upper bound of the files not uploaded yet: a write that would go over it waits until the uploads have made room (0: off)")
+	mf.BoolVar(&cfsMountFlags.allowOther, "allow-other", false, "let other users access the mount (FUSE allow_other; needs user_allow_other in /etc/fuse.conf unless root), e.g. for a Samba share of it")
+	cfsOwnershipFlags(cfsMountCmd)
 	cfsWebdavCmd.Flags().StringVar(&cfsFlags.addr, "addr", "127.0.0.1:8085", "address to serve on")
 	cfsWebdavCmd.Flags().StringVar(&cfsFlags.user, "user", "", "WebDAV user (none: anonymous)")
 	cfsWebdavCmd.Flags().StringVar(&cfsFlags.pass, "pass", "", "WebDAV password")
