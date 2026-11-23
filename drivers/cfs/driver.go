@@ -90,6 +90,9 @@ func (d *Cfs) Init(ctx context.Context) error {
 	if d.Transfers > 0 {
 		m["transfers"] = strconv.Itoa(d.Transfers)
 	}
+	if d.ReadTransfers > 0 {
+		m["read_transfers"] = strconv.Itoa(d.ReadTransfers)
+	}
 	opt, err := cfsrclone.OptionsFrom(m)
 	if err != nil {
 		return fmt.Errorf("cfs options: %w", err)
