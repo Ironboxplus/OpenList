@@ -38,6 +38,7 @@ type gateFile struct {
 	bg        map[*bgRun]struct{}
 	conns     map[*Conn]struct{} // the connections open to the file, whoever opened them
 	pbWait    int                // playback connections waiting for a slot
+	firstWait int                // of those, the ones that are a read's first connection
 	changed   chan struct{}      // closed, and replaced, when a slot changes hands
 }
 
@@ -120,7 +121,7 @@ func (g *FileGate) BeginPlayback(key string, limit int) (end func()) {
 // pruneLocked forgets files nobody has played or read for a while.
 func (g *FileGate) pruneLocked() {
 	for k, f := range g.files {
-		if f.playing == 0 && len(f.bg) == 0 && len(f.conns) == 0 && f.pbWait == 0 && time.Since(f.idleSince) > time.Hour {
+		if f.playing == 0 && len(f.bg) == 0 && len(f.conns) == 0 && f.pbWait == 0 && f.firstWait == 0 && time.Since(f.idleSince) > time.Hour {
 			delete(g.files, k)
 		}
 	}

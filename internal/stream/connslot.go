@@ -20,15 +20,15 @@ import (
 // workers wait, so the download runs with the slots there are (at least one
 // once any is free); nothing fails for it.
 //
-// A playback's connections (the request's context says so, see WithPlayback)
-// do not wait for the others: when none is free they take back the slot of a
-// part that can be fetched again (a preempted part reads ErrPreempted and its
-// downloader opens it anew from where it stopped, when a slot is free), and
-// while one waits no other read takes a freed slot. When what holds the slots
-// is the first connections of playbacks alone, a playback's first connection
-// goes ahead, as playbacks do (see FileGate). Its other workers (extra) only
-// ever take a free slot, so a download runs with fewer workers rather than be
-// refused by the storage.
+// No connection goes beyond the limit. A playback's connections (the request's
+// context says so, see WithPlayback) are served before the others: when none is
+// free they take back the slot of a part that can be fetched again (a preempted
+// part reads ErrPreempted and its downloader opens it anew from where it
+// stopped, when a slot is free), and then wait for a slot like any read, while
+// no background read takes a freed slot. A playback's first connection is
+// served before the extra workers of a download: while one waits they take no
+// free slot, so a download runs with fewer workers rather than keep the slots
+// from a read that has none.
 
 type playbackKey struct{}
 
@@ -103,25 +103,18 @@ func (c fileConnGate) AcquireConn(ctx context.Context, resumable, extra bool) (m
 		var interrupts []func()
 		ok := false
 		if playback {
-			ok = len(f.conns) < n
-			if !ok {
-				// What stands in the way: background reads, and the extra workers
-				// of another playback's download when this is a read's first
-				// connection. They are told to give up their slots; the first
-				// connection goes beyond the limit only when nothing else is in
-				// the way, an extra one never does.
-				blocked := false
+			if len(f.conns) < n {
+				ok = !extra || f.firstWait == 0
+			} else {
+				// Background reads, and the extra workers of another playback's
+				// download when this is a read's first connection, are told to
+				// give up their slots; then this waits for one to be free.
 				for h := range f.conns {
 					displaceable := h.resumable && (!h.playback || (h.extra && !extra))
-					if !displaceable && h.playback {
-						continue
-					}
-					blocked = true
 					if displaceable && h.preempted.CompareAndSwap(false, true) && h.interrupt != nil {
 						interrupts = append(interrupts, h.interrupt)
 					}
 				}
-				ok = !blocked && !extra
 			}
 		} else {
 			ok = len(f.conns) < n && f.pbWait == 0
@@ -129,6 +122,10 @@ func (c fileConnGate) AcquireConn(ctx context.Context, resumable, extra bool) (m
 		if ok {
 			if waiting {
 				f.pbWait--
+				if !extra {
+					f.firstWait--
+					f.signal()
+				}
 			}
 			h := &Conn{g: g, f: f, playback: playback, resumable: resumable, extra: extra}
 			f.conns[h] = struct{}{}
@@ -137,6 +134,9 @@ func (c fileConnGate) AcquireConn(ctx context.Context, resumable, extra bool) (m
 		}
 		if playback && !waiting {
 			f.pbWait++
+			if !extra {
+				f.firstWait++
+			}
 			waiting = true
 		}
 		changed := f.changed
@@ -151,6 +151,9 @@ func (c fileConnGate) AcquireConn(ctx context.Context, resumable, extra bool) (m
 			if waiting {
 				g.mu.Lock()
 				f.pbWait--
+				if !extra {
+					f.firstWait--
+				}
 				f.signal()
 				g.mu.Unlock()
 			}

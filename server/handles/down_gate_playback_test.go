@@ -11,9 +11,10 @@ import (
 
 // A player that has two ranges of one file open (each range a download over the
 // 2 connections the link asks for) is two playbacks: together they hold no more
-// than the 2 connections the storage allows, so neither is refused. Only a
-// download's first connection may go beyond the limit; its other workers wait
-// for a free slot, or take one from another download's extra worker.
+// than the 2 connections the storage allows, so neither is refused. No
+// connection goes beyond the limit: a download's first connection takes the
+// slot of another download's extra worker, or waits for a free one, and its
+// other workers wait behind the first connections.
 func TestTwoPlaybacksOfOneFileStayWithinTheStorageLimit(t *testing.T) {
 	r := newGateRig(t, 2)
 

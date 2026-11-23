@@ -58,12 +58,13 @@ type Link struct {
 // ConnGate is the count of the connections open to one file of a storage that
 // limits them (driver.DownloadLimited), shared by everything that reads the file.
 type ConnGate interface {
-	// AcquireConn takes one connection's slot, waiting while none is free (a
-	// playback takes slots from background reads first). resumable says that the
-	// reader can fetch again what a preempted connection did not deliver; extra,
-	// that the read already has another connection open (the other workers of a
-	// multi-part download): only a read's first connection may go beyond the
-	// limit, as a playback's does.
+	// AcquireConn takes one connection's slot, waiting while none is free; no
+	// connection goes beyond the limit. A playback takes back the slots that can
+	// be given up (background reads, the extra workers of other downloads) and
+	// waits for the rest. resumable says that the reader can fetch again what a
+	// preempted connection did not deliver; extra, that the read already has
+	// another connection open (the other workers of a multi-part download): it
+	// waits behind the first connections of playbacks.
 	AcquireConn(ctx context.Context, resumable, extra bool) (ConnSlot, error)
 }
 
