@@ -63,14 +63,36 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FRONTEND_REPO: ${{ vars.FRONTEND_REPO }}
 
+      # windows-amd64 carries rclone's WinFsp mount for `openlist cfs mount`
+      # (-tags cmount). cgo-actions builds Windows with xgo and cgo on, and then
+      # cgofuse wants the WinFsp C headers, which that xgo does not have
+      # (fuse_common.h: No such file). cgofuse needs no cgo on Windows (it loads
+      # WinFsp's DLL when the mount starts), and the sqlite driver is pure Go
+      # here, so this target is a plain cross build with cgo off.
+      - name: Build windows-amd64 (cmount)
+        if: matrix.target == 'windows-amd64'
+        env:
+          CGO_ENABLED: "0"
+          GOOS: windows
+          GOARCH: amd64
+          FRONTEND_REPO_DEFAULT: ${{ vars.FRONTEND_REPO || 'Ironboxplus/OpenList-Frontend' }}
+        run: |
+          pkg=github.com/OpenListTeam/OpenList/v4/internal/conf
+          mkdir -p build
+          go build -tags cmount -o build/openlist.exe -ldflags "\
+          -X '$pkg.BuiltAt=$(date -u '+%m/%d/%Y, %r')' \
+          -X '$pkg.GitAuthor=The OpenList Projects Contributors <noreply@oplist.org>' \
+          -X '$pkg.GitCommit=$(git rev-parse --short HEAD)' \
+          -X '$pkg.Version=$(git describe --abbrev=0 --tags 2>/dev/null || echo v0.0.0)' \
+          -X '$pkg.WebVersion=latest' \
+          -X '$pkg.FrontendRepoDefault=$FRONTEND_REPO_DEFAULT'" .
+
       - name: Build
+        if: matrix.target != 'windows-amd64'
         uses: OpenListTeam/cgo-actions@d760a8ec1a6be1f8ec181229e11cb2671797f9e0 # v1.3.0
         with:
           targets: ${{ matrix.target }}
           flags: ${{ contains(matrix.target, '-musl') && '-ldflags=-linkmode external -extldflags ''-static -fpic''' || '-ldflags=' }}
-          # windows-amd64 carries rclone's WinFsp mount for `openlist cfs mount`
-          # (needs no cgo; WinFsp is loaded when the mount starts)
-          tags: ${{ matrix.target == 'windows-amd64' && 'cmount' || '' }}
           static-link-for-musl: true
           musl-target-format: $os-$musl-$arch
           github-token: ${{ secrets.GITHUB_TOKEN }}
