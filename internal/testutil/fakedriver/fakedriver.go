@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	stdpath "path"
 	"strings"
 	"sync"
@@ -17,6 +18,7 @@ import (
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/errs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/net"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/internal/stream"
 	"github.com/OpenListTeam/OpenList/v4/pkg/http_range"
@@ -70,8 +72,23 @@ type Driver struct {
 	// stream, with the driver-side path of the file and the start of the range;
 	// the function it returns is called once when that stream is closed.
 	OnRangeOpen func(path string, start int64) (closed func())
-	seq         int
+	// PerFile, when above 0, makes the drive one that allows that many streams
+	// open at once to a file: it declares the limit (driver.DownloadLimited) and
+	// answers 403 to a range stream opened beyond it, as the 115 CDN does. A
+	// stream is over when its body was read to the end, or closed.
+	PerFile int
+	// LinkConcurrency and LinkPartSize are the standard Link properties of the
+	// links it gives out (0: not set).
+	LinkConcurrency, LinkPartSize int
+	// ReadDelay is how long reading 64 KiB of a stream takes.
+	ReadDelay time.Duration
+	seq       int
 	ghosts    map[string]*model.Object
+
+	omu     sync.Mutex
+	open    map[string]int
+	peak    map[string]int
+	refused int
 }
 
 func init() {
@@ -205,18 +222,87 @@ func (d *Driver) Link(_ context.Context, file model.Obj, _ model.LinkArgs) (*mod
 	path := file.GetPath()
 	return &model.Link{
 		ContentLength: int64(len(b)),
+		Concurrency:   d.LinkConcurrency,
+		PartSize:      d.LinkPartSize,
 		RangeReader: stream.RangeReaderFunc(func(_ context.Context, r http_range.Range) (io.ReadCloser, error) {
 			end := int64(len(b))
 			if r.Length >= 0 && r.Start+r.Length < end {
 				end = r.Start + r.Length
 			}
-			rc := io.NopCloser(bytes.NewReader(b[min(r.Start, end):end]))
+			if !d.admit(path) {
+				return nil, net.HttpStatusCodeError(http.StatusForbidden)
+			}
+			var rc io.ReadCloser = &counted{Reader: bytes.NewReader(b[min(r.Start, end):end]), d: d, path: path}
 			if d.OnRangeOpen == nil {
 				return rc, nil
 			}
 			return &notifyClose{ReadCloser: rc, closed: d.OnRangeOpen(path, r.Start)}, nil
 		}),
 	}, nil
+}
+
+// MaxDownloadConnectionsPerFile is PerFile.
+func (d *Driver) MaxDownloadConnectionsPerFile() int { return d.PerFile }
+
+// admit counts a stream opened to path, unless the drive allows no more.
+func (d *Driver) admit(path string) bool {
+	d.omu.Lock()
+	defer d.omu.Unlock()
+	if d.open == nil {
+		d.open, d.peak = map[string]int{}, map[string]int{}
+	}
+	if d.PerFile > 0 && d.open[path] >= d.PerFile {
+		d.refused++
+		return false
+	}
+	d.open[path]++
+	d.peak[path] = max(d.peak[path], d.open[path])
+	return true
+}
+
+func (d *Driver) finish(path string) {
+	d.omu.Lock()
+	defer d.omu.Unlock()
+	d.open[path]--
+}
+
+// PeakOpen is the most streams that were open to the file at once, and Refused
+// how many were turned away for being beyond PerFile.
+func (d *Driver) PeakOpen(path string) int {
+	d.omu.Lock()
+	defer d.omu.Unlock()
+	return d.peak[path]
+}
+
+func (d *Driver) Refused() int {
+	d.omu.Lock()
+	defer d.omu.Unlock()
+	return d.refused
+}
+
+// counted is a stream the drive counts as open until it is read to the end or
+// closed.
+type counted struct {
+	io.Reader
+	d    *Driver
+	path string
+	once sync.Once
+}
+
+func (c *counted) Read(p []byte) (int, error) {
+	if c.d.ReadDelay > 0 {
+		time.Sleep(c.d.ReadDelay * time.Duration(len(p)) / (64 << 10))
+	}
+	n, err := c.Reader.Read(p)
+	if err == io.EOF {
+		c.once.Do(func() { c.d.finish(c.path) })
+	}
+	return n, err
+}
+
+func (c *counted) Close() error {
+	c.once.Do(func() { c.d.finish(c.path) })
+	return nil
 }
 
 // notifyClose calls closed the first time it is closed.
