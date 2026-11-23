@@ -41,6 +41,8 @@ github.com/Ironboxplus/115-sdk-go v0.2.19 h1:lvI37mWHTNPJSnC0OzbP7ZJeR3pufFWR+qa
 github.com/Ironboxplus/115-sdk-go v0.2.19/go.mod h1:cfvitk2lwe6036iNi2h+iNxwxWDifKZsSvNtrur5BqU=
 github.com/Ironboxplus/cfs v0.0.0-20261113141609-0e6db40f3427 h1:TlJ7LzQysU+ls2HybzfL/TNAiKDeD0npwJzNnEvg1y0=
 github.com/Ironboxplus/cfs v0.0.0-20261113141609-0e6db40f3427/go.mod h1:NHQHrFbq59+bybMlrTi9fnII9cndXb0z1Hhuv1TUYXQ=
+github.com/Ironboxplus/cfs v0.0.0-20261123053500-a88c43ab77fa h1:TYd8zcIRrObzsjOoK/P5xgTYVnz73VSLOtBxL8RtjNc=
+github.com/Ironboxplus/cfs v0.0.0-20261123053500-a88c43ab77fa/go.mod h1:NHQHrFbq59+bybMlrTi9fnII9cndXb0z1Hhuv1TUYXQ=
 github.com/Ironboxplus/rclone v0.0.0-20261109144521-b59dcabf8d75 h1:UlzkKVtPpDX2LoytltG0kdbq2aIHmh3G1IcQKPQ45W0=
 github.com/Ironboxplus/rclone v0.0.0-20261109144521-b59dcabf8d75/go.mod h1:YmKNkhnFIoIwLsEZl7FSN756Iq5ZXy3LPDuypnuFocA=
 github.com/KirCute/zip v1.0.1 h1:L/tVZglOiDVKDi9Ud+fN49htgKdQ3Z0H80iX8OZk13c=

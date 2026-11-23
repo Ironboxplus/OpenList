@@ -5,7 +5,7 @@ go 1.27
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.23.1
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.8.1
-	github.com/Ironboxplus/cfs v0.0.0-20261113141609-0e6db40f3427
+	github.com/Ironboxplus/cfs v0.0.0-20261123053500-a88c43ab77fa
 	github.com/KarpelesLab/reflink v1.0.2
 	github.com/KirCute/zip v1.0.1
 	github.com/OpenListTeam/115-sdk-go v0.2.6
