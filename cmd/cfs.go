@@ -109,6 +109,7 @@ var cfsMountFlags struct {
 	cacheMaxSize  string
 	cacheMaxDirty string
 	allowOther    bool
+	extraOptions  []string
 }
 
 // cfsMountParams are the parameters of rc mount/mount. rclone reads VFS and

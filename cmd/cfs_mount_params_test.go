@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"slices"
 	"testing"
 )
 
@@ -25,5 +26,16 @@ func TestCfsMountParamsCarryTheFlags(t *testing.T) {
 		if got, ok := p[k]; !ok || got != v {
 			t.Errorf("param %s = %v (present %v), want %v", k, got, ok, v)
 		}
+	}
+	if _, ok := p["option"]; ok {
+		t.Errorf("param option is present without -o: %v", p["option"])
+	}
+
+	// -o is repeatable and goes to rclone's mount option "option" ([]string).
+	cfsMountFlags.extraOptions = []string{"FileSecurity=D:P(A;;FA;;;WD)", "uid=-1"}
+	defer func() { cfsMountFlags.extraOptions = nil }()
+	got, ok := cfsMountParams("/srv/mnt")["option"].([]string)
+	if !ok || !slices.Equal(got, cfsMountFlags.extraOptions) {
+		t.Errorf("param option = %v (a []string: %v), want %v", got, ok, cfsMountFlags.extraOptions)
 	}
 }
