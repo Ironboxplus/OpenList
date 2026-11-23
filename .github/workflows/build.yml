@@ -68,6 +68,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
           flags: ${{ contains(matrix.target, '-musl') && '-ldflags=-linkmode external -extldflags ''-static -fpic''' || '-ldflags=' }}
+          # windows-amd64 carries rclone's WinFsp mount for `openlist cfs mount`
+          # (needs no cgo; WinFsp is loaded when the mount starts)
+          tags: ${{ matrix.target == 'windows-amd64' && 'cmount' || '' }}
           static-link-for-musl: true
           musl-target-format: $os-$musl-$arch
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -96,3 +99,38 @@ jobs:
         with:
           name: openlist_${{ steps.short-sha.outputs.sha }}_${{ matrix.target }}
           path: build/*
+
+  # The built windows-amd64 binary, run on Windows: `cfs mount` must get past the
+  # mount-method check (exit code 2, "built without mount support"). With no cfs
+  # storage in the empty data dir it then waits for one and gives up, so it is
+  # cut off by timeout; that is the expected end here.
+  windows-mount:
+    name: Windows binary has the mount
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Download windows-amd64 artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: openlist_*_windows-amd64
+          path: bin
+          merge-multiple: true
+
+      - name: cfs mount is not refused
+        run: |
+          ls -l bin
+          set +e
+          timeout 30 bin/openlist.exe --data "$RUNNER_TEMP/data" --log-std cfs mount /no-such-cfs-storage Z: > "$RUNNER_TEMP/mount.log" 2>&1
+          code=$?
+          set -e
+          echo "exit code $code"
+          head -c 4000 "$RUNNER_TEMP/mount.log"
+          if grep -q "built without mount support" "$RUNNER_TEMP/mount.log" || [ "$code" = 2 ]; then
+            echo "::error::the windows-amd64 binary has no mount method (built without -tags cmount?)"
+            exit 1
+          fi

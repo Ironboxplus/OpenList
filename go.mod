@@ -323,6 +323,7 @@ require (
 	github.com/vishvananda/netlink v1.3.0 // indirect
 	github.com/vishvananda/netns v0.0.4 // indirect
 	github.com/willscott/go-nfs v0.0.4 // indirect
+	github.com/winfsp/cgofuse v1.6.1-0.20260126094232-f2c4fccdb286 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/xtaci/kcp-go/v5 v5.6.13 // indirect
