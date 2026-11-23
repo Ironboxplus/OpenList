@@ -114,6 +114,7 @@ type downloader struct {
 	nextChunk int //next chunk id
 	bufMap    map[int]*buffer.PipeBuffer
 	written   atomic.Int64 //total bytes of file downloaded from remote
+	active    atomic.Int32 // parts being requested or read
 
 	concurrency int //剩余的并发数，递减。到0时停止并发
 	workers     int //仍在运行的 downloadPart 数量（mu 保护）；放弃并发的 worker 退出前要保证还剩一个来接手重新入队的分片
@@ -476,6 +477,8 @@ func isOverloadStatus(code int) bool {
 }
 
 func (d *downloader) tryDownloadChunk(params *HttpRequestParams, ch *chunk) (int64, error) {
+	params.Extra = d.active.Add(1) > 1
+	defer d.active.Add(-1)
 	resp, err := d.cfg.HttpClient(d.ctx, params)
 	if err != nil {
 		statusCode, ok := errs.UnwrapOrSelf(err).(HttpStatusCodeError)
@@ -667,6 +670,9 @@ type HttpRequestParams struct {
 	// Part is set by the downloader on the request of one of the parts of a
 	// multi-part download, which it can fetch again.
 	Part bool
+	// Extra is set with Part when the download has another part's connection
+	// open or being opened, so that this one is not its only connection.
+	Extra bool
 }
 type errNeedRetry struct {
 	error

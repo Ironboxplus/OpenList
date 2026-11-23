@@ -25,7 +25,10 @@ import (
 // part that can be fetched again (a preempted part reads ErrPreempted and its
 // downloader opens it anew from where it stopped, when a slot is free), and
 // while one waits no other read takes a freed slot. When what holds the slots
-// is playback alone they all go ahead, as playbacks do (see FileGate).
+// is the first connections of playbacks alone, a playback's first connection
+// goes ahead, as playbacks do (see FileGate). Its other workers (extra) only
+// ever take a free slot, so a download runs with fewer workers rather than be
+// refused by the storage.
 
 type playbackKey struct{}
 
@@ -41,6 +44,7 @@ type Conn struct {
 	f         *gateFile
 	playback  bool
 	resumable bool
+	extra     bool
 	preempted atomic.Bool
 	interrupt func() // under g.mu
 	once      sync.Once
@@ -85,7 +89,7 @@ func (g *FileGate) ConnGate(key string, limit func() int) model.ConnGate {
 	return fileConnGate{g: g, key: key, limit: limit}
 }
 
-func (c fileConnGate) AcquireConn(ctx context.Context, resumable bool) (model.ConnSlot, error) {
+func (c fileConnGate) AcquireConn(ctx context.Context, resumable, extra bool) (model.ConnSlot, error) {
 	n := c.limit()
 	if n <= 0 {
 		return noSlot{}, nil
@@ -101,17 +105,23 @@ func (c fileConnGate) AcquireConn(ctx context.Context, resumable bool) (model.Co
 		if playback {
 			ok = len(f.conns) < n
 			if !ok {
-				others := false
+				// What stands in the way: background reads, and the extra workers
+				// of another playback's download when this is a read's first
+				// connection. They are told to give up their slots; the first
+				// connection goes beyond the limit only when nothing else is in
+				// the way, an extra one never does.
+				blocked := false
 				for h := range f.conns {
-					if h.playback {
+					displaceable := h.resumable && (!h.playback || (h.extra && !extra))
+					if !displaceable && h.playback {
 						continue
 					}
-					others = true
-					if h.resumable && h.preempted.CompareAndSwap(false, true) && h.interrupt != nil {
+					blocked = true
+					if displaceable && h.preempted.CompareAndSwap(false, true) && h.interrupt != nil {
 						interrupts = append(interrupts, h.interrupt)
 					}
 				}
-				ok = !others
+				ok = !blocked && !extra
 			}
 		} else {
 			ok = len(f.conns) < n && f.pbWait == 0
@@ -120,7 +130,7 @@ func (c fileConnGate) AcquireConn(ctx context.Context, resumable bool) (model.Co
 			if waiting {
 				f.pbWait--
 			}
-			h := &Conn{g: g, f: f, playback: playback, resumable: resumable}
+			h := &Conn{g: g, f: f, playback: playback, resumable: resumable, extra: extra}
 			f.conns[h] = struct{}{}
 			g.mu.Unlock()
 			return h, nil
@@ -193,7 +203,7 @@ func gateHttpClient(gate model.ConnGate, client net.HttpRequestFunc) net.HttpReq
 		return client
 	}
 	return func(ctx context.Context, params *net.HttpRequestParams) (*http.Response, error) {
-		slot, err := gate.AcquireConn(ctx, params.Part)
+		slot, err := gate.AcquireConn(ctx, params.Part, params.Extra)
 		if err != nil {
 			return nil, err
 		}
@@ -215,7 +225,7 @@ func gateRangeReader(gate model.ConnGate, rr model.RangeReaderIF) model.RangeRea
 		return rr
 	}
 	return RangeReaderFunc(func(ctx context.Context, r http_range.Range) (io.ReadCloser, error) {
-		slot, err := gate.AcquireConn(ctx, false)
+		slot, err := gate.AcquireConn(ctx, false, false)
 		if err != nil {
 			return nil, err
 		}
