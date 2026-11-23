@@ -41,6 +41,12 @@ jobs:
             pkgs: ./internal/cluster ./drivers/115_open ./internal/op
           - name: handles
             pkgs: ./server/handles
+          # The Windows build with rclone's WinFsp mount (cmount tag, no cgo).
+          - name: cmd-windows-cmount
+            os: windows-latest
+            tags: cmount
+            pkgs: ./cmd
+            run: TestWindowsCmountBuildHasMountMethod
           # Subtitle extraction reads real MKV/MP4 files made by ffmpeg and
           # mkvmerge and compares with what ffmpeg writes for the same track.
           - name: subextract
@@ -132,12 +138,13 @@ jobs:
         env:
           TAGS: ${{ matrix.tags }}
           PKGS: ${{ matrix.pkgs }}
+          RUN: ${{ matrix.run }}
           # the extraction tests fail, rather than skip, when ffmpeg or mkvmerge
           # is missing; only the job that installs them asks for that
           SUBEXTRACT_REQUIRE: ${{ matrix.apt != '' && '1' || '0' }}
         run: |
           set -o pipefail
-          go test -timeout 20m -tags "$TAGS" $PKGS 2>&1 | tee "$RUNNER_TEMP/test.log"
+          go test -timeout 20m -tags "$TAGS" ${RUN:+-run "$RUN"} $PKGS 2>&1 | tee "$RUNNER_TEMP/test.log"
       - name: Tail of the log
         if: failure()
         run: tail -c 200000 "$RUNNER_TEMP/test.log" > "$RUNNER_TEMP/test-tail.log" || true
