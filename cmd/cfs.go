@@ -126,6 +126,9 @@ func cfsMountParams(mountPoint string) rc.Params {
 		"mountOpt":            rc.Params{"VolumeName": "cfs"},
 	}
 	cfsOwnership(p)
+	if len(cfsMountFlags.extraOptions) > 0 {
+		p["option"] = cfsMountFlags.extraOptions
+	}
 	return p
 }
 
@@ -218,6 +221,7 @@ func init() {
 	mf.StringVar(&cfsMountFlags.cacheMaxSize, "vfs-cache-max-size", "10G", "upper bound of the VFS cache on local disk")
 	mf.StringVar(&cfsMountFlags.cacheMaxDirty, "vfs-cache-max-dirty", "0", "upper bound of the files not uploaded yet: a write that would go over it waits until the uploads have made room (0: off)")
 	mf.BoolVar(&cfsMountFlags.allowOther, "allow-other", false, "let other users access the mount (FUSE allow_other; needs user_allow_other in /etc/fuse.conf unless root), e.g. for a Samba share of it")
+	mf.StringArrayVarP(&cfsMountFlags.extraOptions, "option", "o", nil, "extra FUSE or WinFsp mount option, repeatable; e.g. on Windows -o FileSecurity=D:P(A;;FA;;;WD) lets other users (an SMB share of the drive) write")
 	cfsOwnershipFlags(cfsMountCmd)
 	cfsWebdavCmd.Flags().StringVar(&cfsFlags.addr, "addr", "127.0.0.1:8085", "address to serve on")
 	cfsWebdavCmd.Flags().StringVar(&cfsFlags.user, "user", "", "WebDAV user (none: anonymous)")
