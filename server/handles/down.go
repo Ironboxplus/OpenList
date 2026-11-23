@@ -71,6 +71,7 @@ func Proxy(c *gin.Context) {
 		// reads of this file (subtitle extraction) give way while it streams.
 		if end := common.HoldPlayback(storage, rawPath); end != nil {
 			defer end()
+			c.Request = c.Request.WithContext(stream.WithPlayback(c.Request.Context()))
 		}
 		link, file, err := fs.Link(c.Request.Context(), rawPath, model.LinkArgs{
 			Header: c.Request.Header,

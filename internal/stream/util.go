@@ -177,6 +177,7 @@ func (r *RefreshableRangeReader) doRefreshLocked(ctx context.Context) error {
 	}
 
 	newLink.Refresher = r.link.Refresher
+	newLink.Gate = r.link.Gate
 	r.link = newLink
 	r.innerReader = nil
 	r.refreshCount++
@@ -329,12 +330,12 @@ func GetRangeReaderFromLink(size int64, link *model.Link) (model.RangeReaderIF, 
 
 	if link.RangeReader != nil {
 		if link.Concurrency < 1 && link.PartSize < 1 {
-			return link.RangeReader, nil
+			return gateRangeReader(link.Gate, link.RangeReader), nil
 		}
 		down := net.NewDownloader(func(d *net.Downloader) {
 			d.Concurrency = link.Concurrency
 			d.PartSize = link.PartSize
-			d.HttpClient = net.GetRangeReaderHttpRequestFunc(link.RangeReader)
+			d.HttpClient = gateHttpClient(link.Gate, net.GetRangeReaderHttpRequestFunc(link.RangeReader))
 		})
 		rangeReader := func(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
 			return down.Download(ctx, &net.HttpRequestParams{
@@ -354,7 +355,7 @@ func GetRangeReaderFromLink(size int64, link *model.Link) (model.RangeReaderIF, 
 		down := net.NewDownloader(func(d *net.Downloader) {
 			d.Concurrency = link.Concurrency
 			d.PartSize = link.PartSize
-			d.HttpClient = func(ctx context.Context, params *net.HttpRequestParams) (*http.Response, error) {
+			d.HttpClient = gateHttpClient(link.Gate, func(ctx context.Context, params *net.HttpRequestParams) (*http.Response, error) {
 				if ServerDownloadLimit == nil {
 					return net.DefaultHttpRequestFunc(ctx, params)
 				}
@@ -367,7 +368,7 @@ func GetRangeReaderFromLink(size int64, link *model.Link) (model.RangeReaderIF, 
 					}
 				}
 				return resp, err
-			}
+			})
 		})
 		rangeReader := func(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
 			requestHeader, _ := ctx.Value(conf.RequestHeaderKey).(http.Header)
@@ -431,7 +432,7 @@ func GetRangeReaderFromLink(size int64, link *model.Link) (model.RangeReaderIF, 
 		}
 		return response.Body, nil
 	}
-	return RangeReaderFunc(rangeReader), nil
+	return gateRangeReader(link.Gate, RangeReaderFunc(rangeReader)), nil
 }
 
 func GetRangeReaderFromMFile(size int64, file model.File) *model.FileRangeReader {

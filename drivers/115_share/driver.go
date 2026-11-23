@@ -103,10 +103,15 @@ func (d *Pan115Share) Link(ctx context.Context, file model.Obj, args model.LinkA
 	}
 	header := http.Header{}
 	header.Set("User-Agent", ua)
-	return &model.Link{
+	link := &model.Link{
 		URL:    downloadInfo.URL.URL,
 		Header: header,
-	}, nil
+	}
+	if n := d.MaxDownloadConnectionsPerFile(); n > 0 {
+		// read in parts over as many connections as the CDN allows to one file
+		link.Concurrency, link.PartSize = n, 16*utils.MB
+	}
+	return link, nil
 }
 
 func (d *Pan115Share) MakeDir(ctx context.Context, parentDir model.Obj, dirName string) error {

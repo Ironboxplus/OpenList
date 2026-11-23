@@ -321,6 +321,10 @@ func (d *Open115) Link(ctx context.Context, file model.Obj, args model.LinkArgs)
 	if ttl, ok := parseCDNExpiry(u.URL.URL); ok {
 		link.Expiration = &ttl
 	}
+	if n := d.MaxDownloadConnectionsPerFile(); n > 0 {
+		// read in parts over as many connections as the CDN allows to one file
+		link.Concurrency, link.PartSize = n, 16*utils.MB
+	}
 	return link, nil
 }
 

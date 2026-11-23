@@ -356,6 +356,7 @@ func (h *Handler) handleGetHeadPost(w http.ResponseWriter, r *http.Request) (sta
 	// A player on a WebDAV mount is a playback like any other: see HoldPlayback.
 	if end := common.HoldPlayback(storage, reqPath); end != nil {
 		defer end()
+		r = r.WithContext(stream.WithPlayback(r.Context()))
 	}
 	link, _, err := fs.Link(ctx, reqPath, model.LinkArgs{Header: r.Header})
 	if err != nil {

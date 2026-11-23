@@ -445,6 +445,14 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 			return nil, errors.Wrapf(err, "failed get link")
 		}
 
+		// A storage that limits the connections per file has every connection to
+		// the file counted by the download gate, whoever opens it (stream.FileGate).
+		if link.Gate == nil && driver.DownloadConnectionsPerFile(storage) > 0 {
+			link.Gate = stream.DownloadGate.ConnGate(
+				stdpath.Join(storage.GetStorage().MountPath, path),
+				func() int { return driver.DownloadConnectionsPerFile(storage) })
+		}
+
 		// Set up link refresher for automatic refresh on expiry during long downloads
 		// This enables all download scenarios to handle link expiration gracefully
 		if link.Refresher == nil {

@@ -2,9 +2,12 @@ package driver
 
 // DownloadLimited is implemented by a driver whose storage refuses more than a
 // few simultaneous download connections to one file (the drive answers 403, from
-// any IP on the same account). OpenList then keeps its own background reads of
-// such a file (subtitle extraction) within that number, and gives playback the
-// slots first: see stream.FileGate. A driver without it is not limited.
+// any IP on the same account). OpenList then keeps every connection to such a
+// file within that number, whoever opens it (a copy task, playback, subtitle
+// extraction), and gives playback the slots first: op.Link marks the link with
+// the file's gate, see stream.FileGate. A driver sets the standard Link
+// properties (Concurrency, PartSize) to read in parts over that many
+// connections. A driver without it is not limited.
 type DownloadLimited interface {
 	// MaxDownloadConnectionsPerFile is how many connections may read one file at
 	// once; 0 or less means no limit.

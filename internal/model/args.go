@@ -41,6 +41,11 @@ type Link struct {
 	PartSize      int   `json:"part_size"`
 	ContentLength int64 `json:"content_length"` // 转码视频、缩略图
 
+	// Gate, when set, counts every connection opened for the link's file against
+	// the number its storage allows (see ConnGate). It is set by op.Link for a
+	// storage that declares such a limit, not by drivers.
+	Gate ConnGate `json:"-"`
+
 	// Refresher is a callback to refresh the link when it expires during long downloads
 	// This field is not serialized and is optional - if nil, no refresh will be attempted
 	Refresher LinkRefresher `json:"-"`
@@ -48,6 +53,27 @@ type Link struct {
 	utils.SyncClosers `json:"-"`
 	// 如果SyncClosers中的资源被关闭后Link将不可用，则此值应为 true
 	RequireReference bool `json:"-"`
+}
+
+// ConnGate is the count of the connections open to one file of a storage that
+// limits them (driver.DownloadLimited), shared by everything that reads the file.
+type ConnGate interface {
+	// AcquireConn takes one connection's slot, waiting while none is free (a
+	// playback takes slots from background reads first). resumable says that the
+	// reader can fetch again what a preempted connection did not deliver.
+	AcquireConn(ctx context.Context, resumable bool) (ConnSlot, error)
+}
+
+// ConnSlot is a connection's slot; it is given back by Release, which the
+// reader calls when the body was read to the end or is closed.
+type ConnSlot interface {
+	Release()
+	// Preempted is true once a playback has asked for the slot: the reader must
+	// give the connection up and, being resumable, open another one later.
+	Preempted() bool
+	// OnPreempt sets what to call, once, when the slot is asked for, so that a
+	// read in progress ends (closing the body).
+	OnPreempt(interrupt func())
 }
 
 // Clone transfers ownership of l without inheriting its cache expiration.
@@ -58,6 +84,7 @@ func (l *Link) Clone() *Link {
 		RangeReader:      l.RangeReader,
 		Concurrency:      l.Concurrency,
 		PartSize:         l.PartSize,
+		Gate:             l.Gate,
 		ContentLength:    l.ContentLength,
 		SyncClosers:      utils.NewSyncClosers(l),
 		RequireReference: l.RequireReference,

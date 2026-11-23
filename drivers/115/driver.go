@@ -94,6 +94,10 @@ func (d *Pan115) Link(ctx context.Context, file model.Obj, args model.LinkArgs) 
 	if link.Header.Get("Cookie") == "" {
 		link.Header.Set("Cookie", d.Cookie)
 	}
+	if n := d.MaxDownloadConnectionsPerFile(); n > 0 {
+		// read in parts over as many connections as the CDN allows to one file
+		link.Concurrency, link.PartSize = n, 16*utils.MB
+	}
 	return link, nil
 }
 

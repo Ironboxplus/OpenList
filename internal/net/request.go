@@ -407,6 +407,10 @@ func (d *downloader) downloadChunk(ch *chunk) bool {
 				params.Range.Start = ch.start
 				params.Range.Length = ch.size
 			}
+			if errors.Is(err, ErrPreempted) {
+				retry-- // not a failure: the storage's connection went to a playback
+				continue
+			}
 			log.Warnf("err chunk_%d, object part download error %s, retrying attempt %d. %v",
 				ch.id, params.URL, retry, err)
 		} else if err == errOverloadRetry {
@@ -443,6 +447,11 @@ func (d *downloader) delay(ti time.Duration) bool {
 		return true
 	}
 }
+
+// ErrPreempted is what the body of a part reads with when its connection was
+// taken back for a playback (see stream.FileGate): the part is fetched again from
+// where it stopped, and that is not counted as a failed try.
+var ErrPreempted = errors.New("connection given up to a playback")
 
 var errCancelConcurrency = errors.New("")
 var errOverloadRetry = errors.New("overload retry")
@@ -567,6 +576,7 @@ func (d *downloader) getParamsFromChunk(ch *chunk) *HttpRequestParams {
 
 	// Get the getBuf byte range of data
 	params.Range = http_range.Range{Start: ch.start, Length: ch.size}
+	params.Part = true
 	return &params
 }
 
@@ -654,6 +664,9 @@ type HttpRequestParams struct {
 	HeaderRef http.Header
 	//total file size
 	Size int64
+	// Part is set by the downloader on the request of one of the parts of a
+	// multi-part download, which it can fetch again.
+	Part bool
 }
 type errNeedRetry struct {
 	error
